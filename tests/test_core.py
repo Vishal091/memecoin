@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from market_data import MarketData, WSOL_MINT
 from pumpfun_bot import PumpFunBot, native_build_retry_delay_seconds
