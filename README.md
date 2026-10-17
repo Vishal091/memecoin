@@ -49,7 +49,7 @@ Start the monitor:
 
 The first launch stores each watch wallet's latest signature as a starting cursor, so it **does not copy old transactions**. It starts watching for new activity from that point onward. Leave it running to observe signals. Paper mode simulates trades at market-price estimates with a fixed configured cost per side and a $10 virtual starting balance; it never signs or broadcasts a transaction. Paper results are not a reliable substitute for real execution and slippage.
 
-Stop with Ctrl+C. State is stored in memecoin.db. Keep that file local.
+Stop with Ctrl+C. State is stored in `memecoin-paper.db`. Keep that file local. The ledger is locked to its first mode, so paper and live positions cannot accidentally be mixed.
 
 ## 3. Set up a dedicated wallet for live mode
 
@@ -64,7 +64,7 @@ Before enabling live trading:
 - Confirm the RPC and Jupiter endpoints work.
 - Review the risk settings and test the kill switch.
 
-Then change BOT_MODE to live and set LIVE_CONFIRMATION exactly to:
+For live mode, first change `DATABASE_PATH=memecoin-live.db` so the live ledger starts separately from paper history. Then change `BOT_MODE=live`, set `KEYPAIR_PATH` to the fresh wallet's local keypair file, and set `LIVE_CONFIRMATION` exactly to:
 
     I_ACCEPT_THE_RISK_AND_UNDERSTAND_LIVE_TRADING
 
@@ -73,8 +73,9 @@ Live startup refuses to run if the keypair is missing or that confirmation does 
 ## Main settings
 
 - WATCH_WALLETS: comma-separated trader wallet addresses.
-- BOT_MODE: paper (default) or live.
+- BOT_MODE: paper (default) or live. The database is locked to its first mode; use `memecoin-paper.db` for paper and `memecoin-live.db` for live.
 - EXPERIMENT_DURATION_DAYS: continuous-run duration before entries stop and remaining positions are liquidated (default 7 days).
+- DATABASE_PATH: local ledger path; keep separate files for paper and live mode.
 - KEYPAIR_PATH: local Solana CLI keypair JSON, used only in live mode.
 - JUPITER_API_KEY: local API key for Jupiter Swap API V2.
 - SOLANA_RPC_URL: RPC endpoint.
