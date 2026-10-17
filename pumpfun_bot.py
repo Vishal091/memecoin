@@ -51,6 +51,21 @@ def normalize_pending_exit_reason(reason: str) -> str:
     return normalized
 
 
+def resolve_pending_exit_raw_amount(
+    current_raw: int, stored_raw: str | int | None
+) -> int:
+    """Resolve a retry quantity without escalating a stored partial sell to full exit."""
+    current = max(0, int(current_raw))
+    if stored_raw is None or not str(stored_raw).strip():
+        # Backwards compatibility for pending exits saved by older bot versions.
+        return current
+    try:
+        requested = int(stored_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Stored pending exit amount is not an integer") from exc
+    return min(current, max(0, requested))
+
+
 def _pubkey_string(value) -> str:
     if isinstance(value, str):
         return value
@@ -933,22 +948,40 @@ class PumpFunBot:
             return False
         normalized_reason = normalize_pending_exit_reason(reason)
         lower_reason = normalized_reason.lower()
-        full_exit = (
+        pending_retry = str(reason).strip().lower().startswith("pending exit:")
+        current_raw = int(position["amount_raw"])
+        requested_raw = min(max(0, int(amount_raw)), current_raw)
+        pending_key = f"exit_pending:{mint}"
+        pending_amount_key = f"exit_pending_amount:{mint}"
+
+        if pending_retry:
+            stored_amount = self.store.get_state(pending_amount_key, "")
+            try:
+                requested_raw = resolve_pending_exit_raw_amount(
+                    current_raw, stored_amount if stored_amount.strip() else None
+                )
+            except ValueError:
+                logger.error(
+                    "Invalid pending exit amount for %s; refusing to guess a sell quantity",
+                    mint,
+                )
+                return False
+
+        if requested_raw <= 0:
+            return False
+
+        # Leader sells are retryable, but their exact copied quantity must be
+        # preserved. A failed partial copy-sell must never become a full exit.
+        retryable_exit = (
             lower_reason in {"marked loss stop", "trailing stop"}
             or lower_reason.startswith("followed wallet ")
             or lower_reason.startswith("experiment expiry")
             or lower_reason.startswith("total loss limit")
-            or str(reason).strip().lower().startswith("pending exit:")
+            or pending_retry
         )
-        pending_key = f"exit_pending:{mint}"
-        if full_exit:
-            # Persist only the underlying exit reason. Retry wrappers are for
-            # control flow and must not accumulate in state or trade history.
+        if retryable_exit:
             self.store.set_state(pending_key, normalized_reason or str(reason).strip())
-        current_raw = int(position["amount_raw"])
-        requested_raw = min(max(0, int(amount_raw)), current_raw)
-        if requested_raw <= 0:
-            return False
+            self.store.set_state(pending_amount_key, str(requested_raw))
         decimals = int(position["decimals"])
         market = self.market.token_market(mint)
         mark_price = float(market["price_usd"]) if market else float(position["last_price_usd"])
@@ -1010,6 +1043,7 @@ class PumpFunBot:
             self.price_cache[mint] = mark_price
             self.price_cache_at[mint] = time.time()
         self.store.set_state(pending_key, "")
+        self.store.set_state(pending_amount_key, "")
         self._refresh_feed_subscriptions()
         logger.warning("SELL %s raw=%s proceeds=%.4f PnL=%.4f reason=%s", mint, sold_raw, proceeds, realized_pnl, normalized_reason)
         if self.s.mode == "live":
@@ -1024,7 +1058,19 @@ class PumpFunBot:
                 continue
             pending = self.store.get_state(f"exit_pending:{mint}", "")
             if pending:
-                self.sell(mint, int(position["amount_raw"]), f"pending exit: {pending}")
+                pending_amount = self.store.get_state(f"exit_pending_amount:{mint}", "")
+                try:
+                    pending_raw = resolve_pending_exit_raw_amount(
+                        int(position["amount_raw"]),
+                        pending_amount if pending_amount.strip() else None,
+                    )
+                except ValueError:
+                    logger.error(
+                        "Invalid pending exit amount for %s; refusing to guess a sell quantity",
+                        mint,
+                    )
+                    continue
+                self.sell(mint, pending_raw, f"pending exit: {pending}")
                 continue
             price = self._mark_price(mint, float(position["last_price_usd"]))
             if price <= 0:
