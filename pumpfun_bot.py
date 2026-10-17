@@ -66,6 +66,15 @@ def resolve_pending_exit_raw_amount(
     return min(current, max(0, requested))
 
 
+def native_build_retry_delay_seconds(detail: str) -> int:
+    """Back off repeated pre-submission failures without pausing unrelated tokens."""
+    if "unsupported pumpswap quote mint" in str(detail).lower():
+        # This executor cannot spend non-WSOL quote tokens; retry only occasionally
+        # until multi-hop / quote-token execution is deliberately implemented.
+        return 6 * 60 * 60
+    return 60
+
+
 def _pubkey_string(value) -> str:
     if isinstance(value, str):
         return value
@@ -240,6 +249,24 @@ class PumpFunBot:
         )
         logger.warning("%s", self.message)
         return True
+
+    def _native_build_retry_deferred(self, mint: str) -> bool:
+        if self.s.mode != "live":
+            return False
+        try:
+            retry_at = float(self.store.get_state(f"native_build_retry_after:{mint}", "0") or 0)
+        except (TypeError, ValueError):
+            return False
+        return retry_at > time.time()
+
+    def _defer_native_build_retry(self, mint: str, detail: str) -> int:
+        delay = native_build_retry_delay_seconds(detail)
+        self.store.set_state(f"native_build_retry_after:{mint}", str(time.time() + delay))
+        self.store.set_state(
+            f"native_build_failure:{mint}",
+            " ".join(str(detail).split())[:500],
+        )
+        return delay
 
     def dashboard_snapshot(self) -> dict:
         with self.state_lock:
@@ -919,6 +946,9 @@ class PumpFunBot:
         mint = signal["mint"]
         if self.store.get_position(mint):
             return
+        if self._native_build_retry_deferred(mint):
+            logger.debug("Suppressing repeated native build attempt for mint=%s during cooldown", mint)
+            return
         sol_price = self.market.sol_price_usd()
         market = self.market.token_market(mint)
         observed_price = float(signal.get("observed_price_usd") or 0)
@@ -1009,10 +1039,11 @@ class PumpFunBot:
                     slippage_bps=self.s.slippage_bps, preferred_pool=venue,
                 )
             except TransactionBuildFailed as exc:
+                delay = self._defer_native_build_retry(mint, str(exc))
                 logger.warning(
-                    "Skip copied buy for %s: native SDK could not build a transaction; "
-                    "nothing was submitted, and other watched-wallet signals will continue: %s",
-                    mint, exc,
+                    "Skip copied buy for %s: %s; nothing was submitted. "
+                    "Retry for this mint is suppressed for %ds; other mints remain eligible.",
+                    mint, " ".join(str(exc).split())[:220], delay,
                 )
                 return
             except TransactionConfirmationUnknown as exc:
@@ -1063,6 +1094,9 @@ class PumpFunBot:
         if self.s.mode == "live" and self.store.get_state(f"ambiguous_live_tx_mint:{mint}", ""):
             # Do not blindly retry a mint whose previous signed transaction may
             # still land; require explicit reconciliation first.
+            return False
+        if self._native_build_retry_deferred(mint):
+            logger.debug("Suppressing repeated native sell build attempt for mint=%s during cooldown", mint)
             return False
         normalized_reason = normalize_pending_exit_reason(reason)
         lower_reason = normalized_reason.lower()
@@ -1130,11 +1164,12 @@ class PumpFunBot:
                     amount_raw=requested_raw,
                 )
             except TransactionBuildFailed as exc:
-                # This is a pre-submission failure. Keep the pending exit queued, but
-                # do not misclassify the watched-wallet feed as broken or halt all entries.
+                # Keep the exit intent and suppress repeated builder calls for this mint.
+                delay = self._defer_native_build_retry(mint, str(exc))
                 logger.warning(
-                    "Sell for %s could not be built; no transaction was submitted. "
-                    "Pending exit remains queued for retry: %s", mint, exc,
+                    "Sell for %s could not be built; nothing was submitted. "
+                    "Pending exit remains queued, with a %ds retry cooldown: %s",
+                    mint, delay, " ".join(str(exc).split())[:220],
                 )
                 return False
             except TransactionConfirmationUnknown as exc:
@@ -1241,8 +1276,18 @@ class PumpFunBot:
     def process_signal(self, signal: dict):
         if signal.get("wallet") not in self.active_wallets:
             return
-        self.store.add_signal(signal["wallet"], signal["signature"], signal["mint"], signal["side"],
-                              signal["amount_ui"], signal["decimals"])
+        is_new_signal = self.store.add_signal(
+            signal["wallet"], signal["signature"], signal["mint"], signal["side"],
+            signal["amount_ui"], signal["decimals"],
+        )
+        if not is_new_signal:
+            self.signal_stats["duplicate_events"] += 1
+            logger.debug(
+                "Ignoring duplicate copy signal wallet=%s signature=%s mint=%s side=%s",
+                str(signal["wallet"])[:8], str(signal["signature"])[:10],
+                str(signal["mint"])[:8], signal["side"],
+            )
+            return
         if self.wallet_address and signal["wallet"] == self.wallet_address:
             return
         if signal["side"] == "buy":
