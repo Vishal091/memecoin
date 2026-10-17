@@ -1,6 +1,7 @@
 import hashlib
 import struct
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,8 @@ from native_pump import (
     PUMP_BUY_EXACT_QUOTE_IN_V3,
     PUMP_SELL_V3,
     PUMPSWAP_BUY_V2,
+    NativePumpExecutor,
+    TransactionConfirmationUnknown,
     validate_native_transaction,
 )
 
@@ -67,6 +70,52 @@ def fake_tx(route_program, trade_data, route="pump", accounts=None, extra_progra
         ],
     ))
     return tx, wallet, mint
+
+
+class NativeConfirmationUnknownTests(unittest.TestCase):
+    class FakeTransaction:
+        def __bytes__(self):
+            return b"signed-test-transaction"
+
+    class FakeRPC:
+        def __init__(self, status_behavior):
+            self.status_behavior = status_behavior
+            self.methods = []
+
+        def call(self, method, params):
+            self.methods.append(method)
+            if method == "sendTransaction":
+                return "test-signature"
+            if method == "getSignatureStatuses":
+                if isinstance(self.status_behavior, Exception):
+                    raise self.status_behavior
+                return self.status_behavior
+            raise AssertionError(f"Unexpected RPC method: {method}")
+
+    def make_executor(self, status_behavior):
+        executor = object.__new__(NativePumpExecutor)
+        executor.rpc = self.FakeRPC(status_behavior)
+        return executor
+
+    def test_confirmation_timeout_preserves_signature(self):
+        executor = self.make_executor({"value": [None]})
+        with patch("native_pump.time.monotonic", side_effect=[0.0, 31.0]):
+            with self.assertRaises(TransactionConfirmationUnknown) as caught:
+                executor._send_confirm(self.FakeTransaction())
+        self.assertEqual(caught.exception.signature, "test-signature")
+        self.assertIn("confirmation timeout", caught.exception.detail)
+        self.assertEqual(
+            executor.rpc.methods,
+            ["sendTransaction"],
+        )
+
+    def test_status_lookup_error_preserves_signature_as_ambiguous(self):
+        executor = self.make_executor(RuntimeError("RPC unavailable"))
+        with patch("native_pump.time.monotonic", side_effect=[0.0, 1.0]):
+            with self.assertRaises(TransactionConfirmationUnknown) as caught:
+                executor._send_confirm(self.FakeTransaction())
+        self.assertEqual(caught.exception.signature, "test-signature")
+        self.assertIn("RPC unavailable", caught.exception.detail)
 
 
 class NativeBuilderRoutingRegressionTests(unittest.TestCase):
