@@ -41,6 +41,7 @@ class PumpFunSettings:
     dashboard_port: int
     auto_copy_on_start: bool
     stream_token_prices: bool
+    allow_unindexed_pump_curve: bool
     default_leaderboard_window: str
     rpc_url: str
     keypair_path: Path
@@ -86,6 +87,7 @@ class PumpFunSettings:
             dashboard_port=max(1024, min(65535, _int("DASHBOARD_PORT", 8765))),
             auto_copy_on_start=os.getenv("AUTO_COPY_ON_START", "true").strip().lower() in {"1", "true", "yes", "on"},
             stream_token_prices=os.getenv("PUMPPORTAL_STREAM_TOKEN_PRICES", "false").strip().lower() in {"1", "true", "yes", "on"},
+            allow_unindexed_pump_curve=os.getenv("ALLOW_UNINDEXED_PUMP_CURVE", "true").strip().lower() in {"1", "true", "yes", "on"},
             default_leaderboard_window=os.getenv("DEFAULT_LEADERBOARD_WINDOW", "day").strip().lower(),
             rpc_url=os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip(),
             keypair_path=Path(os.getenv("KEYPAIR_PATH", "./wallet.json")).expanduser(),
