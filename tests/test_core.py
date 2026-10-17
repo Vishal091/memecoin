@@ -135,6 +135,23 @@ class MarketTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("Liquidity", reason)
 
+    def test_token_market_exposes_market_cap_or_fdv_estimate(self):
+        class FakeMarket(MarketData):
+            def token_pairs(self, mint):
+                return [{
+                    "chainId": "solana",
+                    "baseToken": {"address": mint, "symbol": "MEME"},
+                    "quoteToken": {"address": "quote", "symbol": "SOL"},
+                    "priceUsd": "0.0001",
+                    "liquidity": {"usd": 25000},
+                    "pairCreatedAt": 1,
+                    "fdv": 125000,
+                }]
+
+        market = FakeMarket().token_market("mint")
+        self.assertEqual(market["market_cap_usd"], 125000)
+        self.assertEqual(market["market_cap_source"], "DexScreener FDV estimate")
+
 
 class StorageTests(unittest.TestCase):
     def test_position_and_daily_pause_persist(self):
@@ -145,9 +162,16 @@ class StorageTests(unittest.TestCase):
                 "initial_amount_raw": "1000000", "peak_price_usd": 1.0, "tp1_done": 0,
                 "tp2_done": 0, "opened_at": "now", "last_price_usd": 1.0, "invested_usd": 1.0,
                 "source_wallet": "leader", "source_signature": "sig",
+                "entry_market_cap_usd": 250000.0,
+                "entry_market_cap_source": "PumpPortal leader-trade snapshot",
             }
             store.upsert_position(position)
             self.assertEqual(store.get_position("mint")["source_wallet"], "leader")
+            self.assertEqual(store.get_position("mint")["entry_market_cap_usd"], 250000.0)
+            self.assertEqual(
+                store.get_position("mint")["entry_market_cap_source"],
+                "PumpPortal leader-trade snapshot",
+            )
             store.set_state("daily_paused", 1)
             store.set_state("day_key", "2000-01-01")
             store.reset_day_if_needed(10)
