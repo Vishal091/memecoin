@@ -174,7 +174,8 @@ class CopyBot:
             cash = float(self.store.get_state("paper_cash", "0"))
             self.store.set_state("paper_cash", cash - spend - cost)
             tx_sig = "PAPER-" + signal["signature"][:20]
-            effective_price = spend / raw_to_units(raw_out, int(signal["decimals"]))
+            cost_basis = spend + cost
+            effective_price = cost_basis / raw_to_units(raw_out, int(signal["decimals"]))
         else:
             assert self.jupiter is not None and self.keypair is not None and self.wallet_address is not None
             sol_price = self.market.sol_price_usd()
@@ -194,13 +195,17 @@ class CopyBot:
                 return
             result = self.jupiter.execute(order, self.keypair)
             tx_sig = result["signature"]
-            effective_price = spend / raw_to_units(raw_out, int(signal["decimals"]))
+            actual_output = int(result.get("total_output_amount") or raw_out)
+            if actual_output > 0:
+                raw_out = actual_output
+            cost_basis = spend
+            effective_price = cost_basis / raw_to_units(raw_out, int(signal["decimals"]))
 
         position = {
             "mint": mint, "decimals": int(signal["decimals"]), "amount_raw": str(raw_out),
             "entry_price_usd": effective_price, "initial_amount_raw": str(raw_out),
             "peak_price_usd": float(market["price_usd"]), "tp1_done": 0, "tp2_done": 0,
-            "opened_at": now, "last_price_usd": float(market["price_usd"]), "invested_usd": spend,
+            "opened_at": now, "last_price_usd": float(market["price_usd"]), "invested_usd": cost_basis,
             "source_wallet": signal["wallet"], "source_signature": signal["signature"],
         }
         self.store.upsert_position(position)
@@ -269,7 +274,8 @@ class CopyBot:
                 return False
             result = self.jupiter.execute(order, self.keypair)
             tx_sig = result["signature"]
-            proceeds = out_lamports / 1_000_000_000 * self.market.sol_price_usd()
+            actual_out_lamports = int(result.get("total_output_amount") or out_lamports)
+            proceeds = actual_out_lamports / 1_000_000_000 * self.market.sol_price_usd()
             value = proceeds
 
         realized_pnl = proceeds - basis
