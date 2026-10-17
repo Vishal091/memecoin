@@ -12,7 +12,7 @@ from pathlib import Path
 from solders.pubkey import Pubkey
 
 from config import Settings
-from jupiter import JupiterExecutor, WSOL_MINT
+from jupiter import JupiterExecutor, NoExecutableRoute, WSOL_MINT
 from market_data import MarketData
 from solana_rpc import SolanaRPC
 from storage import Store
@@ -180,11 +180,16 @@ class CopyBot:
             assert self.jupiter is not None and self.keypair is not None and self.wallet_address is not None
             sol_price = self.market.sol_price_usd()
             amount_lamports = int(spend / sol_price * 1_000_000_000)
-            order = self.jupiter.order(input_mint=WSOL_MINT, output_mint=mint, amount_raw=amount_lamports,
-                                       taker=self.wallet_address, slippage_bps=self.s.slippage_bps)
+            try:
+                order = self.jupiter.order(input_mint=WSOL_MINT, output_mint=mint, amount_raw=amount_lamports,
+                                           taker=self.wallet_address, slippage_bps=self.s.slippage_bps)
+            except NoExecutableRoute as exc:
+                logger.info("Reject buy %s: %s", mint, exc)
+                return
             raw_out = int(order.get("outAmount") or 0)
             if raw_out <= 0:
-                raise RuntimeError("Jupiter returned zero output for buy order")
+                logger.info("Reject buy %s: Jupiter returned zero output", mint)
+                return
             impact = abs(float(order.get("priceImpactPct") or 0))
             if impact > 0.02:
                 logger.warning("Reject buy %s: Jupiter price impact %.2f%% exceeds 2%%", mint, impact * 100)
@@ -192,6 +197,22 @@ class CopyBot:
             shortfall = self._quote_shortfall(raw_out, int(signal["decimals"]), market["price_usd"], spend)
             if shortfall > self.s.max_quote_shortfall_pct:
                 logger.warning("Reject buy %s: quoted output is %.2f%% below market estimate", mint, shortfall * 100)
+                return
+            # Preflight the expected exit route before risking capital in the token.
+            try:
+                exit_quote = self.jupiter.order(
+                    input_mint=mint, output_mint=WSOL_MINT, amount_raw=raw_out,
+                    taker=None, slippage_bps=self.s.slippage_bps, require_transaction=False)
+            except NoExecutableRoute as exc:
+                logger.warning("Reject buy %s: no credible reverse quote (%s)", mint, exc)
+                return
+            exit_lamports = int(exit_quote.get("outAmount") or 0)
+            expected_exit_usd = raw_to_units(raw_out, int(signal["decimals"])) * market["price_usd"]
+            quoted_exit_usd = exit_lamports / 1_000_000_000 * sol_price
+            reverse_shortfall = ((expected_exit_usd - quoted_exit_usd) / expected_exit_usd
+                                 if expected_exit_usd > 0 else 1.0)
+            if exit_lamports <= 0 or reverse_shortfall > self.s.max_quote_shortfall_pct:
+                logger.warning("Reject buy %s: reverse quote shortfall %.2f%% exceeds limit", mint, reverse_shortfall * 100)
                 return
             result = self.jupiter.execute(order, self.keypair)
             tx_sig = result["signature"]
@@ -266,8 +287,12 @@ class CopyBot:
                 return False
             units_sold = raw_to_units(sell_raw, decimals)
             basis = float(p["invested_usd"]) * (sell_raw / current_raw)
-            order = self.jupiter.order(input_mint=mint, output_mint=WSOL_MINT, amount_raw=sell_raw,
-                                       taker=self.wallet_address, slippage_bps=self.s.slippage_bps)
+            try:
+                order = self.jupiter.order(input_mint=mint, output_mint=WSOL_MINT, amount_raw=sell_raw,
+                                           taker=self.wallet_address, slippage_bps=self.s.slippage_bps)
+            except NoExecutableRoute as exc:
+                logger.error("No exit route for %s; will retry: %s", mint, exc)
+                return False
             out_lamports = int(order.get("outAmount") or 0)
             if out_lamports <= 0:
                 logger.error("Jupiter returned no exit quote for %s; will retry", mint)
