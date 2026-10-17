@@ -2,6 +2,7 @@ import hashlib
 import struct
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from solders.pubkey import Pubkey
 
@@ -13,6 +14,8 @@ from native_pump import (
     PUMP_BUY_EXACT_QUOTE_IN_V3,
     PUMP_SELL_V3,
     PUMPSWAP_BUY_V2,
+    NativePumpExecutor,
+    TransactionBuildFailed,
     validate_native_transaction,
 )
 
@@ -67,6 +70,22 @@ def fake_tx(route_program, trade_data, route="pump", accounts=None, extra_progra
     ))
     return tx, wallet, mint
 
+
+
+
+class NativeBuildFailureTests(unittest.TestCase):
+    def test_nonzero_builder_exit_is_classified_as_pre_submission_failure(self):
+        executor = object.__new__(NativePumpExecutor)
+        executor.node = "node"
+        executor.timeout = 12
+        completed = SimpleNamespace(
+            returncode=1,
+            stderr="Error: Native executor only supports SOL-quoted Pump tokens; refusing a token-quoted coin.",
+            stdout="",
+        )
+        with patch("native_pump.subprocess.run", return_value=completed):
+            with self.assertRaisesRegex(TransactionBuildFailed, "token-quoted coin"):
+                executor._build_unsigned({"mint": "test-mint", "action": "buy"})
 
 class NativeTransactionGuardTests(unittest.TestCase):
     def validate(self, tx, wallet, mint, action="buy", route="pump", budget=1_000, raw=100):
