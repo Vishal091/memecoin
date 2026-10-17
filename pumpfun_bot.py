@@ -513,6 +513,12 @@ class PumpFunBot:
                         self.poll_wallet(wallet)
                     except Exception:
                         logger.exception("Wallet monitor failed for %s", wallet)
+                        if self.s.mode == "live":
+                            self.store.set_state("manual_review_halt", "1")
+                            self.store.set_state(
+                                "manual_review_reason",
+                                f"Wallet monitor/execution error for {wallet}; reconcile signatures and balances before resuming",
+                            )
                 if expired:
                     for pos in self.store.list_positions():
                         self.store.set_state(f"exit_pending:{pos['mint']}", "experiment expiry liquidation")
