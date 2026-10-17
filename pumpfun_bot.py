@@ -78,6 +78,9 @@ class PumpFunBot:
         self.message = "Ready. Configure Pump.fun leaderboard access to discover traders automatically."
         self.last_equity_usd = None
         self.price_cache = {}
+        self.price_cache_at = {}
+        self.market_price_cache = {}
+        self.market_price_cache_at = {}
         self.state_lock = threading.RLock()
         self.commands = queue.Queue()
         self.trade_events = queue.Queue()
@@ -159,7 +162,7 @@ class PumpFunBot:
         positions = []
         for p in self.store.list_positions():
             entry = float(p["entry_price_usd"])
-            mark = float(self.price_cache.get(p["mint"], p["last_price_usd"]))
+            mark = self._mark_price(p["mint"], float(p["last_price_usd"]))
             if mark <= 0:
                 mark = float(p["last_price_usd"])
             move = ((mark / entry) - 1.0) * 100.0 if entry > 0 else 0.0
@@ -315,6 +318,7 @@ class PumpFunBot:
             mint = str(event.get("mint") or "")
             if mint and price and price > 0:
                 self.price_cache[mint] = price
+                self.price_cache_at[mint] = time.time()
             if event.get("source") == "token_trade":
                 continue
             signal = self._signal_from_feed(event)
@@ -409,11 +413,42 @@ class PumpFunBot:
             "venue": venue,
         }]
 
+    def _mark_price(self, mint: str, fallback: float) -> float:
+        """Prefer recent PumpPortal trade ticks; cache market quotes to reduce HTTP churn."""
+        now = time.time()
+        feed_price = float(self.price_cache.get(mint, 0) or 0)
+        feed_age = now - float(self.price_cache_at.get(mint, 0) or 0)
+        if feed_price > 0 and feed_age <= 10:
+            return feed_price
+
+        market_price = float(self.market_price_cache.get(mint, 0) or 0)
+        market_age = now - float(self.market_price_cache_at.get(mint, 0) or 0)
+        if market_price > 0 and market_age <= 3:
+            return market_price
+
+        try:
+            market = self.market.token_market(mint)
+            candidate = float((market or {}).get("price_usd") or 0)
+            if candidate > 0:
+                self.market_price_cache[mint] = candidate
+                self.market_price_cache_at[mint] = now
+                return candidate
+        except Exception:
+            logger.debug("Market price unavailable for %s", mint, exc_info=True)
+
+        # When a coin is not indexed by a market-data provider, this falls back to
+        # the last observed trade or prior mark; the dashboard still exposes the mark
+        # as an estimate rather than a guaranteed executable exit price.
+        if feed_price > 0:
+            return feed_price
+        if market_price > 0:
+            return market_price
+        return max(0.0, float(fallback or 0))
+
     def _current_positions_value(self) -> float:
         value = 0.0
         for pos in self.store.list_positions():
-            market = self.market.token_market(pos["mint"])
-            price = float(market["price_usd"]) if market else float(self.price_cache.get(pos["mint"], pos["last_price_usd"]))
+            price = self._mark_price(pos["mint"], float(pos["last_price_usd"]))
             value += raw_to_units(pos["amount_raw"], int(pos["decimals"])) * price
         return value
 
@@ -577,6 +612,7 @@ class PumpFunBot:
                              price_usd=effective_price, value_usd=cost_basis, reason=f"copied Pump.fun {used_pool} buy",
                              source_wallet=signal["wallet"], source_signature=signal["signature"], tx_signature=tx_sig)
         self.price_cache[mint] = observed_price
+        self.price_cache_at[mint] = time.time()
         logger.warning("BUY %s raw=%s cost=%.4f USD leader=%s pool=%s", mint, raw_out, cost_basis, signal["wallet"], used_pool)
         self._refresh_feed_subscriptions()
         if self.s.mode == "live":
@@ -652,8 +688,10 @@ class PumpFunBot:
             self.store.upsert_position(position)
         if remaining == 0:
             self.price_cache.pop(mint, None)
+            self.price_cache_at.pop(mint, None)
         else:
             self.price_cache[mint] = mark_price
+            self.price_cache_at[mint] = time.time()
         self.store.set_state(pending_key, "")
         self._refresh_feed_subscriptions()
         logger.warning("SELL %s raw=%s proceeds=%.4f PnL=%.4f reason=%s", mint, sold_raw, proceeds, realized_pnl, reason)
@@ -671,8 +709,7 @@ class PumpFunBot:
             if pending:
                 self.sell(mint, int(position["amount_raw"]), f"pending exit: {pending}")
                 continue
-            market = self.market.token_market(mint)
-            price = float(market["price_usd"]) if market else float(self.price_cache.get(mint, position["last_price_usd"]))
+            price = self._mark_price(mint, float(position["last_price_usd"]))
             if price <= 0:
                 continue
             peak = max(float(position["peak_price_usd"]), price)
