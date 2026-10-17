@@ -111,7 +111,7 @@ class NativeConfirmationUnknownTests(unittest.TestCase):
 
     def test_status_lookup_error_preserves_signature_as_ambiguous(self):
         executor = self.make_executor(RuntimeError("RPC unavailable"))
-        with patch("native_pump.time.monotonic", side_effect=[0.0]):
+        with patch("native_pump.time.monotonic", side_effect=[0.0, 1.0]):
             with self.assertRaises(TransactionConfirmationUnknown) as caught:
                 executor._send_confirm(self.FakeTransaction())
         self.assertEqual(caught.exception.signature, "test-signature")
