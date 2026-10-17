@@ -34,7 +34,7 @@ class PumpFunSettings:
     mode: str
     live_confirmation: str
     watch_wallets: tuple[str, ...]
-    pumpfun_bearer_token: str
+    pumpfun_auth_token: str
     pumpportal_api_key: str
     leaderboard_refresh_seconds: int
     top_traders_count: int
@@ -80,7 +80,7 @@ class PumpFunSettings:
             mode=mode,
             live_confirmation=os.getenv("LIVE_CONFIRMATION", "").strip(),
             watch_wallets=wallets,
-            pumpfun_bearer_token=os.getenv("PUMPFUN_BEARER_TOKEN", "").strip(),
+            pumpfun_auth_token=(os.getenv("PUMPFUN_AUTH_TOKEN", "").strip() or os.getenv("PUMPFUN_BEARER_TOKEN", "").strip()),
             pumpportal_api_key=os.getenv("PUMPPORTAL_API_KEY", "").strip(),
             leaderboard_refresh_seconds=max(60, _int("LEADERBOARD_REFRESH_SECONDS", 300)),
             top_traders_count=min(10, max(1, _int("TOP_TRADERS_COUNT", 10))),
@@ -137,8 +137,8 @@ class PumpFunSettings:
                 raise ValueError("Live mode not armed. Review risks and set LIVE_CONFIRMATION locally.")
             if not self.keypair_path.is_file():
                 raise ValueError(f"Local keypair file not found: {self.keypair_path}")
-            if not self.pumpfun_bearer_token:
-                raise ValueError("PUMPFUN_BEARER_TOKEN is required for automatic top-trader discovery in live mode")
+            if not self.pumpfun_auth_token:
+                raise ValueError("PUMPFUN_AUTH_TOKEN is required for automatic top-trader discovery in live mode")
             if not self.pumpportal_api_key:
                 raise ValueError("PUMPPORTAL_API_KEY is required for the near-real-time account-trade feed in live mode")
         if self.mode == "paper" and self.starting_paper_cash_usd <= 0:
