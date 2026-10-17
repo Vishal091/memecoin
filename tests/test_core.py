@@ -1,15 +1,68 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from market_data import MarketData, WSOL_MINT
 from pumpfun_bot import (
+    PumpFunBot,
     normalize_pending_exit_reason,
     position_source_matches_wallet,
     resolve_pending_exit_raw_amount,
 )
+from native_pump import TransactionConfirmationUnknown
+from types import SimpleNamespace
 from solana_rpc import SolanaRPC
 from storage import Store
+
+
+class AmbiguousLiveTransactionStateTests(unittest.TestCase):
+    def test_persists_signature_and_forces_manual_copy_halt(self):
+        class FakeStore:
+            def __init__(self):
+                self.state = {}
+
+            def set_state(self, key, value):
+                self.state[key] = str(value)
+
+        bot = object.__new__(PumpFunBot)
+        bot.store = FakeStore()
+        bot.wallet_address = "test-wallet"
+        bot.message = ""
+
+        exc = TransactionConfirmationUnknown(
+            "test-signature", "confirmation timeout after 30 seconds"
+        )
+        bot._record_ambiguous_live_transaction(
+            "buy", "test-mint", exc,
+            requested_amount_sol=0.012,
+            source_wallet="leader-wallet",
+            source_signature="leader-signature",
+        )
+
+        record = json.loads(bot.store.state["ambiguous_live_tx:test-signature"])
+        self.assertEqual(record["signature"], "test-signature")
+        self.assertEqual(record["action"], "BUY")
+        self.assertEqual(record["mint"], "test-mint")
+        self.assertEqual(record["requested_amount_sol"], 0.012)
+        self.assertEqual(bot.store.state["ambiguous_live_tx_mint:test-mint"], "test-signature")
+        self.assertEqual(bot.store.state["manual_review_halt"], "1")
+        self.assertEqual(bot.store.state["copy_paused"], "1")
+        self.assertIn("test-signature", bot.store.state["manual_review_reason"])
+
+    def test_sell_is_blocked_for_mint_with_unresolved_transaction(self):
+        class FakeStore:
+            def get_position(self, mint):
+                return {"mint": mint, "amount_raw": "100"}
+
+            def get_state(self, key, default=""):
+                return "ambiguous-signature" if key == "ambiguous_live_tx_mint:test-mint" else default
+
+        bot = object.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(mode="live")
+        bot.store = FakeStore()
+
+        self.assertFalse(bot.sell("test-mint", 100, "pending exit: trailing stop"))
 
 
 class PendingExitReasonTests(unittest.TestCase):
