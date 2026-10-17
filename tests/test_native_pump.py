@@ -3,6 +3,8 @@ import struct
 import unittest
 from types import SimpleNamespace
 
+from solders.pubkey import Pubkey
+
 from native_pump import (
     COMPUTE_BUDGET_ID,
     PUMP_PROGRAM_ID,
@@ -24,8 +26,8 @@ def ix(program_index, account_indexes=(), data=b""):
 
 
 def fake_tx(route_program, trade_data, route="pump", accounts=None, extra_programs=()):
-    wallet = "wallet-public-key"
-    mint = "token-mint"
+    wallet = str(Pubkey.new_unique())
+    mint = str(Pubkey.new_unique())
     keys = [
         wallet,
         COMPUTE_BUDGET_ID,
