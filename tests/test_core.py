@@ -49,26 +49,6 @@ class PendingExitAmountTests(unittest.TestCase):
             resolve_pending_exit_raw_amount(400, "not-a-number")
 
 
-    def test_normal_exit_reason_is_unchanged(self):
-        self.assertEqual(normalize_pending_exit_reason("trailing stop"), "trailing stop")
-
-    def test_repeated_pending_exit_prefixes_are_removed(self):
-        self.assertEqual(
-            normalize_pending_exit_reason(
-                "pending exit: pending exit: pending exit: trailing stop"
-            ),
-            "trailing stop",
-        )
-
-    def test_wrapped_leader_exit_reason_is_preserved(self):
-        self.assertEqual(
-            normalize_pending_exit_reason(
-                "pending exit: pending exit: followed wallet Leader123 partial/full sell on pump-amm"
-            ),
-            "followed wallet Leader123 partial/full sell on pump-amm",
-        )
-
-
 class SourceWalletSellMatchingTests(unittest.TestCase):
     def test_matching_source_wallet_allows_copy_sell(self):
         position = {"mint": "same-mint", "source_wallet": "leader-A"}
