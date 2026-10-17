@@ -24,6 +24,7 @@ from leaderboard import LeaderboardError, PumpFunLeaderboard
 from market_data import MarketData
 from pumpfun_config import PumpFunSettings
 from pumpportal_feed import PumpPortalAccountFeed
+from solana_logs_feed import SolanaLogsFeed
 from pumpportal import (
     PUMP_PROGRAM_ID,
     PUMPSWAP_PROGRAM_ID,
@@ -87,12 +88,18 @@ class PumpFunBot:
         self.feed = (PumpPortalAccountFeed(self.s.pumpportal_api_key, self.trade_events,
                                            self.s.request_timeout_seconds)
                      if self.s.pumpportal_api_key else None)
+        self.solana_log_events = queue.Queue()
+        self.logs_feed = (
+            SolanaLogsFeed(self.s.rpc_url, self.solana_log_events, self.s.request_timeout_seconds)
+            if self.s.solana_logs_ws_enabled else None
+        )
         self.dashboard = None
         self.last_processed_event = set()
         self.signal_stats = {
             "queued_events": 0, "parsed_signals": 0, "unparsed_events": 0,
             "duplicate_events": 0, "unwatched_events": 0,
             "buy_signals": 0, "sell_signals": 0, "sell_without_position": 0,
+            "rpc_log_notifications": 0, "rpc_log_signals": 0,
         }
         self.store.set_state("auto_copy_enabled", 1 if self.auto_copy_enabled else 0)
         self.store.set_state("leaderboard_window", self.selected_window)
@@ -128,6 +135,8 @@ class PumpFunBot:
         if self.feed:
             token_mints = [p["mint"] for p in self.store.list_positions()] if self.s.stream_token_prices else []
             self.feed.set_subscriptions(sorted(self.active_wallets), token_mints)
+        if self.logs_feed:
+            self.logs_feed.set_subscriptions(sorted(self.active_wallets))
 
     def refresh_leaderboards(self, force: bool = False) -> bool:
         now = time.time()
@@ -218,6 +227,24 @@ class PumpFunBot:
                 "last_event_summary": "", "last_notice": "PumpPortal API key not configured",
                 "subscribed_wallet_count": 0, "subscription_updates": 0,
                 "connected": False, "error": "PumpPortal API key not configured",
+            }),
+            "solana_logs_stats": ({
+                "enabled": True,
+                "connected": self.logs_feed.connected.is_set(),
+                "subscribed_wallet_count": self.logs_feed.subscribed_wallet_count,
+                "messages_received": self.logs_feed.messages_received,
+                "notifications_received": self.logs_feed.notifications_received,
+                "last_message_at": self.logs_feed.last_message_at,
+                "last_notification_at": self.logs_feed.last_notification_at,
+                "last_signature": self.logs_feed.last_signature,
+                "subscription_errors": self.logs_feed.subscription_errors,
+                "error": self.logs_feed.last_error,
+            } if self.logs_feed else {
+                "enabled": False, "connected": False, "subscribed_wallet_count": 0,
+                "messages_received": 0, "notifications_received": 0,
+                "last_message_at": 0, "last_notification_at": 0,
+                "last_signature": "", "subscription_errors": 0,
+                "error": "Disabled by SOLANA_LOGS_WS_ENABLED",
             }),
             "signal_stats": dict(self.signal_stats),
         }
@@ -341,6 +368,12 @@ class PumpFunBot:
             "block_time": event.get("timestamp"),
         }
 
+    @staticmethod
+    def _dedupe_key(wallet: str, signature: str) -> str:
+        # A transaction can mention several watched wallets (for example, fee distributions).
+        # Deduplicate per wallet so one recipient cannot suppress a signer actual trade.
+        return f"{wallet}|{signature}"
+
     def _consume_feed_events(self) -> None:
         while True:
             try:
@@ -366,14 +399,56 @@ class PumpFunBot:
                 logger.warning("Ignoring PumpPortal %s event for a wallet not in active subscriptions (%s)",
                                signal["side"], signal["wallet"][:8])
                 continue
-            if self.store.signature_seen(signal["signature"]):
+            dedupe_key = self._dedupe_key(signal["wallet"], signal["signature"])
+            if self.store.signature_seen(dedupe_key):
                 self.signal_stats["duplicate_events"] += 1
                 continue
             self.signal_stats["parsed_signals"] += 1
             logger.info("Copy signal parsed: side=%s wallet=%s mint=%s source=%s",
                         signal["side"], signal["wallet"][:8], signal["mint"][:8], signal.get("source"))
             self.process_signal(signal)
-            self.store.mark_signature_seen(signal["signature"], signal["wallet"])
+            self.store.mark_signature_seen(dedupe_key, signal["wallet"])
+
+    def _consume_solana_log_events(self) -> None:
+        """Process Solana logs notifications through the same strict signal detector."""
+        while True:
+            try:
+                event = self.solana_log_events.get_nowait()
+            except queue.Empty:
+                break
+            self.signal_stats["rpc_log_notifications"] += 1
+            wallet = str(event.get("wallet") or "")
+            signature = str(event.get("signature") or "")
+            if not wallet or not signature:
+                continue
+            if wallet not in self.active_wallets:
+                self.signal_stats["unwatched_events"] += 1
+                continue
+            dedupe_key = self._dedupe_key(wallet, signature)
+            if self.store.signature_seen(dedupe_key):
+                self.signal_stats["duplicate_events"] += 1
+                continue
+            if self.rpc.backoff_remaining > 0:
+                self.solana_log_events.put(event)
+                break
+            try:
+                signals = self.detect_pump_signal(wallet, signature)
+            except SolanaRPCRateLimited:
+                self.solana_log_events.put(event)
+                break
+            except Exception as exc:
+                logger.warning("Could not inspect Solana log notification (%s)", type(exc).__name__)
+                continue
+            for signal in signals:
+                signal["source"] = "solana_logs"
+                self.signal_stats["parsed_signals"] += 1
+                self.signal_stats["rpc_log_signals"] += 1
+                logger.info(
+                    "Solana logs copy signal parsed: side=%s wallet=%s mint=%s",
+                    signal["side"], wallet[:8], signal["mint"][:8],
+                )
+                self.process_signal(signal)
+            self.store.mark_signature_seen(dedupe_key, wallet)
 
     def _tx_programs(self, tx: dict) -> tuple[set[str], set[str]]:
         """Return all invoked IDs and top-level IDs (parsed or compiled JSON-RPC form)."""
@@ -409,6 +484,15 @@ class PumpFunBot:
     def detect_pump_signal(self, wallet: str, signature: str) -> list[dict]:
         tx = self.rpc.transaction(signature)
         if not tx or (tx.get("meta") or {}).get("err") is not None:
+            return []
+        account_keys = (((tx.get("transaction") or {}).get("message") or {}).get("accountKeys") or [])
+        wallet_signed = any(
+            isinstance(key, dict)
+            and _pubkey_string(key) == wallet
+            and key.get("signer") is True
+            for key in account_keys
+        )
+        if not wallet_signed:
             return []
         all_programs, top_programs = self._tx_programs(tx)
         # Strictly exclude generic DEX swaps. We copy only Pump bonding-curve/PumpSwap activity.
@@ -859,7 +943,8 @@ class PumpFunBot:
             signature = row.get("signature")
             if not signature:
                 continue
-            if self.store.signature_seen(signature):
+            dedupe_key = self._dedupe_key(wallet, signature)
+            if self.store.signature_seen(dedupe_key):
                 cursor_candidate = signature
                 continue
             try:
@@ -870,7 +955,7 @@ class PumpFunBot:
                 break
             for signal in signals:
                 self.process_signal(signal)
-            self.store.mark_signature_seen(signature, wallet)
+            self.store.mark_signature_seen(dedupe_key, wallet)
             cursor_candidate = signature
             handled += 1
 
@@ -938,6 +1023,8 @@ class PumpFunBot:
             self.dashboard.start()
         if self.feed and not self.feed.is_alive() and not once:
             self.feed.start()
+        if self.logs_feed and not self.logs_feed.is_alive() and not once:
+            self.logs_feed.start()
 
         started_at = self.store.get_state("experiment_started_at", "")
         if not once and not started_at:
@@ -952,6 +1039,8 @@ class PumpFunBot:
             while True:
                 try:
                     self._process_dashboard_commands()
+                    self._consume_feed_events()
+                    self._consume_solana_log_events()
                     now = time.time()
 
                     if self.leaderboard_client.ready and now - self.last_leaderboard_refresh >= self.s.leaderboard_refresh_seconds:
@@ -959,7 +1048,6 @@ class PumpFunBot:
 
                     feed_live = bool(self.feed and self.feed.connected.is_set())
                     if feed_live:
-                        self._consume_feed_events()
                         # An open WebSocket is not proof that the provider accepted
                         # account subscriptions. If no account-trade event arrives,
                         # use a slower RPC safety scan; signatures are de-duplicated.
@@ -967,7 +1055,7 @@ class PumpFunBot:
                             float(self.feed.connected_at or 0),
                             float(self.feed.last_account_trade_at or 0),
                         )
-                        fallback_interval = max(30, self.s.poll_seconds * 10)
+                        fallback_interval = max(20, self.s.poll_seconds * 5)
                         if now >= next_rpc_poll and now - last_activity >= fallback_interval:
                             logger.warning(
                                 "No PumpPortal account-trade events for %.0fs; running slower RPC fallback scan across %d wallets",
@@ -1040,6 +1128,8 @@ class PumpFunBot:
         finally:
             if self.feed and self.feed.is_alive():
                 self.feed.stop()
+            if self.logs_feed and self.logs_feed.is_alive():
+                self.logs_feed.stop()
             if self.dashboard:
                 self.dashboard.stop()
 
