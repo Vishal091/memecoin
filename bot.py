@@ -165,7 +165,7 @@ class CopyBot:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         if self.s.mode == "paper":
             cost = self.s.paper_swap_cost_usd
-            raw_out = int((spend - cost) / market["price_usd"] * (10 ** int(signal["decimals"])))
+            raw_out = int(spend / market["price_usd"] * (10 ** int(signal["decimals"])))
             if raw_out <= 0:
                 logger.info("Reject buy %s: output quantity rounds to zero", mint)
                 return
@@ -215,18 +215,22 @@ class CopyBot:
              source_wallet: str | None = None, source_signature: str | None = None) -> None:
         p = self.store.get_position(mint)
         if not p:
-            return
+            return False
+        full_exit = reason in {"marked loss stop", "trailing stop", "followed wallet sell"} or reason.startswith("pending exit:")
+        pending_key = f"exit_pending:{mint}"
+        if full_exit:
+            self.store.set_state(pending_key, reason)
         current_raw = int(p["amount_raw"])
         sell_raw = min(max(0, amount_raw), current_raw)
         if sell_raw <= 0:
-            return
+            return False
         decimals = int(p["decimals"])
         units_sold = raw_to_units(sell_raw, decimals)
         market = self.market.token_market(mint)
         price = float(market["price_usd"]) if market else float(p["last_price_usd"])
         if price <= 0:
             logger.error("No usable price for exit %s; will retry on next loop", mint)
-            return
+            return False
 
         basis = float(p["invested_usd"]) * (sell_raw / current_raw)
         if self.s.mode == "paper":
@@ -250,7 +254,7 @@ class CopyBot:
             sell_raw = min(sell_raw, available)
             if sell_raw <= 0:
                 logger.error("No token balance available to sell %s; leaving position for reconciliation", mint)
-                return
+                return False
             units_sold = raw_to_units(sell_raw, decimals)
             basis = float(p["invested_usd"]) * (sell_raw / current_raw)
             order = self.jupiter.order(input_mint=mint, output_mint=WSOL_MINT, amount_raw=sell_raw,
@@ -258,7 +262,7 @@ class CopyBot:
             out_lamports = int(order.get("outAmount") or 0)
             if out_lamports <= 0:
                 logger.error("Jupiter returned no exit quote for %s; will retry", mint)
-                return
+                return False
             result = self.jupiter.execute(order, self.keypair)
             tx_sig = result["signature"]
             proceeds = out_lamports / 1_000_000_000 * self.market.sol_price_usd()
@@ -279,15 +283,21 @@ class CopyBot:
             p["invested_usd"] = remaining_basis
             p["last_price_usd"] = price
             self.store.upsert_position(p)
+        self.store.set_state(pending_key, "")
         logger.warning("SELL %s units_raw=%s proceeds=%.4f USD PnL=%.4f reason=%s", mint, sell_raw, proceeds, realized_pnl, reason)
         if self.s.mode == "live":
             logger.warning("LIVE SELL submitted/confirmed: %s", tx_sig)
+        return True
 
     def manage_positions(self) -> None:
         for original in self.store.list_positions():
             mint = original["mint"]
             p = self.store.get_position(mint)
             if not p:
+                continue
+            pending_reason = self.store.get_state(f"exit_pending:{mint}", "")
+            if pending_reason:
+                self.sell(mint, int(p["amount_raw"]), f"pending exit: {pending_reason}")
                 continue
             market = self.market.token_market(mint)
             price = float(market["price_usd"]) if market else float(p["last_price_usd"])
@@ -309,17 +319,17 @@ class CopyBot:
                 continue
             if not int(p["tp1_done"]) and price >= entry * (1 + self.s.take_profit_1_pct):
                 qty = min(current_raw, int(initial_raw * self.s.take_profit_1_sell_fraction))
-                self.sell(mint, qty, "take profit 1 (+30% target)")
+                sold = self.sell(mint, qty, "take profit 1 (+30% target)")
                 p = self.store.get_position(mint)
-                if p:
+                if sold and p:
                     p["tp1_done"] = 1
                     self.store.upsert_position(p)
                 continue
             if not int(p["tp2_done"]) and price >= entry * (1 + self.s.take_profit_2_pct):
                 qty = min(current_raw, int(initial_raw * self.s.take_profit_2_sell_fraction))
-                self.sell(mint, qty, "take profit 2 (+60% target)")
+                sold = self.sell(mint, qty, "take profit 2 (+60% target)")
                 p = self.store.get_position(mint)
-                if p:
+                if sold and p:
                     p["tp2_done"] = 1
                     self.store.upsert_position(p)
 
@@ -332,7 +342,7 @@ class CopyBot:
             self.buy(signal)
         elif signal["side"] == "sell":
             if self.store.get_position(signal["mint"]):
-                self.sell(int(signal["mint"]), int(self.store.get_position(signal["mint"])["amount_raw"]),
+                self.sell(signal["mint"], int(self.store.get_position(signal["mint"])["amount_raw"]),
                           "followed wallet sell", signal["wallet"], signal["signature"])
 
     def poll_wallet(self, wallet: str) -> int:
@@ -364,8 +374,8 @@ class CopyBot:
                 self.process_signal(signal)
             self.store.mark_signature_seen(sig, wallet)
             handled += 1
-        if not new_sigs or handled >= 0:
-            self.store.set_cursor(wallet, latest)
+        # Advance only after the complete batch has been processed without an exception.
+        self.store.set_cursor(wallet, latest)
         return handled
 
     def status(self) -> None:
