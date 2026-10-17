@@ -97,6 +97,8 @@ class CopyBot:
 
     def _can_enter(self, equity: float, market_price: float) -> tuple[bool, str]:
         snap = self.store.equity_snapshot()
+        if self.store.get_state("experiment_expired", "0") == "1":
+            return False, "Seven-day experiment is over; no new entries allowed"
         if snap["halted"]:
             return False, f"Overall halt: {snap['halt_reason']}"
         if self.store.get_state("daily_paused", "0") == "1":
@@ -217,7 +219,8 @@ class CopyBot:
         p = self.store.get_position(mint)
         if not p:
             return False
-        full_exit = reason in {"marked loss stop", "trailing stop"} or reason.startswith("followed wallet ") or reason.startswith("pending exit:")
+        full_exit = (reason in {"marked loss stop", "trailing stop"} or reason.startswith("followed wallet ")
+                     or reason.startswith("experiment expiry") or reason.startswith("pending exit:"))
         pending_key = f"exit_pending:{mint}"
         if full_exit:
             self.store.set_state(pending_key, reason)
@@ -405,9 +408,17 @@ class CopyBot:
     def run(self, once: bool = False) -> None:
         logger.warning("Starting Solana copy bot: mode=%s; live transactions %s",
                        self.s.mode, "ENABLED" if self.s.mode == "live" else "disabled (paper mode)")
-        if not self.s.watch_wallets:
-            logger.warning("WATCH_WALLETS is empty. Add researched public trader addresses to .env.")
+        if not self.s.watch_wallets and not self.store.list_positions():
+            logger.warning("WATCH_WALLETS is empty and there are no positions to manage. Add researched public trader addresses to .env.")
             return
+        if not self.s.watch_wallets:
+            logger.warning("WATCH_WALLETS is empty; entries are disabled, but existing positions will still be managed.")
+        if not once:
+            started_at = self.store.get_state("experiment_started_at", "")
+            if not started_at:
+                started_at = str(time.time())
+                self.store.set_state("experiment_started_at", started_at)
+                logger.warning("Seven-day experiment timer started.")
         if self.s.mode == "live":
             assert self.wallet_address
             logger.warning("Live signer pubkey: %s", self.wallet_address)
@@ -419,6 +430,17 @@ class CopyBot:
         while True:
             cycles += 1
             try:
+                started_at = self.store.get_state("experiment_started_at", "")
+                expired = self.store.get_state("experiment_expired", "0") == "1"
+                if not once and started_at:
+                    try:
+                        elapsed = time.time() - float(started_at)
+                    except ValueError:
+                        elapsed = 0
+                    if elapsed >= self.s.experiment_duration_days * 86400 and not expired:
+                        expired = True
+                        self.store.set_state("experiment_expired", "1")
+                        logger.warning("Experiment duration reached. Disabling entries and attempting to exit all remaining positions.")
                 for wallet in self.s.watch_wallets:
                     try:
                         n = self.poll_wallet(wallet)
@@ -426,12 +448,19 @@ class CopyBot:
                             logger.info("Handled %d new transactions for %s", n, wallet)
                     except Exception:
                         logger.exception("Watcher cycle failed for %s; cursor will retry on next poll where possible", wallet)
+                if expired:
+                    for p in self.store.list_positions():
+                        self.sell(p["mint"], int(p["amount_raw"]), "experiment expiry liquidation")
                 self.manage_positions()
                 equity = self.equity()
                 self._refresh_risk_state(equity)
+                open_count = len(self.store.list_positions())
                 logger.info("Heartbeat equity=%.4f positions=%d total_halt=%s daily_pause=%s",
-                            equity, len(self.store.list_positions()), self.store.get_state("halted", "0"),
+                            equity, open_count, self.store.get_state("halted", "0"),
                             self.store.get_state("daily_paused", "0"))
+                if expired and open_count == 0:
+                    logger.warning("Seven-day experiment complete; no positions remain. Bot is shutting down.")
+                    break
             except KeyboardInterrupt:
                 logger.warning("Stopped by user.")
                 break
