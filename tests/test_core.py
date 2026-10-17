@@ -9,6 +9,7 @@ from pumpfun_bot import (
     normalize_pending_exit_reason,
     position_source_matches_wallet,
     resolve_pending_exit_raw_amount,
+    native_build_retry_delay_seconds,
 )
 from native_pump import TransactionBuildFailed, TransactionConfirmationUnknown
 from types import SimpleNamespace
@@ -138,6 +139,22 @@ class StaleMonitorHaltRecoveryTests(unittest.TestCase):
         self.assertEqual(bot.store.state["manual_review_halt"], "1")
 
 
+class NativeBuildRetryDelayTests(unittest.TestCase):
+    def test_transient_missing_pool_gets_short_per_mint_cooldown(self):
+        self.assertEqual(
+            native_build_retry_delay_seconds("Native SDK transaction build failed: Pool account not found"),
+            60,
+        )
+
+    def test_unsupported_non_sol_quote_gets_long_per_mint_cooldown(self):
+        self.assertEqual(
+            native_build_retry_delay_seconds(
+                "Native SDK transaction build failed: Unsupported PumpSwap quote mint PUMP"
+            ),
+            6 * 60 * 60,
+        )
+
+
 class BuildFailureHandlingTests(unittest.TestCase):
     class FakeStore:
         def __init__(self, position=None):
@@ -194,7 +211,11 @@ class BuildFailureHandlingTests(unittest.TestCase):
             "venue": "pump-amm", "source": "account_trade", "decimals": 6,
         })
 
-        self.assertEqual(bot.store.state, {})
+        self.assertEqual(bot.store.state.get("manual_review_halt"), None)
+        self.assertGreater(
+            float(bot.store.state["native_build_retry_after:test-mint"]), 0
+        )
+        self.assertIn("Pool account not found", bot.store.state["native_build_failure:test-mint"])
         self.assertFalse(bot.store.get_position("test-mint"))
 
     def test_unbuildable_sell_leaves_pending_exit_without_raising_monitor_error(self):
