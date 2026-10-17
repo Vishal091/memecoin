@@ -26,7 +26,7 @@ from pumpfun_config import PumpFunSettings
 from pumpportal_feed import PumpPortalAccountFeed
 from solana_logs_feed import SolanaLogsFeed
 from pumpportal import PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID
-from native_pump import NativePumpExecutor
+from native_pump import NativePumpExecutor, TransactionBuildFailed
 from solana_rpc import SolanaRPC, SolanaRPCRateLimited, SolanaTransactionNotReady
 from pump_curve import fetch_pump_curve
 from storage import Store
@@ -36,6 +36,14 @@ logger = logging.getLogger("pumpfun")
 
 def raw_to_units(amount_raw: int | str, decimals: int) -> float:
     return int(amount_raw) / (10 ** decimals)
+
+
+def native_build_retry_delay_seconds(detail: str) -> int:
+    """Avoid retrying unsupported quote-token routes while allowing other mints through."""
+    normalized = str(detail or "").lower()
+    if "token-quoted coin" in normalized or "unsupported pumpswap quote mint" in normalized:
+        return 6 * 60 * 60
+    return 60
 
 
 def _pubkey_string(value) -> str:
@@ -790,9 +798,27 @@ class PumpFunBot:
                 return False, "SOL balance insufficient for entry plus fee reserve"
         return True, "allowed"
 
+    def _native_build_retry_deferred(self, mint: str) -> bool:
+        if self.s.mode != "live":
+            return False
+        try:
+            retry_at = float(self.store.get_state(f"native_build_retry_after:{mint}", "0") or 0)
+        except (TypeError, ValueError):
+            return False
+        return retry_at > time.time()
+
+    def _defer_native_build_retry(self, mint: str, detail: str) -> int:
+        delay = native_build_retry_delay_seconds(detail)
+        self.store.set_state(f"native_build_retry_after:{mint}", str(time.time() + delay))
+        self.store.set_state(f"native_build_failure:{mint}", " ".join(str(detail).split())[:500])
+        return delay
+
     def buy(self, signal: dict):
         mint = signal["mint"]
         if self.store.get_position(mint):
+            return
+        if self._native_build_retry_deferred(mint):
+            logger.debug("Skipping repeated build for mint=%s during pre-submission cooldown", mint[:8])
             return
         sol_price = self.market.sol_price_usd()
         market = self.market.token_market(mint)
@@ -876,11 +902,20 @@ class PumpFunBot:
             used_pool = venue
         else:
             assert self.keypair is not None and self.wallet_address is not None
-            result = self.executor.trade(
-                owner=self.wallet_address, keypair=self.keypair, mint=mint, action="buy",
-                amount=round(spend / sol_price, 9), denominated_in_sol=True,
-                slippage_bps=self.s.slippage_bps, preferred_pool=venue,
-            )
+            try:
+                result = self.executor.trade(
+                    owner=self.wallet_address, keypair=self.keypair, mint=mint, action="buy",
+                    amount=round(spend / sol_price, 9), denominated_in_sol=True,
+                    slippage_bps=self.s.slippage_bps, preferred_pool=venue,
+                )
+            except TransactionBuildFailed as exc:
+                delay = self._defer_native_build_retry(mint, str(exc))
+                logger.warning(
+                    "Skip copied buy for %s: %s. No transaction was signed or submitted; "
+                    "this mint is cooling down for %ds and other watched-wallet signals can continue.",
+                    mint[:8], " ".join(str(exc).split())[:220], delay,
+                )
+                return
             tx_sig = result["signature"]
             used_pool = result["pool"]
             raw_out = int(result["total_output_amount"])
@@ -918,6 +953,9 @@ class PumpFunBot:
         position = self.store.get_position(mint)
         if not position:
             return False
+        if self._native_build_retry_deferred(mint):
+            logger.debug("Skipping repeated sell build for mint=%s during pre-submission cooldown", mint[:8])
+            return False
         full_exit = (reason in {"marked loss stop", "trailing stop"} or
                      reason.startswith("followed wallet ") or reason.startswith("experiment expiry") or
                      reason.startswith("total loss limit") or reason.startswith("pending exit:"))
@@ -950,12 +988,21 @@ class PumpFunBot:
                 return False
             units_requested = raw_to_units(requested_raw, decimals)
             preferred = self.store.get_state(f"pool:{mint}", "pump")
-            result = self.executor.trade(
-                owner=self.wallet_address, keypair=self.keypair, mint=mint, action="sell",
-                amount=units_requested, denominated_in_sol=False,
-                slippage_bps=self.s.slippage_bps, preferred_pool=preferred,
-                amount_raw=requested_raw,
-            )
+            try:
+                result = self.executor.trade(
+                    owner=self.wallet_address, keypair=self.keypair, mint=mint, action="sell",
+                    amount=units_requested, denominated_in_sol=False,
+                    slippage_bps=self.s.slippage_bps, preferred_pool=preferred,
+                    amount_raw=requested_raw,
+                )
+            except TransactionBuildFailed as exc:
+                delay = self._defer_native_build_retry(mint, str(exc))
+                logger.warning(
+                    "Sell for %s could not be built; nothing was signed or submitted. "
+                    "Pending exit remains queued; retry cooldown=%ds: %s",
+                    mint[:8], delay, " ".join(str(exc).split())[:220],
+                )
+                return False
             tx_sig = result["signature"]
             sold_raw = abs(int(result["token_delta_raw"]))
             sol_received = max(0, int(result["sol_delta_lamports"])) / 1_000_000_000
