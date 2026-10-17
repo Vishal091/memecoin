@@ -291,9 +291,15 @@ class PumpFunBot:
             except (TypeError, ValueError):
                 post_raw = 0
         pre_raw = post_raw + amount_raw if side == "sell" else max(0, post_raw - amount_raw)
-        curve_sol = event.get("vSolInBondingCurve") or event.get("v_sol_in_bonding_curve") or 0
+        # Use real reserves only. vSolInBondingCurve is a synthetic pricing reserve,
+        # not actual withdrawable liquidity, and must not be used as a liquidity filter.
+        real_sol = event.get("realSolReserves") or event.get("real_sol_reserves")
         try:
-            curve_liquidity_usd = float(curve_sol) * 2 * self.market.sol_price_usd()
+            real_sol_value = float(real_sol or 0)
+            # PumpPortal integrations may serialize lamports as large integers or SOL as decimals.
+            if real_sol_value > 1_000_000:
+                real_sol_value /= 1_000_000_000
+            curve_liquidity_usd = real_sol_value * 2 * self.market.sol_price_usd()
         except (TypeError, ValueError, RuntimeError):
             curve_liquidity_usd = 0.0
         return {
@@ -540,18 +546,28 @@ class PumpFunBot:
 
         curve_liquidity = float(signal.get("curve_liquidity_usd") or 0)
         pair_liquidity = float(market.get("liquidity_usd") or 0) if market else 0.0
-        effective_liquidity = max(curve_liquidity, pair_liquidity)
+        actual_liquidity = max(curve_liquidity, pair_liquidity)
         is_realtime_signal = signal.get("source") == "account_trade"
-        if effective_liquidity < self.s.min_liquidity_usd:
-            logger.info("Reject Pump.fun buy %s: estimated liquidity %.0f USD below %.0f USD",
-                        mint, effective_liquidity, self.s.min_liquidity_usd)
+        venue = str(signal.get("venue", "pump"))
+        unindexed_pump_entry = (
+            self.s.allow_unindexed_pump_curve
+            and is_realtime_signal
+            and venue in {"pump", "pump-amm"}
+            and (market is None or int(market.get("pair_age_seconds") or 0) < self.s.min_pair_age_seconds)
+        )
+        if actual_liquidity < self.s.min_liquidity_usd and not unindexed_pump_entry:
+            logger.info("Reject Pump.fun buy %s: verified/observed liquidity %.0f USD below %.0f USD",
+                        mint, actual_liquidity, self.s.min_liquidity_usd)
             return
-        if market and int(market.get("pair_age_seconds") or 0) < self.s.min_pair_age_seconds:
-            # Fresh Pump.fun curve trades are accepted using the curve reserve estimate;
-            # a Dexscreener pair-age signal alone should not block a newly launched curve.
-            if not (is_realtime_signal and curve_liquidity >= self.s.min_liquidity_usd):
-                logger.info("Reject Pump.fun buy %s: pair age below filter", mint)
-                return
+        if market and int(market.get("pair_age_seconds") or 0) < self.s.min_pair_age_seconds and not unindexed_pump_entry:
+            logger.info("Reject Pump.fun buy %s: pair age below filter", mint)
+            return
+        if unindexed_pump_entry:
+            logger.warning(
+                "HIGH-RISK unindexed Pump launch entry for %s: no verified indexed liquidity; "
+                "fixed entry/exposure caps apply, but exit liquidity is not assured",
+                mint,
+            )
 
         equity = self.equity()
         self._refresh_risk_state(equity)
