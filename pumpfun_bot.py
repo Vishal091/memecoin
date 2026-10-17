@@ -161,6 +161,7 @@ class PumpFunBot:
         )
         self.dashboard = None
         self.last_processed_event = set()
+        self.copy_audit = []
         self.signal_stats = {
             "queued_events": 0, "parsed_signals": 0, "unparsed_events": 0,
             "duplicate_events": 0, "unwatched_events": 0,
@@ -291,6 +292,37 @@ class PumpFunBot:
             " ".join(str(detail).split())[:500],
         )
         return delay
+
+    def _audit_copy_event(
+        self, status: str, reason: str, *, source: str = "", wallet: str = "",
+        signature: str = "", mint: str = "", side: str = "", bot_signature: str = "",
+    ) -> None:
+        """Keep the latest decision for each leader transaction for dashboard reconciliation."""
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        wallet = str(wallet or "")
+        signature = str(signature or "")
+        with self.state_lock:
+            match_index = next((
+                i for i, item in enumerate(self.copy_audit)
+                if wallet and signature and item.get("wallet") == wallet
+                and item.get("signature") == signature
+            ), None)
+            previous = self.copy_audit.pop(match_index) if match_index is not None else {}
+            row = {
+                **previous,
+                "first_seen": previous.get("first_seen", now),
+                "updated_at": now,
+                "source": str(source or previous.get("source") or "unknown"),
+                "wallet": wallet or previous.get("wallet", ""),
+                "signature": signature or previous.get("signature", ""),
+                "mint": str(mint or previous.get("mint") or ""),
+                "side": str(side or previous.get("side") or ""),
+                "status": str(status),
+                "reason": str(reason)[:240],
+                "bot_signature": str(bot_signature or previous.get("bot_signature") or ""),
+            }
+            self.copy_audit.insert(0, row)
+            del self.copy_audit[100:]
 
     def dashboard_snapshot(self) -> dict:
         with self.state_lock:
@@ -435,6 +467,7 @@ class PumpFunBot:
                 "error": "Disabled by SOLANA_LOGS_WS_ENABLED",
             }),
             "signal_stats": dict(self.signal_stats),
+            "copy_audit": list(self.copy_audit),
         }
         with self.state_lock:
             self.dashboard_state = state
@@ -588,27 +621,59 @@ class PumpFunBot:
             except queue.Empty:
                 break
             self.signal_stats["queued_events"] += 1
+            event_signature = (event.get("signature") or event.get("txSignature") or event.get("txid")
+                               or event.get("transactionSignature") or "")
+            self._audit_copy_event(
+                "EVENT_RECEIVED", "PumpPortal trade event received; validating fields.",
+                source=str(event.get("source") or "PumpPortal"),
+                wallet=str(event.get("wallet") or event.get("traderPublicKey") or ""),
+                signature=str(event_signature), mint=str(event.get("mint") or ""),
+                side=str(event.get("side") or event.get("txType") or ""),
+            )
             price = self._event_price_usd(event)
             mint = str(event.get("mint") or "")
             if mint and price and price > 0:
                 self.price_cache[mint] = price
                 self.price_cache_at[mint] = time.time()
             if event.get("source") == "token_trade":
+                self._audit_copy_event(
+                    "PRICE_ONLY", "Token-trade subscription is used for price updates, not copy signals.",
+                    source="token_trade", wallet=str(event.get("wallet") or ""),
+                    signature=str(event_signature), mint=str(event.get("mint") or ""),
+                    side=str(event.get("side") or ""),
+                )
                 continue
             signal = self._signal_from_feed(event)
             if not signal:
                 self.signal_stats["unparsed_events"] += 1
+                self._audit_copy_event(
+                    "NOT_COPIED", "Required mint, wallet, side, or token-amount fields could not be parsed.",
+                    source=str(event.get("source") or "PumpPortal"),
+                    wallet=str(event.get("wallet") or event.get("traderPublicKey") or ""),
+                    signature=str(event_signature), mint=str(event.get("mint") or ""),
+                    side=str(event.get("side") or event.get("txType") or ""),
+                )
                 logger.warning("Ignoring PumpPortal trade event because required mint/wallet/side/amount fields could not be parsed; fields=%s",
                                ",".join(sorted(str(k) for k in event.keys())))
                 continue
             if signal["wallet"] not in self.active_wallets:
                 self.signal_stats["unwatched_events"] += 1
+                self._audit_copy_event(
+                    "NOT_COPIED", "Event wallet is not in the bot's current active watch list.",
+                    source=signal.get("source", "PumpPortal"), wallet=signal["wallet"],
+                    signature=signal["signature"], mint=signal["mint"], side=signal["side"],
+                )
                 logger.warning("Ignoring PumpPortal %s event for a wallet not in active subscriptions (%s)",
                                signal["side"], signal["wallet"][:8])
                 continue
             dedupe_key = self._dedupe_key(signal["wallet"], signal["signature"])
             if self.store.signature_seen(dedupe_key):
                 self.signal_stats["duplicate_events"] += 1
+                self._audit_copy_event(
+                    "DUPLICATE", "This leader transaction was already processed.",
+                    source=signal.get("source", "PumpPortal"), wallet=signal["wallet"],
+                    signature=signal["signature"], mint=signal["mint"], side=signal["side"],
+                )
                 continue
             self.signal_stats["parsed_signals"] += 1
             logger.info("Copy signal parsed: side=%s wallet=%s mint=%s source=%s",
@@ -630,17 +695,29 @@ class PumpFunBot:
                 continue
             if wallet not in self.active_wallets:
                 self.signal_stats["unwatched_events"] += 1
+                self._audit_copy_event(
+                    "NOT_COPIED", "Notification wallet is not in the bot's current active watch list.",
+                    source="solana_logs", wallet=wallet, signature=signature,
+                )
                 continue
+            self._audit_copy_event(
+                "TX_INSPECTING", "On-chain transaction observed; validating signer, venue, and token deltas.",
+                source="solana_logs", wallet=wallet, signature=signature,
+            )
             dedupe_key = self._dedupe_key(wallet, signature)
             if self.store.signature_seen(dedupe_key):
                 self.signal_stats["duplicate_events"] += 1
+                self._audit_copy_event(
+                    "DUPLICATE", "This leader transaction was already inspected.",
+                    source="solana_logs", wallet=wallet, signature=signature,
+                )
                 continue
             if self.rpc.backoff_remaining > 0:
                 self.solana_log_events.put(event)
                 break
             event.setdefault("_first_seen_at", time.time())
             try:
-                signals = self.detect_pump_signal(wallet, signature)
+                signals = self.detect_pump_signal(wallet, signature, source="solana_logs")
             except SolanaRPCRateLimited:
                 self.solana_log_events.put(event)
                 break
@@ -706,20 +783,34 @@ class PumpFunBot:
                         all_ids.add(pid)
         return all_ids, top
 
-    def detect_pump_signal(self, wallet: str, signature: str) -> list[dict]:
+    def detect_pump_signal(
+        self, wallet: str, signature: str, source: str = "rpc_poll"
+    ) -> list[dict]:
         tx = self.rpc.transaction(signature)
         if tx is None or tx.get("meta") is None:
             raise SolanaTransactionNotReady(
                 f"Transaction details are not indexed yet for signature {signature[:10]}"
             )
         if tx.get("meta", {}).get("err") is not None:
+            self._audit_copy_event(
+                "NOT_COPIED", "On-chain transaction failed.",
+                source=source, wallet=wallet, signature=signature,
+            )
             return []
         message = ((tx.get("transaction") or {}).get("message") or {})
         if not wallet_is_transaction_signer(wallet, message):
+            self._audit_copy_event(
+                "IGNORED", "Wallet is mentioned in the transaction but is not a transaction signer.",
+                source=source, wallet=wallet, signature=signature,
+            )
             return []
         all_programs, top_programs = self._tx_programs(tx)
         # Strictly exclude generic DEX swaps. We copy only Pump bonding-curve/PumpSwap activity.
         if PUMP_PROGRAM_ID not in all_programs and PUMPSWAP_PROGRAM_ID not in all_programs:
+            self._audit_copy_event(
+                "NOT_COPIED", "Transaction did not invoke Pump or PumpSwap.",
+                source=source, wallet=wallet, signature=signature,
+            )
             return []
         venue = "pump-amm" if PUMPSWAP_PROGRAM_ID in top_programs else "pump"
         deltas, native_delta = self.rpc.wallet_token_deltas(wallet, tx)
@@ -743,6 +834,19 @@ class PumpFunBot:
             mint, data = removed[0]
             side = "sell"
         else:
+            if added and removed:
+                detail = (
+                    "Multiple non-quote token deltas; likely token-to-token routing "
+                    "or a non-SOL quote asset not supported by the current detector."
+                )
+            else:
+                detail = (
+                    "Token/native balance changes did not match exactly one unambiguous "
+                    "Pump buy or sell."
+                )
+            self._audit_copy_event(
+                "NOT_COPIED", detail, source=source, wallet=wallet, signature=signature,
+            )
             return []
         def token_balance(rows):
             total = 0
@@ -763,6 +867,12 @@ class PumpFunBot:
             "native_delta_sol": sol_delta, "block_time": tx.get("blockTime"),
             "venue": venue,
         }
+        self._audit_copy_event(
+            "SIGNAL_PARSED",
+            f"On-chain Pump {side.upper()} parsed; checking entry/risk rules.",
+            source=source, wallet=wallet, signature=signature, mint=mint, side=side,
+        )
+        signal["source"] = source
         # New Pump bonding curves often have no external market index yet. Read
         # their on-chain reserves for a spot-price/liquidity estimate instead of
         # emitting an unpriced RPC signal that buy() must always reject.
@@ -1293,13 +1403,31 @@ class PumpFunBot:
 
     def process_signal(self, signal: dict):
         if signal.get("wallet") not in self.active_wallets:
+            self._audit_copy_event(
+                "NOT_COPIED", "Signal wallet is no longer in the active watch list.",
+                source=signal.get("source", "unknown"), wallet=signal.get("wallet", ""),
+                signature=signal.get("signature", ""), mint=signal.get("mint", ""),
+                side=signal.get("side", ""),
+            )
             return
+        self._audit_copy_event(
+            "SIGNAL_PARSED", "Leader trade parsed; applying duplicate, position, and risk checks.",
+            source=signal.get("source", "unknown"), wallet=signal.get("wallet", ""),
+            signature=signal.get("signature", ""), mint=signal.get("mint", ""),
+            side=signal.get("side", ""),
+        )
         is_new_signal = self.store.add_signal(
             signal["wallet"], signal["signature"], signal["mint"], signal["side"],
             signal["amount_ui"], signal["decimals"],
         )
         if not is_new_signal:
             self.signal_stats["duplicate_events"] += 1
+            self._audit_copy_event(
+                "DUPLICATE", "This exact wallet/signature/mint/side signal was already recorded.",
+                source=signal.get("source", "unknown"), wallet=signal.get("wallet", ""),
+                signature=signal.get("signature", ""), mint=signal.get("mint", ""),
+                side=signal.get("side", ""),
+            )
             logger.debug(
                 "Ignoring duplicate copy signal wallet=%s signature=%s mint=%s side=%s",
                 str(signal["wallet"])[:8], str(signal["signature"])[:10],
@@ -1307,18 +1435,38 @@ class PumpFunBot:
             )
             return
         if self.wallet_address and signal["wallet"] == self.wallet_address:
+            self._audit_copy_event(
+                "IGNORED", "Observed transaction belongs to the bot wallet, not a leader.",
+                source=signal.get("source", "unknown"), wallet=signal["wallet"],
+                signature=signal["signature"], mint=signal["mint"], side=signal["side"],
+            )
             return
         if signal["side"] == "buy":
             self.signal_stats["buy_signals"] += 1
+            self._audit_copy_event(
+                "BUY_SIGNAL", "Leader buy detected; evaluating eligibility, liquidity, and risk limits.",
+                source=signal.get("source", "unknown"), wallet=signal["wallet"],
+                signature=signal["signature"], mint=signal["mint"], side="buy",
+            )
             self.buy(signal)
         elif signal["side"] == "sell":
             position = self.store.get_position(signal["mint"])
             if not position:
                 self.signal_stats["sell_without_position"] += 1
+                self._audit_copy_event(
+                    "NOT_COPIED", "Leader sold, but the bot has no tracked position in this mint.",
+                    source=signal.get("source", "unknown"), wallet=signal["wallet"],
+                    signature=signal["signature"], mint=signal["mint"], side="sell",
+                )
                 logger.info("Leader sell observed but no tracked position is open for mint=%s; no sell copied",
                             signal["mint"][:8])
                 return
             if not position_source_matches_wallet(position, signal.get("wallet")):
+                self._audit_copy_event(
+                    "NOT_COPIED", "Position belongs to a different source wallet; cross-leader selling is blocked.",
+                    source=signal.get("source", "unknown"), wallet=signal["wallet"],
+                    signature=signal["signature"], mint=signal["mint"], side="sell",
+                )
                 logger.info(
                     "Ignoring sell for mint=%s from wallet=%s; tracked position source_wallet=%s. "
                     "A different leader's sell must not close this position.",
@@ -1380,7 +1528,7 @@ class PumpFunBot:
                 cursor_candidate = signature
                 continue
             try:
-                signals = self.detect_pump_signal(wallet, signature)
+                signals = self.detect_pump_signal(wallet, signature, source="rpc_poll")
             except SolanaRPCRateLimited:
                 logger.warning("RPC fallback paused for %s; keeping cursor at the last inspected transaction.", wallet[:8])
                 rate_limited = True
