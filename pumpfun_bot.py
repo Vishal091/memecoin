@@ -30,7 +30,8 @@ from pumpportal import (
     PUMPSWAP_PROGRAM_ID,
     PumpPortalExecutor,
 )
-from solana_rpc import SolanaRPC, SolanaRPCRateLimited
+from solana_rpc import SolanaRPC, SolanaRPCRateLimited, SolanaTransactionNotReady
+from pump_curve import fetch_pump_curve
 from storage import Store
 
 logger = logging.getLogger("pumpfun")
@@ -431,11 +432,29 @@ class PumpFunBot:
             if self.rpc.backoff_remaining > 0:
                 self.solana_log_events.put(event)
                 break
+            event.setdefault("_first_seen_at", time.time())
             try:
                 signals = self.detect_pump_signal(wallet, signature)
             except SolanaRPCRateLimited:
                 self.solana_log_events.put(event)
                 break
+            except SolanaTransactionNotReady:
+                retry_count = int(event.get("_retry_count", 0))
+                age_seconds = time.time() - float(event["_first_seen_at"])
+                if retry_count < 8 and age_seconds < 45:
+                    event["_retry_count"] = retry_count + 1
+                    self.solana_log_events.put(event)
+                    if retry_count in (0, 2, 5):
+                        logger.info(
+                            "Transaction details not indexed yet for %s; retry %d/8",
+                            signature[:10], retry_count + 1,
+                        )
+                    break
+                logger.warning(
+                    "Transaction details remained unavailable for %s after retries; "
+                    "leaving it unmarked so signature polling can retry", signature[:10],
+                )
+                continue
             except Exception as exc:
                 logger.warning("Could not inspect Solana log notification (%s)", type(exc).__name__)
                 continue
@@ -483,7 +502,11 @@ class PumpFunBot:
 
     def detect_pump_signal(self, wallet: str, signature: str) -> list[dict]:
         tx = self.rpc.transaction(signature)
-        if not tx or (tx.get("meta") or {}).get("err") is not None:
+        if tx is None or tx.get("meta") is None:
+            raise SolanaTransactionNotReady(
+                f"Transaction details are not indexed yet for signature {signature[:10]}"
+            )
+        if tx.get("meta", {}).get("err") is not None:
             return []
         account_keys = (((tx.get("transaction") or {}).get("message") or {}).get("accountKeys") or [])
         wallet_signed = any(
@@ -531,7 +554,7 @@ class PumpFunBot:
         meta = tx.get("meta") or {}
         pre_raw = token_balance(meta.get("preTokenBalances"))
         post_raw = token_balance(meta.get("postTokenBalances"))
-        return [{
+        signal = {
             "wallet": wallet, "signature": signature, "mint": mint, "side": side,
             "amount_ui": abs(float(data["delta_ui"])),
             "amount_raw": abs(int(data["delta_raw"])),
@@ -539,7 +562,25 @@ class PumpFunBot:
             "leader_pre_raw": pre_raw, "leader_post_raw": post_raw,
             "native_delta_sol": sol_delta, "block_time": tx.get("blockTime"),
             "venue": venue,
-        }]
+        }
+        # New Pump bonding curves often have no external market index yet. Read
+        # their on-chain reserves for a spot-price/liquidity estimate instead of
+        # emitting an unpriced RPC signal that buy() must always reject.
+        if venue == "pump":
+            try:
+                curve = fetch_pump_curve(self.rpc, mint)
+                if curve is not None and not curve.complete:
+                    sol_price = self.market.sol_price_usd()
+                    curve_price = curve.price_usd(sol_price, int(data["decimals"]))
+                    if curve_price is not None:
+                        signal["observed_price_usd"] = curve_price
+                        signal["curve_liquidity_usd"] = curve.liquidity_usd(sol_price)
+                        signal["curve_state_verified"] = True
+            except SolanaRPCRateLimited:
+                raise
+            except Exception as exc:
+                logger.debug("Bonding-curve quote unavailable for %s (%s)", mint[:8], type(exc).__name__)
+        return [signal]
 
     def _mark_price(self, mint: str, fallback: float) -> float:
         """Prefer recent PumpPortal trade ticks; cache market quotes to reduce HTTP churn."""
@@ -670,14 +711,25 @@ class PumpFunBot:
         pair_liquidity = float(market.get("liquidity_usd") or 0) if market else 0.0
         actual_liquidity = max(curve_liquidity, pair_liquidity)
         is_realtime_signal = signal.get("source") == "account_trade"
+        curve_state_verified = bool(signal.get("curve_state_verified"))
         venue = str(signal.get("venue", "pump"))
-        unindexed_pump_entry = (
-            self.s.allow_unindexed_pump_curve
-            and is_realtime_signal
+        # Keep the legacy PumpPortal exception only for account-trade events.
+        # RPC notifications may bypass a young/unindexed pair-age filter only
+        # when an on-chain curve snapshot independently confirms sufficient liquidity.
+        allow_unindexed_account_trade = (
+            self.s.allow_unindexed_pump_curve and is_realtime_signal
             and venue in {"pump", "pump-amm"}
+        )
+        allow_verified_curve_age_bypass = (
+            self.s.allow_unindexed_pump_curve and curve_state_verified
+            and curve_liquidity >= self.s.min_liquidity_usd
+            and venue == "pump"
+        )
+        unindexed_pump_entry = (
+            (allow_unindexed_account_trade or allow_verified_curve_age_bypass)
             and (market is None or int(market.get("pair_age_seconds") or 0) < self.s.min_pair_age_seconds)
         )
-        if actual_liquidity < self.s.min_liquidity_usd and not unindexed_pump_entry:
+        if actual_liquidity < self.s.min_liquidity_usd and not allow_unindexed_account_trade:
             logger.info("Reject Pump.fun buy %s: verified/observed liquidity %.0f USD below %.0f USD",
                         mint, actual_liquidity, self.s.min_liquidity_usd)
             return
@@ -951,6 +1003,10 @@ class PumpFunBot:
                 signals = self.detect_pump_signal(wallet, signature)
             except SolanaRPCRateLimited:
                 logger.warning("RPC fallback paused for %s; keeping cursor at the last inspected transaction.", wallet[:8])
+                rate_limited = True
+                break
+            except SolanaTransactionNotReady:
+                logger.info("Transaction details not indexed for %s; keeping cursor for retry.", signature[:10])
                 rate_limited = True
                 break
             for signal in signals:
