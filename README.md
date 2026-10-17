@@ -36,7 +36,7 @@ notepad .env
 
 Set these values in your **local** `.env`:
 
-- `PUMPFUN_BEARER_TOKEN`: bearer token from your own authenticated Pump.fun browser request to the leaderboard endpoint. It may expire. Never paste it into chat or commit it.
+- `PUMPFUN_AUTH_TOKEN`: the value of the `auth_token` cookie from your own successful Pump.fun leaderboard request. Copy only that cookie's value, never the full Cookie header. It may expire. Keep it in your local `.env`; never paste it into chat or commit it.
 - `PUMPPORTAL_API_KEY`: your PumpPortal API key for the trader event stream. Keep it local.
 - `BOT_MODE=paper` and `DATABASE_PATH=memecoin-pumpfun-paper.db`.
 
