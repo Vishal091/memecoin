@@ -70,9 +70,25 @@ class PumpPortalExecutor:
         signers = list(message.account_keys[:message.header.num_required_signatures])
         if len(signers) != 1 or str(signers[0]) != owner:
             raise RuntimeError("Unexpected signer list; refusing to sign")
-        if VENUE_PROGRAMS[pool] not in {str(k) for k in message.account_keys}:
-            raise RuntimeError("Transaction does not contain the requested Pump venue program")
+        program_ids = self._top_level_program_ids(message)
+        expected_program = VENUE_PROGRAMS[pool]
+        if expected_program not in program_ids:
+            actual = ", ".join(program_ids[:20]) if program_ids else "(none)"
+            raise RuntimeError(
+                f"Transaction does not invoke requested {pool} program; "
+                f"expected={expected_program}; top_level_programs={actual}"
+            )
         return VersionedTransaction(message, [keypair])
+
+    @staticmethod
+    def _top_level_program_ids(message):
+        """Return public program IDs referenced by the message's top-level instructions."""
+        keys = [str(key) for key in message.account_keys]
+        program_ids = []
+        for instruction in message.instructions:
+            index = int(instruction.program_id_index)
+            program_ids.append(keys[index] if index < len(keys) else f"<invalid-index:{index}>")
+        return list(dict.fromkeys(program_ids))
 
     def _send_confirm(self, tx):
         encoded = base64.b64encode(bytes(tx)).decode("ascii")
