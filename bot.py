@@ -86,8 +86,9 @@ class CopyBot:
         total_loss = initial - equity
         if total_loss >= self.s.total_loss_limit_usd:
             self.store.set_state("halted", "1")
+            self.store.set_state("liquidate_all_pending", "1")
             self.store.set_state("halt_reason", f"Total loss limit reached: drawdown {total_loss:.2f} USD")
-            logger.critical("TOTAL LOSS HALT: %s", self.store.get_state("halt_reason"))
+            logger.critical("TOTAL LOSS HALT: %s; attempting to liquidate tracked positions", self.store.get_state("halt_reason"))
             return
         day_start = float(self.store.get_state("day_start_equity", str(equity)))
         daily_loss = day_start - equity
@@ -246,7 +247,8 @@ class CopyBot:
         if not p:
             return False
         full_exit = (reason in {"marked loss stop", "trailing stop"} or reason.startswith("followed wallet ")
-                     or reason.startswith("experiment expiry") or reason.startswith("pending exit:"))
+                     or reason.startswith("experiment expiry") or reason.startswith("total loss limit")
+                     or reason.startswith("pending exit:"))
         pending_key = f"exit_pending:{mint}"
         if full_exit:
             self.store.set_state(pending_key, reason)
@@ -479,10 +481,16 @@ class CopyBot:
                             logger.info("Handled %d new transactions for %s", n, wallet)
                     except Exception:
                         logger.exception("Watcher cycle failed for %s; cursor will retry on next poll where possible", wallet)
+                liquidate_all = self.store.get_state("liquidate_all_pending", "0") == "1"
+                if liquidate_all:
+                    for p in self.store.list_positions():
+                        self.sell(p["mint"], int(p["amount_raw"]), "total loss limit liquidation")
                 if expired:
                     for p in self.store.list_positions():
                         self.sell(p["mint"], int(p["amount_raw"]), "experiment expiry liquidation")
                 self.manage_positions()
+                if liquidate_all and not self.store.list_positions():
+                    self.store.set_state("liquidate_all_pending", "0")
                 equity = self.equity()
                 self._refresh_risk_state(equity)
                 open_count = len(self.store.list_positions())
