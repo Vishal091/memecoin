@@ -44,6 +44,7 @@ class PumpFunSettings:
     allow_unindexed_pump_curve: bool
     default_leaderboard_window: str
     rpc_url: str
+    solana_logs_ws_enabled: bool
     keypair_path: Path
     max_entry_usd: float
     max_total_exposure_usd: float
@@ -90,6 +91,7 @@ class PumpFunSettings:
             allow_unindexed_pump_curve=os.getenv("ALLOW_UNINDEXED_PUMP_CURVE", "true").strip().lower() in {"1", "true", "yes", "on"},
             default_leaderboard_window=os.getenv("DEFAULT_LEADERBOARD_WINDOW", "day").strip().lower(),
             rpc_url=os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip(),
+            solana_logs_ws_enabled=os.getenv("SOLANA_LOGS_WS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
             keypair_path=Path(os.getenv("KEYPAIR_PATH", "./wallet.json")).expanduser(),
             max_entry_usd=_float("MAX_ENTRY_USD", 2.0),
             max_total_exposure_usd=_float("MAX_TOTAL_EXPOSURE_USD", 3.0),
