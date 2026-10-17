@@ -3,9 +3,80 @@ import unittest
 from pathlib import Path
 
 from market_data import MarketData, WSOL_MINT
+from pumpfun_bot import PumpFunBot, native_build_retry_delay_seconds
+from native_pump import TransactionBuildFailed
+from types import SimpleNamespace
 from solana_rpc import SolanaRPC
 from storage import Store
 
+
+
+
+class BuildFailureHandlingTests(unittest.TestCase):
+    class FakeStore:
+        def __init__(self):
+            self.state = {}
+
+        def get_position(self, mint):
+            return None
+
+        def get_state(self, key, default=""):
+            return self.state.get(key, default)
+
+        def set_state(self, key, value):
+            self.state[key] = str(value)
+
+    class FakeMarket:
+        def sol_price_usd(self):
+            return 150.0
+
+        def token_market(self, mint):
+            return {"price_usd": 1.0, "liquidity_usd": 10_000.0, "pair_age_seconds": 120}
+
+    class FakeExecutor:
+        def trade(self, **kwargs):
+            raise TransactionBuildFailed(
+                "Native Pump SDK transaction build failed: Error: "
+                "Native executor only supports SOL-quoted Pump tokens; refusing a token-quoted coin."
+            )
+
+    def test_token_quoted_buy_is_skipped_without_global_halt(self):
+        bot = object.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(
+            mode="live", min_liquidity_usd=5_000, min_pair_age_seconds=60,
+            allow_unindexed_pump_curve=False, max_entry_usd=1.0,
+            max_total_exposure_usd=10.0, slippage_bps=100,
+        )
+        bot.store = self.FakeStore()
+        bot.market = self.FakeMarket()
+        bot.executor = self.FakeExecutor()
+        bot.keypair = object()
+        bot.wallet_address = "test-wallet"
+        bot._estimate_market_cap_usd = lambda *args, **kwargs: (None, "")
+        bot.equity = lambda: 10.0
+        bot._refresh_risk_state = lambda equity: None
+        bot._can_enter = lambda equity: (True, "allowed")
+        bot._current_positions_value = lambda: 0.0
+
+        bot.buy({
+            "mint": "test-mint", "observed_price_usd": 1.0,
+            "wallet": "leader-wallet", "signature": "leader-signature",
+            "venue": "pump-amm", "source": "solana_logs", "decimals": 6,
+        })
+
+        self.assertNotIn("manual_review_halt", bot.store.state)
+        self.assertGreater(float(bot.store.state["native_build_retry_after:test-mint"]), 0)
+        self.assertIn("token-quoted coin", bot.store.state["native_build_failure:test-mint"])
+        self.assertIsNone(bot.store.get_position("test-mint"))
+
+    def test_quote_token_failure_gets_long_cooldown(self):
+        self.assertEqual(
+            native_build_retry_delay_seconds("token-quoted coin is not supported"),
+            6 * 60 * 60,
+        )
+
+    def test_other_builder_failures_get_short_cooldown(self):
+        self.assertEqual(native_build_retry_delay_seconds("Pool account not found"), 60)
 
 class ParserTests(unittest.TestCase):
     def setUp(self):
