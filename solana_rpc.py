@@ -117,6 +117,17 @@ class SolanaRPC:
         result = self.call("getBalance", [address, {"commitment": "confirmed"}])
         return int((result or {}).get("value", 0))
 
+    def token_supply_ui(self, mint: str) -> float:
+        """Return the mint's current total supply in UI units."""
+        result = self.call("getTokenSupply", [mint, {"commitment": "confirmed"}]) or {}
+        value = result.get("value") or {}
+        ui_string = value.get("uiAmountString")
+        if ui_string is not None:
+            return float(ui_string)
+        raw = int(value.get("amount") or 0)
+        decimals = int(value.get("decimals") or 0)
+        return raw / (10 ** decimals)
+
     @staticmethod
     def _key_string(key: Any) -> str:
         if isinstance(key, str):

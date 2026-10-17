@@ -93,6 +93,10 @@ class Store:
                 self.db.execute("ALTER TABLE positions ADD COLUMN source_wallet TEXT")
             if "source_signature" not in pos_columns:
                 self.db.execute("ALTER TABLE positions ADD COLUMN source_signature TEXT")
+            if "entry_market_cap_usd" not in pos_columns:
+                self.db.execute("ALTER TABLE positions ADD COLUMN entry_market_cap_usd REAL")
+            if "entry_market_cap_source" not in pos_columns:
+                self.db.execute("ALTER TABLE positions ADD COLUMN entry_market_cap_source TEXT")
 
     def close(self) -> None:
         self.db.close()
@@ -144,13 +148,13 @@ class Store:
     def upsert_position(self, p: dict) -> None:
         columns = ("mint", "decimals", "amount_raw", "entry_price_usd", "initial_amount_raw",
                    "peak_price_usd", "tp1_done", "tp2_done", "opened_at", "last_price_usd", "invested_usd",
-                   "source_wallet", "source_signature")
+                   "source_wallet", "source_signature", "entry_market_cap_usd", "entry_market_cap_source")
         with self.db:
             self.db.execute(
                 "INSERT INTO positions (" + ",".join(columns) + ") VALUES (" + ",".join("?" for _ in columns) + ") "
                 "ON CONFLICT(mint) DO UPDATE SET " +
                 ",".join(f"{c}=excluded.{c}" for c in columns if c != "mint"),
-                tuple(p[c] for c in columns))
+                tuple(p.get(c) for c in columns))
 
     def delete_position(self, mint: str) -> None:
         with self.db:

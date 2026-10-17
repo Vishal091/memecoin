@@ -85,6 +85,8 @@ class PumpFunBot:
         self.price_cache_at = {}
         self.market_price_cache = {}
         self.market_price_cache_at = {}
+        self.token_supply_cache: dict[str, tuple[float, float]] = {}
+        self.market_cap_cache: dict[str, tuple[float, str, float]] = {}
         self.state_lock = threading.RLock()
         self.commands = queue.Queue()
         self.trade_events = queue.Queue()
@@ -183,9 +185,16 @@ class PumpFunBot:
             if mark <= 0:
                 mark = float(p["last_price_usd"])
             move = ((mark / entry) - 1.0) * 100.0 if entry > 0 else 0.0
+            current_market_cap_usd, current_market_cap_source = self._estimate_market_cap_usd(
+                str(p["mint"]), mark
+            )
             positions.append({
                 "mint": p["mint"], "amount_raw": p["amount_raw"], "decimals": p["decimals"],
                 "entry_price_usd": entry, "last_price_usd": mark, "move_pct": move,
+                "entry_market_cap_usd": p.get("entry_market_cap_usd"),
+                "entry_market_cap_source": p.get("entry_market_cap_source") or "",
+                "current_market_cap_usd": current_market_cap_usd,
+                "current_market_cap_source": current_market_cap_source or "",
                 "source_wallet": p.get("source_wallet", ""),
             })
         trades = self.store.recent_trades(15)
@@ -359,6 +368,24 @@ class PumpFunBot:
             curve_liquidity_usd = real_sol_value * 2 * self.market.sol_price_usd()
         except (TypeError, ValueError, RuntimeError):
             curve_liquidity_usd = 0.0
+
+        # PumpPortal's marketCapSol is a SOL-denominated snapshot at the leader's
+        # trade. Prefer a directly supplied USD value when available.
+        event_market_cap_usd = 0.0
+        try:
+            direct_market_cap = float(event.get("marketCapUsd") or event.get("market_cap_usd") or 0)
+            if direct_market_cap > 0:
+                event_market_cap_usd = direct_market_cap
+            else:
+                market_cap_sol = float(
+                    event.get("marketCapSol") or event.get("market_cap_sol")
+                    or event.get("marketCapSOL") or 0
+                )
+                if market_cap_sol > 0:
+                    event_market_cap_usd = market_cap_sol * self.market.sol_price_usd()
+        except (TypeError, ValueError, RuntimeError):
+            event_market_cap_usd = 0.0
+
         return {
             "wallet": wallet, "signature": str(tx_sig), "mint": mint, "side": side,
             "amount_ui": observed_amount, "amount_raw": amount_raw, "decimals": decimals,
@@ -367,6 +394,7 @@ class PumpFunBot:
             "venue": str(event.get("pool") or "pump"),
             "observed_price_usd": observed_price or 0.0,
             "curve_liquidity_usd": curve_liquidity_usd,
+            "market_cap_usd": event_market_cap_usd or None,
             "source": str(event.get("source") or "account_trade"),
             "block_time": event.get("timestamp"),
         }
@@ -616,6 +644,72 @@ class PumpFunBot:
             return market_price
         return max(0.0, float(fallback or 0))
 
+    def _estimate_market_cap_usd(
+        self,
+        mint: str,
+        price_usd: float,
+        *,
+        market: dict | None = None,
+        feed_market_cap_usd: float | None = None,
+    ) -> tuple[float | None, str | None]:
+        """Estimate market cap with an explicit source and a short-lived cache."""
+        now = time.time()
+
+        if market:
+            try:
+                cap = float(market.get("market_cap_usd") or 0)
+            except (TypeError, ValueError):
+                cap = 0.0
+            if cap > 0:
+                source = str(market.get("market_cap_source") or "Market-data estimate")
+                self.market_cap_cache[mint] = (cap, source, now)
+                return cap, source
+
+        try:
+            feed_cap = float(feed_market_cap_usd or 0)
+        except (TypeError, ValueError):
+            feed_cap = 0.0
+        if feed_cap > 0:
+            return feed_cap, "PumpPortal leader-trade snapshot"
+
+        cached_cap = self.market_cap_cache.get(mint)
+        if cached_cap and now - cached_cap[2] <= 15:
+            return cached_cap[0], cached_cap[1]
+
+        if market is None:
+            try:
+                latest_market = self.market.token_market(mint)
+            except Exception as exc:
+                logger.debug("Current market-cap lookup failed for %s (%s)", mint[:8], type(exc).__name__)
+                latest_market = None
+            if latest_market:
+                try:
+                    cap = float(latest_market.get("market_cap_usd") or 0)
+                except (TypeError, ValueError):
+                    cap = 0.0
+                if cap > 0:
+                    source = str(latest_market.get("market_cap_source") or "Market-data estimate")
+                    self.market_cap_cache[mint] = (cap, source, now)
+                    return cap, source
+
+        cached_supply = self.token_supply_cache.get(mint)
+        if cached_supply and now - cached_supply[1] <= 300:
+            supply = cached_supply[0]
+        else:
+            try:
+                supply = float(self.rpc.token_supply_ui(mint))
+                self.token_supply_cache[mint] = (supply, now)
+            except Exception as exc:
+                logger.debug("Token supply lookup failed for %s (%s)", mint[:8], type(exc).__name__)
+                supply = 0.0
+
+        if supply > 0 and price_usd > 0:
+            cap = supply * price_usd
+            source = "Price × on-chain total supply (FDV estimate)"
+            self.market_cap_cache[mint] = (cap, source, now)
+            return cap, source
+        return None, None
+
     def _current_positions_value(self) -> float:
         value = 0.0
         for pos in self.store.list_positions():
@@ -709,6 +803,13 @@ class PumpFunBot:
             logger.info("Reject Pump.fun buy %s: no reliable trade or market price yet", mint)
             return
 
+        entry_market_cap_usd, entry_market_cap_source = self._estimate_market_cap_usd(
+            mint,
+            observed_price,
+            market=market,
+            feed_market_cap_usd=signal.get("market_cap_usd"),
+        )
+
         curve_liquidity = float(signal.get("curve_liquidity_usd") or 0)
         pair_liquidity = float(market.get("liquidity_usd") or 0) if market else 0.0
         actual_liquidity = max(curve_liquidity, pair_liquidity)
@@ -796,6 +897,8 @@ class PumpFunBot:
             "opened_at": timestamp, "last_price_usd": observed_price,
             "invested_usd": cost_basis, "source_wallet": signal["wallet"],
             "source_signature": signal["signature"],
+            "entry_market_cap_usd": entry_market_cap_usd,
+            "entry_market_cap_source": entry_market_cap_source or "",
         }
         self.store.upsert_position(position)
         self.store.set_state(f"pool:{mint}", used_pool)
