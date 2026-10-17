@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from market_data import MarketData, WSOL_MINT
+from pumpfun_bot import position_source_matches_wallet
 from solana_rpc import SolanaRPC
 from storage import Store
 
