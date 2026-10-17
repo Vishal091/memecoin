@@ -1,6 +1,7 @@
 """PumpPortal Local Transaction API adapter for Pump.fun/PumpSwap."""
 import base64
 import json
+import logging
 import time
 from pathlib import Path
 import requests
@@ -11,6 +12,7 @@ PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 PUMPSWAP_PROGRAM_ID = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 PUMPPORTAL_TRADE_URL = "https://pumpportal.fun/api/trade-local"
 VENUE_PROGRAMS = {"pump": PUMP_PROGRAM_ID, "pump-amm": PUMPSWAP_PROGRAM_ID}
+logger = logging.getLogger(__name__)
 
 
 class PumpPortalExecutor:
@@ -56,7 +58,13 @@ class PumpPortalExecutor:
         }
         response = self.http.post(PUMPPORTAL_TRADE_URL, json=body, timeout=self.timeout)
         if response.status_code != 200:
-            raise RuntimeError(f"PumpPortal {pool} build failed {response.status_code}: {response.text[:300]}")
+            # Keep the response body visible for diagnosis, but bound its size so
+            # an upstream HTML error page cannot flood the bot log.
+            body = " ".join((response.text or "").split())[:500]
+            raise RuntimeError(
+                f"PumpPortal {pool} build failed HTTP {response.status_code}: "
+                f"{body or '(empty response body)'}"
+            )
         unsigned = VersionedTransaction.from_bytes(response.content)
         message = unsigned.message
         signers = list(message.account_keys[:message.header.num_required_signatures])
@@ -85,7 +93,7 @@ class PumpPortalExecutor:
         raise TimeoutError(f"Confirmation timeout for {sig}; do not retry before checking signature")
 
     def trade(self, owner, keypair, mint, action, amount, denominated_in_sol, slippage_bps, preferred_pool):
-        last_error = None
+        build_errors = []
         pools = [preferred_pool] + [p for p in ("pump", "pump-amm") if p != preferred_pool]
         for pool in pools:
             token_before = self.token_balance_raw(owner, mint)
@@ -93,8 +101,13 @@ class PumpPortalExecutor:
             try:
                 tx = self._build(owner, mint, action, amount, denominated_in_sol, slippage_bps, pool, keypair)
             except Exception as exc:
-                last_error = exc
+                detail = f"{pool}: {type(exc).__name__}: {exc}"
+                build_errors.append(detail)
+                logger.warning("PumpPortal route build failed mint=%s pool=%s error=%s", mint, pool, exc)
                 continue
+            # Do not catch submission/confirmation exceptions here. Once a signed
+            # transaction might have been sent, trying another route could duplicate
+            # a live trade when the first transaction's status is ambiguous.
             signature = self._send_confirm(tx)
             deadline = time.monotonic() + 8
             token_after = token_before
@@ -117,4 +130,8 @@ class PumpPortalExecutor:
                     "sol_delta_lamports": sol_delta,
                     "total_input_amount": max(0, -sol_delta) if action == "buy" else abs(delta),
                     "total_output_amount": delta if action == "buy" else max(0, sol_delta)}
-        raise RuntimeError(f"No Pump ecosystem route for {mint}: {last_error}")
+        details = " | ".join(build_errors) if build_errors else "no build attempts recorded"
+        raise RuntimeError(
+            f"No Pump ecosystem route for {mint}; no transaction was submitted. "
+            f"Build attempts: {details}"
+        )
