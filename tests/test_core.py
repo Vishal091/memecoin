@@ -31,6 +31,81 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(deltas[mint]["delta_raw"], 1_250_000)
         self.assertEqual(deltas[mint]["decimals"], 6)
 
+
+    def test_detect_usdc_funded_buy(self):
+        wallet = "Wallet111111111111111111111111111111111111111"
+        mint = "Mint1111111111111111111111111111111111111111"
+        usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        tx = {
+            "transaction": {"message": {"accountKeys": [{"pubkey": wallet}]}},
+            "meta": {
+                "err": None, "preBalances": [5_000_000_000], "postBalances": [4_999_995_000],
+                "preTokenBalances": [
+                    {"owner": wallet, "mint": usdc,
+                     "uiTokenAmount": {"amount": "10000000", "decimals": 6}}
+                ],
+                "postTokenBalances": [
+                    {"owner": wallet, "mint": usdc,
+                     "uiTokenAmount": {"amount": "9000000", "decimals": 6}},
+                    {"owner": wallet, "mint": mint,
+                     "uiTokenAmount": {"amount": "1250000", "decimals": 6}},
+                ],
+            },
+            "blockTime": 1,
+        }
+        self.rpc.transaction = lambda signature: tx
+        signal = self.rpc.detect_wallet_signal(wallet, "signature")
+        self.assertEqual(len(signal), 1)
+        self.assertEqual(signal[0]["side"], "buy")
+        self.assertEqual(signal[0]["mint"], mint)
+
+    def test_detect_usdc_proceeds_as_sell(self):
+        wallet = "Wallet111111111111111111111111111111111111111"
+        mint = "Mint1111111111111111111111111111111111111111"
+        usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        tx = {
+            "transaction": {"message": {"accountKeys": [{"pubkey": wallet}]}},
+            "meta": {
+                "err": None, "preBalances": [5_000_000_000], "postBalances": [4_999_995_000],
+                "preTokenBalances": [
+                    {"owner": wallet, "mint": mint,
+                     "uiTokenAmount": {"amount": "1250000", "decimals": 6}}
+                ],
+                "postTokenBalances": [
+                    {"owner": wallet, "mint": usdc,
+                     "uiTokenAmount": {"amount": "1000000", "decimals": 6}},
+                ],
+            },
+            "blockTime": 1,
+        }
+        self.rpc.transaction = lambda signature: tx
+        signal = self.rpc.detect_wallet_signal(wallet, "signature")
+        self.assertEqual(len(signal), 1)
+        self.assertEqual(signal[0]["side"], "sell")
+        self.assertEqual(signal[0]["mint"], mint)
+
+    def test_ignores_ambiguous_token_to_token_swap(self):
+        wallet = "Wallet111111111111111111111111111111111111111"
+        buy_mint = "Mint1111111111111111111111111111111111111111"
+        sell_mint = "Mint2222222222222222222222222222222222222222"
+        tx = {
+            "transaction": {"message": {"accountKeys": [{"pubkey": wallet}]}},
+            "meta": {
+                "err": None, "preBalances": [5_000_000_000], "postBalances": [4_999_995_000],
+                "preTokenBalances": [{"owner": wallet, "mint": sell_mint,
+                    "uiTokenAmount": {"amount": "2000000", "decimals": 6}}],
+                "postTokenBalances": [
+                    {"owner": wallet, "mint": sell_mint,
+                     "uiTokenAmount": {"amount": "1000000", "decimals": 6}},
+                    {"owner": wallet, "mint": buy_mint,
+                     "uiTokenAmount": {"amount": "1000000", "decimals": 6}},
+                ],
+            },
+            "blockTime": 1,
+        }
+        self.rpc.transaction = lambda signature: tx
+        self.assertEqual(self.rpc.detect_wallet_signal(wallet, "signature"), [])
+
     def test_failed_transaction_has_no_signal_deltas(self):
         wallet = "Wallet111111111111111111111111111111111111111"
         tx = {"transaction": {"message": {"accountKeys": [wallet]}},
