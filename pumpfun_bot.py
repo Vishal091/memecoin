@@ -89,6 +89,11 @@ class PumpFunBot:
                      if self.s.pumpportal_api_key else None)
         self.dashboard = None
         self.last_processed_event = set()
+        self.signal_stats = {
+            "queued_events": 0, "parsed_signals": 0, "unparsed_events": 0,
+            "duplicate_events": 0, "unwatched_events": 0,
+            "buy_signals": 0, "sell_signals": 0, "sell_without_position": 0,
+        }
         self.store.set_state("auto_copy_enabled", 1 if self.auto_copy_enabled else 0)
         self.store.set_state("leaderboard_window", self.selected_window)
 
@@ -193,6 +198,28 @@ class PumpFunBot:
             "trades": trades,
             "feed_connected": bool(self.feed and self.feed.connected.is_set()),
             "feed_error": self.feed.last_error if self.feed else "",
+            "feed_stats": ({
+                "messages_received": self.feed.messages_received,
+                "trade_events_received": self.feed.trade_events_received,
+                "account_trade_events_received": self.feed.account_trade_events_received,
+                "last_message_at": self.feed.last_message_at,
+                "connected_at": self.feed.connected_at,
+                "last_account_trade_at": self.feed.last_account_trade_at,
+                "last_event_summary": self.feed.last_event_summary,
+                "last_notice": self.feed.last_notice,
+                "subscribed_wallet_count": self.feed.subscribed_wallet_count,
+                "subscription_updates": self.feed.subscription_updates,
+                "connected": self.feed.connected.is_set(),
+                "error": self.feed.last_error,
+            } if self.feed else {
+                "messages_received": 0, "trade_events_received": 0,
+                "account_trade_events_received": 0, "last_message_at": 0,
+                "connected_at": 0, "last_account_trade_at": 0,
+                "last_event_summary": "", "last_notice": "PumpPortal API key not configured",
+                "subscribed_wallet_count": 0, "subscription_updates": 0,
+                "connected": False, "error": "PumpPortal API key not configured",
+            }),
+            "signal_stats": dict(self.signal_stats),
         }
         with self.state_lock:
             self.dashboard_state = state
@@ -320,6 +347,7 @@ class PumpFunBot:
                 event = self.trade_events.get_nowait()
             except queue.Empty:
                 break
+            self.signal_stats["queued_events"] += 1
             price = self._event_price_usd(event)
             mint = str(event.get("mint") or "")
             if mint and price and price > 0:
@@ -329,11 +357,21 @@ class PumpFunBot:
                 continue
             signal = self._signal_from_feed(event)
             if not signal:
+                self.signal_stats["unparsed_events"] += 1
+                logger.warning("Ignoring PumpPortal trade event because required mint/wallet/side/amount fields could not be parsed; fields=%s",
+                               ",".join(sorted(str(k) for k in event.keys())))
                 continue
             if signal["wallet"] not in self.active_wallets:
+                self.signal_stats["unwatched_events"] += 1
+                logger.warning("Ignoring PumpPortal %s event for a wallet not in active subscriptions (%s)",
+                               signal["side"], signal["wallet"][:8])
                 continue
             if self.store.signature_seen(signal["signature"]):
+                self.signal_stats["duplicate_events"] += 1
                 continue
+            self.signal_stats["parsed_signals"] += 1
+            logger.info("Copy signal parsed: side=%s wallet=%s mint=%s source=%s",
+                        signal["side"], signal["wallet"][:8], signal["mint"][:8], signal.get("source"))
             self.process_signal(signal)
             self.store.mark_signature_seen(signal["signature"], signal["wallet"])
 
@@ -764,8 +802,10 @@ class PumpFunBot:
         if self.wallet_address and signal["wallet"] == self.wallet_address:
             return
         if signal["side"] == "buy":
+            self.signal_stats["buy_signals"] += 1
             self.buy(signal)
         elif signal["side"] == "sell" and self.store.get_position(signal["mint"]):
+            self.signal_stats["sell_signals"] += 1
             position = self.store.get_position(signal["mint"])
             our_raw = int(position["amount_raw"])
             leader_remaining = int(signal.get("leader_post_raw", 0))
@@ -779,6 +819,10 @@ class PumpFunBot:
             self.sell(signal["mint"], our_sell_raw,
                       f"followed wallet {signal['wallet']} partial/full sell on {signal['venue']}",
                       signal["wallet"], signal["signature"])
+        elif signal["side"] == "sell":
+            self.signal_stats["sell_without_position"] += 1
+            logger.info("Leader sell observed but no matching paper position is open for mint=%s; no sell copied",
+                        signal["mint"][:8])
 
     def poll_wallet(self, wallet: str) -> int:
         sigs = self.rpc.signatures(wallet, limit=1000)
@@ -883,6 +927,21 @@ class PumpFunBot:
                     feed_live = bool(self.feed and self.feed.connected.is_set())
                     if feed_live:
                         self._consume_feed_events()
+                        # An open WebSocket is not proof that the provider accepted
+                        # account subscriptions. If no account-trade event arrives,
+                        # use a slower RPC safety scan; signatures are de-duplicated.
+                        last_activity = max(
+                            float(self.feed.connected_at or 0),
+                            float(self.feed.last_account_trade_at or 0),
+                        )
+                        fallback_interval = max(30, self.s.poll_seconds * 10)
+                        if now >= next_rpc_poll and now - last_activity >= fallback_interval:
+                            logger.warning(
+                                "No PumpPortal account-trade events for %.0fs; running slower RPC fallback scan across %d wallets",
+                                now - last_activity, len(self.active_wallets),
+                            )
+                            self._poll_active_wallets()
+                            next_rpc_poll = now + fallback_interval
                     elif now >= next_rpc_poll:
                         self._poll_active_wallets()
                         next_rpc_poll = now + self.s.poll_seconds
