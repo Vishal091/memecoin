@@ -130,11 +130,22 @@ class PumpFunBot:
             side = "sell"
         else:
             return []
+        def token_balance(rows):
+            total = 0
+            for row in rows or []:
+                if row.get("owner") == wallet and row.get("mint") == mint:
+                    total += int((row.get("uiTokenAmount") or {}).get("amount", "0"))
+            return total
+
+        meta = tx.get("meta") or {}
+        pre_raw = token_balance(meta.get("preTokenBalances"))
+        post_raw = token_balance(meta.get("postTokenBalances"))
         return [{
             "wallet": wallet, "signature": signature, "mint": mint, "side": side,
             "amount_ui": abs(float(data["delta_ui"])),
             "amount_raw": abs(int(data["delta_raw"])),
             "decimals": int(data["decimals"]),
+            "leader_pre_raw": pre_raw, "leader_post_raw": post_raw,
             "native_delta_sol": sol_delta, "block_time": tx.get("blockTime"),
             "venue": venue,
         }]
@@ -413,8 +424,17 @@ class PumpFunBot:
             self.buy(signal)
         elif signal["side"] == "sell" and self.store.get_position(signal["mint"]):
             position = self.store.get_position(signal["mint"])
-            self.sell(signal["mint"], int(position["amount_raw"]),
-                      f"followed wallet {signal['wallet']} sold on {signal['venue']}",
+            our_raw = int(position["amount_raw"])
+            leader_remaining = int(signal.get("leader_post_raw", 0))
+            leader_sold = int(signal.get("amount_raw", 0))
+            if leader_remaining <= 0:
+                our_sell_raw = our_raw
+            else:
+                denominator = leader_sold + leader_remaining
+                fraction = min(1.0, leader_sold / denominator) if denominator > 0 else 1.0
+                our_sell_raw = min(our_raw, max(1, int(our_raw * fraction)))
+            self.sell(signal["mint"], our_sell_raw,
+                      f"followed wallet {signal['wallet']} partial/full sell on {signal['venue']}",
                       signal["wallet"], signal["signature"])
 
     def poll_wallet(self, wallet: str) -> int:
