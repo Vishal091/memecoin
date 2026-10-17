@@ -6,7 +6,7 @@ This is the Pump.fun-specific entrypoint. It can automatically fetch Pump.fun's 
 
 ## Important API and cost requirements
 
-- **Pump.fun leaderboard token:** the front-end endpoint is authenticated and may change. You need a bearer token from your own logged-in Pump.fun browser session. The app checks that the three period requests return distinct rankings; if the endpoint ignores the period query, automatic copying is blocked.
+- **Pump.fun session token:** the current request observed in the logged-in UI is `https://frontend-api-v3.pump.fun/pnl-leaderboard?period=weekly&sort=combined&limit=100`. It uses a cookie named `auth_token`, not an `Authorization: Bearer` header. This frontend endpoint is not a stable public API and session cookies expire.
 - **PumpPortal API key:** needed for the near-real-time account-trade WebSocket feed. The feed is metered. Check current PumpPortal data API requirements and fees at [PumpPortal](https://pumpportal.fun/) and [PumpPortal fees](https://pumpportal.fun/fees/) before subscribing. Published conditions have included a 0.02 SOL linked-wallet minimum and 0.01 SOL for each 10,000 data events; verify current terms as they can change.
 - **Swap costs:** PumpPortal's Local Transaction API has a 0.5% per-trade fee, in addition to Solana network and Pump protocol/creator fees. On $10 these costs can consume meaningful capital.
 - The dashboard's “Overall” list is a composite rank across the 1D/1W/1M leaderboards, not an official all-time leaderboard.
@@ -29,19 +29,14 @@ If you already have an important .env, back it up before replacing it.
 
 In your local .env, set:
 
-- **PUMPFUN_BEARER_TOKEN:** the Authorization: Bearer token used by your own authenticated request to the Pump.fun leaderboard API at https://advanced-api-v2.pump.fun/callout/leaderboard. To find it, log into Pump.fun, open browser Developer Tools → Network, select the leaderboard request, and inspect the request headers. Copy it directly into your local .env; do not paste it into ChatGPT, GitHub, screenshots, or issues. The token may expire.
+- **PUMPFUN_AUTH_TOKEN:** log into Pump.fun, open Developer Tools → Network, select the successful `pnl-leaderboard` request, then under Request Headers → `cookie`, copy only the value immediately after `auth_token=` up to the next semicolon. Store that value as `PUMPFUN_AUTH_TOKEN` in your local `.env`. Never copy the entire Cookie header and never share this token; it grants access to your session and may expire. If the request fails after restarting the bot, sign in again and refresh this value.
 - **PUMPPORTAL_API_KEY:** your key for PumpPortal's data WebSocket. Keep it local and private.
 - **BOT_MODE=paper.**
 - **DATABASE_PATH=memecoin-pumpfun-paper.db.**
 
 No trader addresses need to be entered in WATCH_WALLETS. Leave it blank for automatic Top 10 selection; you may add extra wallet addresses there if you separately want to follow additional public wallets.
 
-The default period query settings in .env.pumpfun.example are configurable:
-
-- PUMPFUN_LEADERBOARD_PERIOD_PARAM=period
-- PUMPFUN_LEADERBOARD_DAY_VALUE=1D
-- PUMPFUN_LEADERBOARD_WEEK_VALUE=1W
-- PUMPFUN_LEADERBOARD_MONTH_VALUE=1M
+The configured query uses `period=daily`, `period=weekly`, or `period=monthly`, plus `sort=combined` and `limit=100`. The `weekly` value is directly from the request you captured; daily/monthly values follow the 1D/1M UI options but still need verification from those specific requests. Settings are configurable in `.env.pumpfun.example`.
 
 These are frontend API settings, not a stable public API promise. If Pump.fun changes its endpoint, inspect the request made by the official leaderboard page and adjust the settings locally. The app deliberately fails closed if it cannot identify wallet addresses or if all three period lists come back identical.
 
