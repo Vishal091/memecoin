@@ -191,6 +191,56 @@ class PumpFunBot:
             reason,
         )
 
+    def resolve_stale_monitor_halt(self) -> bool:
+        """Clear only the legacy generic RPC-monitor halt after explicit operator review.
+
+        This is intentionally not a general emergency-stop override: ambiguous live
+        transaction records and tracked positions must be handled separately. Copying
+        is left paused so the operator must explicitly re-arm it in the dashboard.
+        """
+        if self.store.get_state("manual_review_halt", "0") != "1":
+            logger.error("No manual-review halt is active; nothing to resolve.")
+            return False
+
+        reason = self.store.get_state("manual_review_reason", "")
+        if not reason.startswith("RPC wallet monitoring error for "):
+            logger.error(
+                "Refusing recovery: this command only clears the legacy generic RPC-monitor halt. "
+                "Current halt reason: %s",
+                reason or "(missing)",
+            )
+            return False
+
+        unresolved = self.store.db.execute(
+            "SELECT key FROM state WHERE key LIKE 'ambiguous_live_tx:%' "
+            "OR key LIKE 'ambiguous_live_tx_mint:%' ORDER BY key"
+        ).fetchall()
+        if unresolved:
+            logger.error(
+                "Refusing recovery: %d ambiguous live-transaction state record(s) still exist. "
+                "Resolve those records explicitly first.",
+                len(unresolved),
+            )
+            return False
+
+        positions = self.store.list_positions()
+        if positions:
+            logger.error(
+                "Refusing recovery: %d tracked position(s) remain. Review wallet holdings and positions first.",
+                len(positions),
+            )
+            return False
+
+        self.store.set_state("manual_review_halt", "0")
+        self.store.set_state("manual_review_reason", "")
+        self.store.set_state("copy_paused", "1")
+        self.message = (
+            "Stale RPC-monitor halt cleared after operator review. Copying remains paused; "
+            "review the dashboard, then explicitly select Copy Top 10 to resume."
+        )
+        logger.warning("%s", self.message)
+        return True
+
     def dashboard_snapshot(self) -> dict:
         with self.state_lock:
             return json.loads(json.dumps(getattr(self, "dashboard_state", {
@@ -1466,6 +1516,10 @@ def main():
     group.add_argument("--once", action="store_true", help="one polling/management cycle")
     group.add_argument("--run", action="store_true", help="continuous monitoring (default)")
     group.add_argument("--status", action="store_true", help="show local ledger status")
+    group.add_argument(
+        "--resolve-monitor-halt", action="store_true",
+        help="clear a stale generic RPC-monitor halt after checking wallet/transactions; copy stays paused",
+    )
     args = parser.parse_args()
     try:
         settings = PumpFunSettings.load()
@@ -1476,7 +1530,10 @@ def main():
         print(f"Startup/configuration error: {exc}", file=sys.stderr)
         return 2
     try:
-        if args.check:
+        if args.resolve_monitor_halt:
+            if not bot.resolve_stale_monitor_halt():
+                return 2
+        elif args.check:
             slot = bot.rpc.call("getSlot", [{"commitment":"confirmed"}])
             sol_price = bot.market.sol_price_usd()
             logger.warning("RPC OK slot=%s; SOL ref price %.4f USD; mode=%s",
