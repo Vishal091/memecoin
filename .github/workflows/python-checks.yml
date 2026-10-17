@@ -14,7 +14,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install dependencies
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install official Pump SDK dependencies
+        run: npm install --no-audit --no-fund
+      - name: Check native builder syntax
+        run: npm run check
+      - name: Check official Pump SDK exports
+        run: npm run check:sdk
+      - name: Install Python dependencies
         run: python -m pip install -r requirements.txt
       - name: Compile Python
         run: python -m compileall -q .

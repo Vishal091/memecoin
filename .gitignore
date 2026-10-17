@@ -12,3 +12,4 @@ __pycache__/
 wallet.json
 id.json
 *.key
+node_modules/
