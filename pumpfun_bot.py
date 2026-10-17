@@ -29,7 +29,7 @@ from pumpportal import (
     PUMPSWAP_PROGRAM_ID,
     PumpPortalExecutor,
 )
-from solana_rpc import SolanaRPC
+from solana_rpc import SolanaRPC, SolanaRPCRateLimited
 from storage import Store
 
 logger = logging.getLogger("pumpfun")
@@ -843,16 +843,42 @@ class PumpFunBot:
             new_rows.append(row)
         if not cursor_found and cursor != latest and len(sigs) >= 1000:
             logger.error("More than 1000 signatures may have arrived for %s between polls; oldest missed signals cannot be recovered by this pass", wallet)
+
+        # Bound RPC bursts. Process new signatures oldest-to-newest and advance the
+        # cursor only through successfully inspected rows, so a 429 never skips newer trades.
+        try:
+            max_per_poll = max(1, min(50, int(__import__("os").getenv("SOLANA_MAX_SIGNATURES_PER_WALLET_POLL", "8"))))
+        except ValueError:
+            max_per_poll = 8
+        chronological = list(reversed(new_rows))
+        batch = chronological[:max_per_poll]
+        cursor_candidate = cursor
         handled = 0
-        for row in reversed(new_rows):
+        rate_limited = False
+        for row in batch:
             signature = row.get("signature")
-            if not signature or self.store.signature_seen(signature):
+            if not signature:
                 continue
-            for signal in self.detect_pump_signal(wallet, signature):
+            if self.store.signature_seen(signature):
+                cursor_candidate = signature
+                continue
+            try:
+                signals = self.detect_pump_signal(wallet, signature)
+            except SolanaRPCRateLimited:
+                logger.warning("RPC fallback paused for %s; keeping cursor at the last inspected transaction.", wallet[:8])
+                rate_limited = True
+                break
+            for signal in signals:
                 self.process_signal(signal)
             self.store.mark_signature_seen(signature, wallet)
+            cursor_candidate = signature
             handled += 1
-        self.store.set_cursor(wallet, latest)
+
+        if not rate_limited and len(batch) == len(chronological):
+            # All new signatures present in this response have now been inspected.
+            cursor_candidate = latest
+        if cursor_candidate and cursor_candidate != cursor:
+            self.store.set_cursor(wallet, cursor_candidate)
         return handled
 
     def status(self):
@@ -879,11 +905,18 @@ class PumpFunBot:
                            t["id"], t["action"], t["mint"], t["value_usd"], t["pnl_usd"], t["reason"])
 
     def _poll_active_wallets(self):
+        if self.rpc.backoff_remaining > 0:
+            logger.debug("Skipping RPC fallback during rate-limit cooldown (%.0fs remaining).",
+                         self.rpc.backoff_remaining)
+            return
         for wallet in sorted(self.active_wallets):
             try:
                 self.poll_wallet(wallet)
-            except Exception:
-                logger.exception("RPC fallback monitor failed for %s", wallet)
+            except SolanaRPCRateLimited as exc:
+                logger.warning("RPC fallback paused: %s", exc)
+                break
+            except Exception as exc:
+                logger.error("RPC fallback monitor failed for %s: %s", wallet[:8], exc)
                 if self.s.mode == "live":
                     self.store.set_state("manual_review_halt", "1")
                     self.store.set_state(
