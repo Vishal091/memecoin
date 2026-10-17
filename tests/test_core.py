@@ -3,8 +3,35 @@ import unittest
 from pathlib import Path
 
 from market_data import MarketData, WSOL_MINT
+from pumpfun_bot import PumpFunBot
 from solana_rpc import SolanaRPC
 from storage import Store
+
+
+
+class DashboardErrorRefreshTests(unittest.TestCase):
+    def test_refreshes_dashboard_from_current_state_after_loop_error(self):
+        bot = object.__new__(PumpFunBot)
+        bot.last_equity_usd = 9.57
+        published = []
+        bot._publish_dashboard_state = lambda equity=None: published.append(equity)
+
+        bot._publish_dashboard_state_after_error()
+
+        self.assertEqual(published, [9.57])
+
+    def test_dashboard_refresh_error_does_not_escape_error_handler(self):
+        bot = object.__new__(PumpFunBot)
+        bot.last_equity_usd = None
+
+        def fail_refresh(equity=None):
+            raise RuntimeError("test dashboard failure")
+
+        bot._publish_dashboard_state = fail_refresh
+        with self.assertLogs("pumpfun", level="ERROR") as captured:
+            bot._publish_dashboard_state_after_error()
+
+        self.assertTrue(any("Could not refresh dashboard state" in line for line in captured.output))
 
 
 class ParserTests(unittest.TestCase):
