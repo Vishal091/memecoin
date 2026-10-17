@@ -65,6 +65,79 @@ class AmbiguousLiveTransactionStateTests(unittest.TestCase):
         self.assertFalse(bot.sell("test-mint", 100, "pending exit: trailing stop"))
 
 
+class StaleMonitorHaltRecoveryTests(unittest.TestCase):
+    class FakeRows:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return self.rows
+
+    class FakeDB:
+        def __init__(self, state):
+            self.state = state
+
+        def execute(self, query):
+            keys = [
+                key for key in self.state
+                if key.startswith("ambiguous_live_tx:") or key.startswith("ambiguous_live_tx_mint:")
+            ]
+            return StaleMonitorHaltRecoveryTests.FakeRows([{"key": key} for key in keys])
+
+    class FakeStore:
+        def __init__(self, reason="RPC wallet monitoring error for leader-wallet; reconcile transactions before resuming"):
+            self.state = {
+                "manual_review_halt": "1",
+                "manual_review_reason": reason,
+                "copy_paused": "0",
+            }
+            self.db = StaleMonitorHaltRecoveryTests.FakeDB(self.state)
+            self.positions = []
+
+        def get_state(self, key, default=""):
+            return self.state.get(key, default)
+
+        def set_state(self, key, value):
+            self.state[key] = str(value)
+
+        def list_positions(self):
+            return list(self.positions)
+
+    def test_clears_only_legacy_monitor_halt_and_keeps_copy_paused(self):
+        bot = object.__new__(PumpFunBot)
+        bot.store = self.FakeStore()
+        bot.message = ""
+
+        self.assertTrue(bot.resolve_stale_monitor_halt())
+        self.assertEqual(bot.store.state["manual_review_halt"], "0")
+        self.assertEqual(bot.store.state["manual_review_reason"], "")
+        self.assertEqual(bot.store.state["copy_paused"], "1")
+        self.assertIn("Copying remains paused", bot.message)
+
+    def test_refuses_recovery_when_ambiguous_transaction_exists(self):
+        bot = object.__new__(PumpFunBot)
+        bot.store = self.FakeStore()
+        bot.store.state["ambiguous_live_tx:test-signature"] = '{"signature":"test-signature"}'
+
+        self.assertFalse(bot.resolve_stale_monitor_halt())
+        self.assertEqual(bot.store.state["manual_review_halt"], "1")
+
+    def test_refuses_recovery_when_a_position_remains(self):
+        bot = object.__new__(PumpFunBot)
+        bot.store = self.FakeStore()
+        bot.store.positions = [{"mint": "test-mint"}]
+
+        self.assertFalse(bot.resolve_stale_monitor_halt())
+        self.assertEqual(bot.store.state["manual_review_halt"], "1")
+
+    def test_refuses_to_clear_an_unrelated_halt_reason(self):
+        bot = object.__new__(PumpFunBot)
+        bot.store = self.FakeStore("Ambiguous live BUY transaction; signature=test-signature")
+
+        self.assertFalse(bot.resolve_stale_monitor_halt())
+        self.assertEqual(bot.store.state["manual_review_halt"], "1")
+
+
 class PendingExitReasonTests(unittest.TestCase):
     def test_normal_exit_reason_is_unchanged(self):
         self.assertEqual(normalize_pending_exit_reason("trailing stop"), "trailing stop")
