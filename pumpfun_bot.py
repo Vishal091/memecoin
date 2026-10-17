@@ -77,6 +77,7 @@ class PumpFunBot:
         self.last_leaderboard_error = ""
         self.message = "Ready. Configure Pump.fun leaderboard access to discover traders automatically."
         self.last_equity_usd = None
+        self.price_cache = {}
         self.state_lock = threading.RLock()
         self.commands = queue.Queue()
         self.trade_events = queue.Queue()
@@ -412,7 +413,7 @@ class PumpFunBot:
         value = 0.0
         for pos in self.store.list_positions():
             market = self.market.token_market(pos["mint"])
-            price = float(market["price_usd"]) if market else float(pos["last_price_usd"])
+            price = float(market["price_usd"]) if market else float(self.price_cache.get(pos["mint"], pos["last_price_usd"]))
             value += raw_to_units(pos["amount_raw"], int(pos["decimals"])) * price
         return value
 
@@ -456,6 +457,8 @@ class PumpFunBot:
     def _can_enter(self, equity: float) -> tuple[bool, str]:
         if self.store.get_state("experiment_expired", "0") == "1":
             return False, "Seven-day experiment is over"
+        if self.store.get_state("copy_paused", "0") == "1":
+            return False, "Copying is paused from the dashboard"
         if self.store.get_state("manual_review_halt", "0") == "1":
             return False, "Manual review halt active: " + self.store.get_state("manual_review_reason", "")
         if self.store.get_state("halted", "0") == "1":
@@ -647,7 +650,12 @@ class PumpFunBot:
             position["invested_usd"] = remaining_basis
             position["last_price_usd"] = mark_price
             self.store.upsert_position(position)
+        if remaining == 0:
+            self.price_cache.pop(mint, None)
+        else:
+            self.price_cache[mint] = mark_price
         self.store.set_state(pending_key, "")
+        self._refresh_feed_subscriptions()
         logger.warning("SELL %s raw=%s proceeds=%.4f PnL=%.4f reason=%s", mint, sold_raw, proceeds, realized_pnl, reason)
         if self.s.mode == "live":
             logger.warning("Live transaction confirmed: https://solscan.io/tx/%s", tx_sig)
@@ -664,7 +672,7 @@ class PumpFunBot:
                 self.sell(mint, int(position["amount_raw"]), f"pending exit: {pending}")
                 continue
             market = self.market.token_market(mint)
-            price = float(market["price_usd"]) if market else float(position["last_price_usd"])
+            price = float(market["price_usd"]) if market else float(self.price_cache.get(mint, position["last_price_usd"]))
             if price <= 0:
                 continue
             peak = max(float(position["peak_price_usd"]), price)
@@ -696,6 +704,8 @@ class PumpFunBot:
                         self.store.upsert_position(pos)
 
     def process_signal(self, signal: dict):
+        if signal.get("wallet") not in self.active_wallets:
+            return
         self.store.add_signal(signal["wallet"], signal["signature"], signal["mint"], signal["side"],
                               signal["amount_ui"], signal["decimals"])
         if self.wallet_address and signal["wallet"] == self.wallet_address:
