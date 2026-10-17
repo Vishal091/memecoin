@@ -37,7 +37,7 @@ If PowerShell blocks activation, run the venv interpreter directly instead: .\.v
 
 ## 2. Configure paper mode first
 
-Edit .env. Keep BOT_MODE=paper. Add the public addresses of the wallets you have researched to WATCH_WALLETS, separated by commas. Obtain a Jupiter API key and add it as JUPITER_API_KEY; keep it local and never commit .env. Configure SOLANA_RPC_URL with your RPC provider endpoint if needed.
+Edit .env. Keep BOT_MODE=paper. Add public addresses of wallets you have independently researched to WATCH_WALLETS, separated by commas. **Paper mode does not need a Jupiter API key.** Live mode does; keep it local and never commit .env. Configure SOLANA_RPC_URL with your RPC provider endpoint if needed.
 
 Run a configuration check:
 
@@ -47,7 +47,7 @@ Start the monitor:
 
     python bot.py --run
 
-The first launch stores each watch wallet's latest signature as a starting cursor, so it **does not copy old transactions**. It starts watching for new activity from that point onward. Leave it running to observe signals. Paper mode simulates orders using quotes and a $10 virtual starting cash balance; it never signs or broadcasts a transaction.
+The first launch stores each watch wallet's latest signature as a starting cursor, so it **does not copy old transactions**. It starts watching for new activity from that point onward. Leave it running to observe signals. Paper mode simulates trades at market-price estimates with a fixed configured cost per side and a $10 virtual starting balance; it never signs or broadcasts a transaction. Paper results are not a reliable substitute for real execution and slippage.
 
 Stop with Ctrl+C. State is stored in memecoin.db. Keep that file local.
 
@@ -74,6 +74,7 @@ Live startup refuses to run if the keypair is missing or that confirmation does 
 
 - WATCH_WALLETS: comma-separated trader wallet addresses.
 - BOT_MODE: paper (default) or live.
+- EXPERIMENT_DURATION_DAYS: continuous-run duration before entries stop and remaining positions are liquidated (default 7 days).
 - KEYPAIR_PATH: local Solana CLI keypair JSON, used only in live mode.
 - JUPITER_API_KEY: local API key for Jupiter Swap API V2.
 - SOLANA_RPC_URL: RPC endpoint.
@@ -89,7 +90,7 @@ Live startup refuses to run if the keypair is missing or that confirmation does 
 - SLIPPAGE_BPS: default 150 (1.5%).
 - MAX_QUOTE_SHORTFALL_PCT: default 0.04 (reject if quoted output is over 4% below its market-price estimate).
 
-The overall loss halt is persistent in the local database. If it activates, the bot stops opening positions but continues trying to manage existing positions. Do not delete the database or clear the halt simply to resume trading; investigate first.
+The overall loss halt is persistent in the local database. If it activates, the bot stops opening positions but continues trying to manage existing positions. The seven-day clock starts the first time you launch `python bot.py --run`; `--once` is for a single test cycle and does not start the clock. At expiry, the bot disables entries and attempts to sell remaining holdings, then shuts down when no tracked positions remain. This expiry liquidation cannot guarantee a sale if liquidity or routes disappear. Do not delete the database or clear the halt simply to resume trading; investigate first.
 
 ## Commands
 
