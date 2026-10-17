@@ -165,6 +165,7 @@ class Store:
             self.set_state("day_start_equity", equity_usd)
             self.set_state("daily_entries", 0)
             self.set_state("daily_realized_pnl", 0)
+            self.set_state("daily_paused", 0)
 
     def claim_once(self, key: str) -> bool:
         """Atomically add a one-time action key; returns False if it was already claimed."""
