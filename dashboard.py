@@ -54,7 +54,7 @@ function render(d){
  el("posCount").textContent=(d.positions||[]).length;el("copyStatus").textContent=d.auto_copy?"ON":"OFF";el("walletCount").textContent=(d.active_wallets||[]).length;
  var f=d.feed_stats||{};var ss=d.signal_stats||{};
   function ago(ts){if(!ts)return "never";var sec=Math.max(0,Math.floor(Date.now()/1000-Number(ts)));return sec<60?sec+"s ago":Math.floor(sec/60)+"m "+(sec%60)+"s ago"}
-  el("feedSummary").textContent=(f.connected?"WebSocket connected":"WebSocket disconnected")+" · "+(f.subscribed_wallet_count||0)+" account subscriptions · "+(f.account_trade_events_received||0)+" account trade events";
+  el("feedSummary").textContent=(f.connected?"WebSocket connected":"WebSocket disconnected")+" · "+(f.subscribed_wallet_count||0)+" account wallets requested · "+(f.account_trade_events_received||0)+" account trade events";
   el("feedDetail").textContent="Messages received: "+(f.messages_received||0)+" · Trade events: "+(f.trade_events_received||0)+" · Last message: "+ago(f.last_message_at)+" · Last account trade: "+ago(f.last_account_trade_at);
   var notices=[];if(f.error)notices.push("Feed error: "+f.error);if(f.last_notice)notices.push("Provider notice: "+f.last_notice);if(f.last_event_summary)notices.push("Last event: "+f.last_event_summary);
   el("signalDetail").textContent=notices.join(" · ")+" · Parsed signals: "+(ss.parsed_signals||0)+" · Unparsed: "+(ss.unparsed_events||0)+" · Duplicate: "+(ss.duplicate_events||0)+" · Unwatched: "+(ss.unwatched_events||0)+" · Sells with no position: "+(ss.sell_without_position||0);
