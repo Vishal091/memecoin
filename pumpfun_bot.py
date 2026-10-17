@@ -438,7 +438,7 @@ class PumpFunBot:
                       signal["wallet"], signal["signature"])
 
     def poll_wallet(self, wallet: str) -> int:
-        sigs = self.rpc.signatures(wallet, limit=25)
+        sigs = self.rpc.signatures(wallet, limit=1000)
         if not sigs:
             return 0
         latest = sigs[0].get("signature")
@@ -448,10 +448,14 @@ class PumpFunBot:
             logger.info("Initial sync %s at %s; old activity will not be copied", wallet, latest)
             return 0
         new_rows = []
+        cursor_found = False
         for row in sigs:
             if row.get("signature") == cursor:
+                cursor_found = True
                 break
             new_rows.append(row)
+        if not cursor_found and cursor != latest and len(sigs) >= 1000:
+            logger.error("More than 1000 signatures may have arrived for %s between polls; oldest missed signals cannot be recovered by this pass", wallet)
         handled = 0
         for row in reversed(new_rows):
             signature = row.get("signature")
