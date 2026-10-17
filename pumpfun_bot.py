@@ -26,7 +26,7 @@ from pumpfun_config import PumpFunSettings
 from pumpportal_feed import PumpPortalAccountFeed
 from solana_logs_feed import SolanaLogsFeed
 from pumpportal import PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID
-from native_pump import NativePumpExecutor
+from native_pump import NativePumpExecutor, TransactionConfirmationUnknown
 from solana_rpc import SolanaRPC, SolanaRPCRateLimited, SolanaTransactionNotReady
 from pump_curve import fetch_pump_curve
 from storage import Store
@@ -143,6 +143,53 @@ class PumpFunBot:
                 Pubkey.from_string(wallet)
             except Exception as exc:
                 raise ValueError(f"Invalid WATCH_WALLETS Solana address: {wallet}") from exc
+
+
+    def _record_ambiguous_live_transaction(
+        self,
+        action: str,
+        mint: str,
+        exc: TransactionConfirmationUnknown,
+        *,
+        requested_amount_sol: float | None = None,
+        requested_amount_raw: int | None = None,
+        source_wallet: str | None = None,
+        source_signature: str | None = None,
+    ) -> None:
+        """Persist an unknown live transaction outcome and stop automated retries."""
+        signature = exc.signature
+        record = {
+            "status": "confirmation_unknown",
+            "signature": signature,
+            "action": str(action).upper(),
+            "mint": mint,
+            "wallet": self.wallet_address,
+            "detail": exc.detail,
+            "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        if requested_amount_sol is not None:
+            record["requested_amount_sol"] = requested_amount_sol
+        if requested_amount_raw is not None:
+            record["requested_amount_raw"] = int(requested_amount_raw)
+        if source_wallet:
+            record["source_wallet"] = source_wallet
+        if source_signature:
+            record["source_signature"] = source_signature
+
+        self.store.set_state(f"ambiguous_live_tx:{signature}", json.dumps(record, sort_keys=True))
+        self.store.set_state(f"ambiguous_live_tx_mint:{mint}", signature)
+        self.store.set_state("manual_review_halt", "1")
+        self.store.set_state("copy_paused", "1")
+        reason = (
+            f"Ambiguous live {str(action).upper()} transaction for mint={mint}; "
+            f"signature={signature}. Reconcile the signature and wallet balance before resuming."
+        )
+        self.store.set_state("manual_review_reason", reason)
+        self.message = reason
+        logger.critical(
+            "%s; automated copy entries paused and mint-specific retries blocked",
+            reason,
+        )
 
     def dashboard_snapshot(self) -> dict:
         with self.state_lock:
@@ -904,11 +951,21 @@ class PumpFunBot:
             used_pool = venue
         else:
             assert self.keypair is not None and self.wallet_address is not None
-            result = self.executor.trade(
-                owner=self.wallet_address, keypair=self.keypair, mint=mint, action="buy",
-                amount=round(spend / sol_price, 9), denominated_in_sol=True,
-                slippage_bps=self.s.slippage_bps, preferred_pool=venue,
-            )
+            requested_sol = round(spend / sol_price, 9)
+            try:
+                result = self.executor.trade(
+                    owner=self.wallet_address, keypair=self.keypair, mint=mint, action="buy",
+                    amount=requested_sol, denominated_in_sol=True,
+                    slippage_bps=self.s.slippage_bps, preferred_pool=venue,
+                )
+            except TransactionConfirmationUnknown as exc:
+                self._record_ambiguous_live_transaction(
+                    "buy", mint, exc,
+                    requested_amount_sol=requested_sol,
+                    source_wallet=signal.get("wallet"),
+                    source_signature=signal.get("signature"),
+                )
+                raise
             tx_sig = result["signature"]
             used_pool = result["pool"]
             raw_out = int(result["total_output_amount"])
@@ -945,6 +1002,10 @@ class PumpFunBot:
              source_wallet: str | None = None, source_signature: str | None = None) -> bool:
         position = self.store.get_position(mint)
         if not position:
+            return False
+        if self.s.mode == "live" and self.store.get_state(f"ambiguous_live_tx_mint:{mint}", ""):
+            # Do not blindly retry a mint whose previous signed transaction may
+            # still land; require explicit reconciliation first.
             return False
         normalized_reason = normalize_pending_exit_reason(reason)
         lower_reason = normalized_reason.lower()
@@ -1004,12 +1065,21 @@ class PumpFunBot:
                 return False
             units_requested = raw_to_units(requested_raw, decimals)
             preferred = self.store.get_state(f"pool:{mint}", "pump")
-            result = self.executor.trade(
-                owner=self.wallet_address, keypair=self.keypair, mint=mint, action="sell",
-                amount=units_requested, denominated_in_sol=False,
-                slippage_bps=self.s.slippage_bps, preferred_pool=preferred,
-                amount_raw=requested_raw,
-            )
+            try:
+                result = self.executor.trade(
+                    owner=self.wallet_address, keypair=self.keypair, mint=mint, action="sell",
+                    amount=units_requested, denominated_in_sol=False,
+                    slippage_bps=self.s.slippage_bps, preferred_pool=preferred,
+                    amount_raw=requested_raw,
+                )
+            except TransactionConfirmationUnknown as exc:
+                self._record_ambiguous_live_transaction(
+                    "sell", mint, exc,
+                    requested_amount_raw=requested_raw,
+                    source_wallet=source_wallet or position.get("source_wallet"),
+                    source_signature=source_signature or position.get("source_signature"),
+                )
+                raise
             tx_sig = result["signature"]
             sold_raw = abs(int(result["token_delta_raw"]))
             sol_received = max(0, int(result["sol_delta_lamports"])) / 1_000_000_000
@@ -1226,6 +1296,20 @@ class PumpFunBot:
         for t in self.store.recent_trades(10):
             logger.warning("TRADE #%s %s %s value=%.4f pnl=%.4f %s",
                            t["id"], t["action"], t["mint"], t["value_usd"], t["pnl_usd"], t["reason"])
+        unresolved = self.store.db.execute(
+            "SELECT key, value FROM state WHERE key LIKE 'ambiguous_live_tx:%' ORDER BY key"
+        ).fetchall()
+        for row in unresolved:
+            try:
+                detail = json.loads(row["value"])
+            except (TypeError, ValueError):
+                detail = {"raw": row["value"]}
+            logger.critical(
+                "UNRESOLVED LIVE TRANSACTION action=%s mint=%s signature=%s status=%s",
+                detail.get("action", "unknown"), detail.get("mint", "unknown"),
+                detail.get("signature", row["key"].split(":", 1)[-1]),
+                detail.get("status", "unknown"),
+            )
 
     def _poll_active_wallets(self):
         if self.rpc.backoff_remaining > 0:
@@ -1240,7 +1324,7 @@ class PumpFunBot:
                 break
             except Exception as exc:
                 logger.error("RPC fallback monitor failed for %s: %s", wallet[:8], exc)
-                if self.s.mode == "live":
+                if self.s.mode == "live" and self.store.get_state("manual_review_halt", "0") != "1":
                     self.store.set_state("manual_review_halt", "1")
                     self.store.set_state(
                         "manual_review_reason",
@@ -1352,7 +1436,7 @@ class PumpFunBot:
                     break
                 except Exception:
                     logger.exception("Loop error; inspect logs before re-arming after any ambiguous transaction")
-                    if self.s.mode == "live":
+                    if self.s.mode == "live" and self.store.get_state("manual_review_halt", "0") != "1":
                         self.store.set_state("manual_review_halt", "1")
                         self.store.set_state(
                             "manual_review_reason",
