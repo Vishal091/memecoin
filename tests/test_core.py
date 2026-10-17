@@ -3,12 +3,52 @@ import unittest
 from pathlib import Path
 
 from market_data import MarketData, WSOL_MINT
-from pumpfun_bot import normalize_pending_exit_reason, position_source_matches_wallet
+from pumpfun_bot import (
+    normalize_pending_exit_reason,
+    position_source_matches_wallet,
+    resolve_pending_exit_raw_amount,
+)
 from solana_rpc import SolanaRPC
 from storage import Store
 
 
 class PendingExitReasonTests(unittest.TestCase):
+    def test_normal_exit_reason_is_unchanged(self):
+        self.assertEqual(normalize_pending_exit_reason("trailing stop"), "trailing stop")
+
+    def test_repeated_pending_exit_prefixes_are_removed(self):
+        self.assertEqual(
+            normalize_pending_exit_reason(
+                "pending exit: pending exit: pending exit: trailing stop"
+            ),
+            "trailing stop",
+        )
+
+    def test_wrapped_leader_exit_reason_is_preserved(self):
+        self.assertEqual(
+            normalize_pending_exit_reason(
+                "pending exit: pending exit: followed wallet Leader123 partial/full sell on pump-amm"
+            ),
+            "followed wallet Leader123 partial/full sell on pump-amm",
+        )
+
+
+class PendingExitAmountTests(unittest.TestCase):
+    def test_preserves_partial_sell_amount_on_retry(self):
+        self.assertEqual(resolve_pending_exit_raw_amount(1000, "250"), 250)
+
+    def test_pending_amount_is_capped_at_current_position_balance(self):
+        self.assertEqual(resolve_pending_exit_raw_amount(200, "500"), 200)
+
+    def test_legacy_pending_exit_without_amount_defaults_to_current_balance(self):
+        self.assertEqual(resolve_pending_exit_raw_amount(400, None), 400)
+        self.assertEqual(resolve_pending_exit_raw_amount(400, ""), 400)
+
+    def test_invalid_stored_amount_fails_closed(self):
+        with self.assertRaises(ValueError):
+            resolve_pending_exit_raw_amount(400, "not-a-number")
+
+
     def test_normal_exit_reason_is_unchanged(self):
         self.assertEqual(normalize_pending_exit_reason("trailing stop"), "trailing stop")
 
