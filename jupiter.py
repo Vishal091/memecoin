@@ -9,6 +9,7 @@ from typing import Any
 import requests
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
+from solders.message import to_bytes_versioned
 
 logger = logging.getLogger(__name__)
 WSOL_MINT = "So11111111111111111111111111111111111111112"
@@ -59,7 +60,17 @@ class JupiterExecutor:
             # This refuses transactions requiring unknown additional signer(s).
             if len(signer_keys) != 1:
                 raise RuntimeError(f"Refusing transaction requiring {len(signer_keys)} signers; expected one wallet signer")
-            signed = VersionedTransaction(message, [keypair])
+            signer_index = [str(k) for k in signer_keys].index(str(keypair.pubkey()))
+            router = str(order.get("router", "")).lower()
+            if len(signer_keys) != 1 and not (router == "jupiterz" and len(signer_keys) == 2):
+                raise RuntimeError(
+                    f"Refusing unexpected multi-signer transaction: router={router}, signers={len(signer_keys)}"
+                )
+            # Sign only our wallet's slot and preserve other signatures/placeholders.
+            # JupiterZ may add its market-maker signature during /execute.
+            signatures = list(unsigned.signatures)
+            signatures[signer_index] = keypair.sign_message(to_bytes_versioned(message))
+            signed = VersionedTransaction.populate(message, signatures)
             encoded = base64.b64encode(bytes(signed)).decode("ascii")
         except Exception as exc:
             raise RuntimeError(f"Could not safely validate/sign Jupiter transaction: {exc}") from exc
