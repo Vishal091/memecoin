@@ -764,84 +764,139 @@ class PumpFunBot:
                        self.s.mode, self.wallet_address or "(paper)", equity,
                        float(self.store.get_state("initial_equity", "10")),
                        self.store.get_state("halted", "0"), self.store.get_state("halt_reason", ""))
-        logger.warning("Cash=%.4f positions=%d entries_today=%d daily_pause=%s",
-                       float(self.store.get_state("paper_cash", "0")) if self.s.mode == "paper" else -1.0,
-                       len(self.store.list_positions()), self.store.daily_entries(),
-                       self.store.get_state("daily_paused", "0"))
+        logger.warning("Copy enabled=%s window=%s active traders=%d positions=%d entries_today=%d",
+                       self.auto_copy_enabled, self.selected_window, len(self.active_wallets),
+                       len(self.store.list_positions()), self.store.daily_entries())
+        if self.last_leaderboard_error:
+            logger.warning("Leaderboard status: %s", self.last_leaderboard_error)
+        if self.feed:
+            logger.warning("PumpPortal data feed connected=%s error=%s",
+                           self.feed.connected.is_set(), self.feed.last_error)
         for p in self.store.list_positions():
+            mark = float(self.price_cache.get(p["mint"], p["last_price_usd"]))
             logger.warning("POSITION %s qty_raw=%s entry=%.8g mark=%.8g pool=%s",
-                           p["mint"], p["amount_raw"], p["entry_price_usd"], p["last_price_usd"],
+                           p["mint"], p["amount_raw"], p["entry_price_usd"], mark,
                            self.store.get_state(f"pool:{p['mint']}", "pump"))
         for t in self.store.recent_trades(10):
             logger.warning("TRADE #%s %s %s value=%.4f pnl=%.4f %s",
                            t["id"], t["action"], t["mint"], t["value_usd"], t["pnl_usd"], t["reason"])
 
+    def _poll_active_wallets(self):
+        for wallet in sorted(self.active_wallets):
+            try:
+                self.poll_wallet(wallet)
+            except Exception:
+                logger.exception("RPC fallback monitor failed for %s", wallet)
+                if self.s.mode == "live":
+                    self.store.set_state("manual_review_halt", "1")
+                    self.store.set_state(
+                        "manual_review_reason",
+                        f"RPC wallet monitoring error for {wallet}; reconcile transactions before resuming",
+                    )
+
     def run(self, once=False):
-        logger.warning("Pump.fun bot mode=%s (Pump bonding curve + PumpSwap only)", self.s.mode)
-        if not self.s.watch_wallets and not self.store.list_positions():
-            logger.warning("WATCH_WALLETS is empty. Add vetted public wallet addresses in .env.")
-            return
+        logger.warning("Pump.fun bot mode=%s; automatic leaderboard discovery=%s",
+                       self.s.mode, "configured" if self.leaderboard_client.ready else "not configured")
+        if self.s.mode == "live":
+            logger.warning("Live wallet: %s", self.wallet_address)
+            self._initialize_live_baseline()
+
+        self.refresh_leaderboards(force=True)
+        self._refresh_feed_subscriptions()
+        if not once:
+            self.dashboard = DashboardServer(self.s.dashboard_port, self.dashboard_snapshot, self.commands)
+            self.dashboard.start()
+        if self.feed and not self.feed.is_alive() and not once:
+            self.feed.start()
+
         started_at = self.store.get_state("experiment_started_at", "")
         if not once and not started_at:
             started_at = str(time.time())
             self.store.set_state("experiment_started_at", started_at)
             logger.warning("Seven-day experiment timer started.")
-        if self.s.mode == "live":
-            logger.warning("Live wallet: %s", self.wallet_address)
-            self._initialize_live_baseline()
         self._refresh_risk_state(self.equity())
-        while True:
-            try:
-                started_at = self.store.get_state("experiment_started_at", "")
-                expired = self.store.get_state("experiment_expired", "0") == "1"
-                if not once and started_at:
-                    try:
-                        expired = expired or (time.time() - float(started_at) >= self.s.experiment_duration_days * 86400)
-                    except ValueError:
-                        pass
-                if expired and self.store.get_state("experiment_expired", "0") != "1":
-                    self.store.set_state("experiment_expired", "1")
-                    logger.warning("Experiment expiry reached; disabling entries and attempting exit.")
-                for wallet in self.s.watch_wallets:
-                    try:
-                        self.poll_wallet(wallet)
-                    except Exception:
-                        logger.exception("Wallet monitor failed for %s", wallet)
-                        if self.s.mode == "live":
-                            self.store.set_state("manual_review_halt", "1")
-                            self.store.set_state(
-                                "manual_review_reason",
-                                f"Wallet monitor/execution error for {wallet}; reconcile signatures and balances before resuming",
-                            )
-                if expired:
-                    for pos in self.store.list_positions():
-                        self.store.set_state(f"exit_pending:{pos['mint']}", "experiment expiry liquidation")
-                self.manage_positions()
-                self._refresh_risk_state(self.equity())
-                if self.store.get_state("halted", "0") == "1":
-                    for pos in self.store.list_positions():
-                        self.store.set_state(f"exit_pending:{pos['mint']}", "total loss limit liquidation")
-                    self.manage_positions()
-                open_count = len(self.store.list_positions())
-                logger.info("Heartbeat equity=%.4f positions=%d halt=%s daily_pause=%s",
-                            self.equity(), open_count, self.store.get_state("halted", "0"),
-                            self.store.get_state("daily_paused", "0"))
-                if expired and open_count == 0:
-                    logger.warning("Seven-day experiment finished; no tracked positions remain.")
+        next_rpc_poll = 0.0
+        next_position_check = 0.0
+
+        try:
+            while True:
+                try:
+                    self._process_dashboard_commands()
+                    now = time.time()
+
+                    if self.leaderboard_client.ready and now - self.last_leaderboard_refresh >= self.s.leaderboard_refresh_seconds:
+                        self.refresh_leaderboards(force=True)
+
+                    feed_live = bool(self.feed and self.feed.connected.is_set())
+                    if feed_live:
+                        self._consume_feed_events()
+                    elif now >= next_rpc_poll:
+                        self._poll_active_wallets()
+                        next_rpc_poll = now + self.s.poll_seconds
+
+                    started_at = self.store.get_state("experiment_started_at", "")
+                    expired = self.store.get_state("experiment_expired", "0") == "1"
+                    if not once and started_at and not expired:
+                        try:
+                            expired = (time.time() - float(started_at) >= self.s.experiment_duration_days * 86400)
+                        except ValueError:
+                            expired = False
+                    if expired and self.store.get_state("experiment_expired", "0") != "1":
+                        self.store.set_state("experiment_expired", "1")
+                        self.auto_copy_enabled = False
+                        self.store.set_state("auto_copy_enabled", "0")
+                        self.store.set_state("copy_paused", "1")
+                        self._refresh_feed_subscriptions()
+                        logger.warning("Seven-day experiment expired; new entries disabled.")
+                    if expired:
+                        for pos in self.store.list_positions():
+                            self.store.set_state(f"exit_pending:{pos['mint']}", "experiment expiry liquidation")
+
+                    if now >= next_position_check:
+                        self.manage_positions()
+                        equity = self.equity()
+                        self.last_equity_usd = equity
+                        self._refresh_risk_state(equity)
+                        if self.store.get_state("halted", "0") == "1":
+                            self.auto_copy_enabled = False
+                            self.store.set_state("auto_copy_enabled", "0")
+                            self.store.set_state("copy_paused", "1")
+                            self._refresh_feed_subscriptions()
+                            for pos in self.store.list_positions():
+                                self.store.set_state(f"exit_pending:{pos['mint']}", "total loss limit liquidation")
+                            self.manage_positions()
+                        self._refresh_feed_subscriptions()
+                        self._publish_dashboard_state(equity)
+                        open_count = len(self.store.list_positions())
+                        logger.info("Heartbeat equity=%.4f positions=%d auto_copy=%s active_wallets=%d",
+                                    equity, open_count, self.auto_copy_enabled, len(self.active_wallets))
+                        if expired and open_count == 0:
+                            logger.warning("Seven-day experiment finished; no tracked positions remain.")
+                            break
+                        next_position_check = now + 1.5
+
+                    self._publish_dashboard_state(self.last_equity_usd)
+                except KeyboardInterrupt:
+                    logger.warning("Stopped by user.")
                     break
-            except KeyboardInterrupt:
-                logger.warning("Stopped by user.")
-                break
-            except Exception:
-                logger.exception("Loop error; inspect logs before re-arming after any ambiguous transaction")
-                if self.s.mode == "live":
-                    # Do not automatically liquidate after an ambiguous runtime/network error.
-                    # Block new entries until the operator reconciles the wallet and ledger.
-                    self.store.set_state("manual_review_halt", "1")
-                    self.store.set_state("manual_review_reason", "Runtime exception; reconcile wallet and transactions before resuming")
-            if once:
-                break
-            time.sleep(self.s.poll_seconds)
+                except Exception:
+                    logger.exception("Loop error; inspect logs before re-arming after any ambiguous transaction")
+                    if self.s.mode == "live":
+                        self.store.set_state("manual_review_halt", "1")
+                        self.store.set_state(
+                            "manual_review_reason",
+                            "Runtime exception; reconcile wallet and transactions before resuming",
+                        )
+                    self.message = "Runtime error; inspect console. Live entries are halted pending reconciliation."
+
+                if once:
+                    break
+                time.sleep(0.20)
+        finally:
+            if self.feed and self.feed.is_alive():
+                self.feed.stop()
+            if self.dashboard:
+                self.dashboard.stop()
 
     def close(self):
         self.store.close()
