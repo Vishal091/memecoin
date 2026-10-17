@@ -95,6 +95,237 @@ class PumpFunBot:
             except Exception as exc:
                 raise ValueError(f"Invalid WATCH_WALLETS Solana address: {wallet}") from exc
 
+    def dashboard_snapshot(self) -> dict:
+        with self.state_lock:
+            return json.loads(json.dumps(getattr(self, "dashboard_state", {
+                "mode": self.s.mode, "message": self.message, "leaderboards": {},
+                "positions": [], "trades": [], "active_wallets": [], "auto_copy": False,
+                "equity_usd": None,
+            }), default=str))
+
+    def _refresh_feed_subscriptions(self) -> None:
+        held_leaders = {
+            str(p.get("source_wallet")) for p in self.store.list_positions()
+            if p.get("source_wallet")
+        }
+        if self.auto_copy_enabled and self.store.get_state("copy_paused", "0") != "1":
+            base_wallets = set(self.s.watch_wallets) | held_leaders
+            rows = self.leaderboards.get(self.selected_window, [])
+            base_wallets.update(str(row["wallet"]) for row in rows[:self.s.top_traders_count] if row.get("wallet"))
+        else:
+            base_wallets = held_leaders
+        self.active_wallets = base_wallets
+        self.store.set_state("active_wallets_json", json.dumps(sorted(self.active_wallets)))
+        if self.feed:
+            token_mints = [p["mint"] for p in self.store.list_positions()] if self.s.stream_token_prices else []
+            self.feed.set_subscriptions(sorted(self.active_wallets), token_mints)
+
+    def refresh_leaderboards(self, force: bool = False) -> bool:
+        now = time.time()
+        if not force and now - self.last_leaderboard_refresh < self.s.leaderboard_refresh_seconds:
+            return bool(self.leaderboards)
+        self.last_leaderboard_refresh = now
+        if not self.leaderboard_client.ready:
+            self.last_leaderboard_error = (
+                "Automatic discovery needs PUMPFUN_BEARER_TOKEN in the local .env. "
+                "No trader wallet addresses need to be entered."
+            )
+            if not self.s.watch_wallets:
+                self.message = self.last_leaderboard_error
+            return False
+        try:
+            boards = self.leaderboard_client.fetch_all()
+            self.leaderboards = boards
+            self.last_leaderboard_error = ""
+            self.message = "Leaderboard refreshed. Select a window and copy its Top 10."
+            if self.auto_copy_enabled and self.store.get_state("copy_paused", "0") != "1":
+                self._refresh_feed_subscriptions()
+            return True
+        except LeaderboardError as exc:
+            self.last_leaderboard_error = str(exc)
+            self.message = "Leaderboard error: " + str(exc)
+            logger.warning("%s", self.message)
+            return False
+        except Exception:
+            logger.exception("Unexpected leaderboard error")
+            self.last_leaderboard_error = "Unexpected leaderboard error; inspect the console log."
+            self.message = self.last_leaderboard_error
+            return False
+
+    def _publish_dashboard_state(self, equity: float | None = None) -> None:
+        if equity is not None:
+            self.last_equity_usd = equity
+        positions = []
+        for p in self.store.list_positions():
+            entry = float(p["entry_price_usd"])
+            mark = float(self.price_cache.get(p["mint"], p["last_price_usd"]))
+            if mark <= 0:
+                mark = float(p["last_price_usd"])
+            move = ((mark / entry) - 1.0) * 100.0 if entry > 0 else 0.0
+            positions.append({
+                "mint": p["mint"], "amount_raw": p["amount_raw"], "decimals": p["decimals"],
+                "entry_price_usd": entry, "last_price_usd": mark, "move_pct": move,
+                "source_wallet": p.get("source_wallet", ""),
+            })
+        trades = self.store.recent_trades(15)
+        leaders = {}
+        for period, rows in self.leaderboards.items():
+            leaders[period] = [{
+                "rank": item.get("rank"), "wallet": item.get("wallet"), "label": item.get("label", ""),
+                "profit": item.get("profit"), "rank_score": item.get("rank_score"),
+            } for item in rows]
+        paused = self.store.get_state("copy_paused", "0") == "1"
+        state = {
+            "mode": self.s.mode,
+            "message": self.message,
+            "leaderboard_error": self.last_leaderboard_error,
+            "leaderboards": leaders,
+            "selected_window": self.selected_window,
+            "auto_copy": bool(self.auto_copy_enabled and not paused),
+            "copy_paused": paused,
+            "active_wallets": sorted(self.active_wallets),
+            "equity_usd": self.last_equity_usd,
+            "positions": positions,
+            "trades": trades,
+            "feed_connected": bool(self.feed and self.feed.connected.is_set()),
+            "feed_error": self.feed.last_error if self.feed else "",
+        }
+        with self.state_lock:
+            self.dashboard_state = state
+
+    def _process_dashboard_commands(self) -> None:
+        while True:
+            try:
+                command = self.commands.get_nowait()
+            except queue.Empty:
+                break
+            action = command.get("action")
+            if action == "copy_top10":
+                window = str(command.get("window", "day")).lower()
+                if window not in {"overall", "day", "week", "month"}:
+                    self.message = "Invalid leaderboard window."
+                    continue
+                if not self.leaderboards:
+                    self.refresh_leaderboards(force=True)
+                if not self.leaderboards.get(window):
+                    self.message = self.last_leaderboard_error or "No rankings available for this window."
+                    continue
+                self.selected_window = window
+                self.auto_copy_enabled = True
+                self.store.set_state("leaderboard_window", window)
+                self.store.set_state("auto_copy_enabled", "1")
+                self.store.set_state("copy_paused", "0")
+                self._refresh_feed_subscriptions()
+                self.message = f"Auto-copy enabled for the top {len(self.leaderboards[window])} traders in {window}."
+                logger.warning("%s", self.message)
+            elif action == "stop_copy":
+                self.auto_copy_enabled = False
+                self.store.set_state("auto_copy_enabled", "0")
+                self.store.set_state("copy_paused", "1")
+                self._refresh_feed_subscriptions()
+                self.message = "New copied entries paused. Existing positions remain managed."
+                logger.warning("%s", self.message)
+            elif action == "manual_exit":
+                mint = str(command.get("mint", "")).strip()
+                position = self.store.get_position(mint)
+                if not position:
+                    self.message = "No tracked open position exists for that mint."
+                    continue
+                self.store.set_state(f"exit_pending:{mint}", "manual exit requested from dashboard")
+                self.message = f"Manual exit queued for {mint}; attempting on the next bot cycle."
+                logger.warning("%s", self.message)
+            elif action == "exit_all":
+                positions = self.store.list_positions()
+                for position in positions:
+                    self.store.set_state(f"exit_pending:{position['mint']}", "manual exit all requested from dashboard")
+                self.message = f"Manual exit-all queued for {len(positions)} tracked position(s)."
+                logger.warning("%s", self.message)
+
+    def _event_price_usd(self, event: dict) -> float | None:
+        try:
+            token_amount = float(event.get("tokenAmount") or event.get("token_amount") or 0)
+            sol_amount = float(event.get("solAmount") or event.get("sol_amount") or 0)
+            if token_amount <= 0 or sol_amount <= 0:
+                return None
+            return (sol_amount / token_amount) * self.market.sol_price_usd()
+        except (TypeError, ValueError, RuntimeError):
+            return None
+
+    def _signal_from_feed(self, event: dict) -> dict | None:
+        mint = str(event.get("mint") or "")
+        wallet = str(event.get("wallet") or event.get("traderPublicKey") or "")
+        side = str(event.get("side") or event.get("txType") or "").lower()
+        if not mint or not wallet or side not in {"buy", "sell"}:
+            return None
+        try:
+            observed_amount = float(event.get("tokenAmount") or event.get("token_amount") or 0)
+            if observed_amount <= 0:
+                return None
+            decimals = int(event.get("decimals") or 6)
+            raw = event.get("tokenAmountRaw") or event.get("token_amount_raw")
+            amount_raw = abs(int(raw)) if raw is not None else abs(int(observed_amount * (10 ** decimals)))
+            sol_amount = float(event.get("solAmount") or event.get("sol_amount") or 0)
+        except (TypeError, ValueError):
+            return None
+        if amount_raw <= 0:
+            return None
+        tx_sig = (event.get("signature") or event.get("txSignature") or event.get("txid")
+                  or event.get("transactionSignature"))
+        if not tx_sig:
+            # Stable per-event de-duplication key when provider doesn't include a signature.
+            seed = "|".join(str(event.get(k, "")) for k in (
+                "wallet", "mint", "side", "timestamp", "solAmount", "tokenAmount", "marketCapSol"
+            ))
+            import hashlib
+            tx_sig = "ws-" + hashlib.sha256(seed.encode()).hexdigest()[:40]
+        observed_price = self._event_price_usd(event)
+        new_balance = event.get("newTokenBalance") or event.get("new_token_balance")
+        post_raw = 0
+        if new_balance is not None:
+            try:
+                post_raw = max(0, int(float(new_balance) * (10 ** decimals)))
+            except (TypeError, ValueError):
+                post_raw = 0
+        pre_raw = post_raw + amount_raw if side == "sell" else max(0, post_raw - amount_raw)
+        curve_sol = event.get("vSolInBondingCurve") or event.get("v_sol_in_bonding_curve") or 0
+        try:
+            curve_liquidity_usd = float(curve_sol) * 2 * self.market.sol_price_usd()
+        except (TypeError, ValueError, RuntimeError):
+            curve_liquidity_usd = 0.0
+        return {
+            "wallet": wallet, "signature": str(tx_sig), "mint": mint, "side": side,
+            "amount_ui": observed_amount, "amount_raw": amount_raw, "decimals": decimals,
+            "leader_pre_raw": pre_raw, "leader_post_raw": post_raw,
+            "native_delta_sol": (-sol_amount if side == "buy" else sol_amount),
+            "venue": str(event.get("pool") or "pump"),
+            "observed_price_usd": observed_price or 0.0,
+            "curve_liquidity_usd": curve_liquidity_usd,
+            "source": str(event.get("source") or "account_trade"),
+            "block_time": event.get("timestamp"),
+        }
+
+    def _consume_feed_events(self) -> None:
+        while True:
+            try:
+                event = self.trade_events.get_nowait()
+            except queue.Empty:
+                break
+            price = self._event_price_usd(event)
+            mint = str(event.get("mint") or "")
+            if mint and price and price > 0:
+                self.price_cache[mint] = price
+            if event.get("source") == "token_trade":
+                continue
+            signal = self._signal_from_feed(event)
+            if not signal:
+                continue
+            if signal["wallet"] not in self.active_wallets:
+                continue
+            if self.store.signature_seen(signal["signature"]):
+                continue
+            self.process_signal(signal)
+            self.store.mark_signature_seen(signal["signature"], signal["wallet"])
+
     def _tx_programs(self, tx: dict) -> tuple[set[str], set[str]]:
         """Return all invoked IDs and top-level IDs (parsed or compiled JSON-RPC form)."""
         message = ((tx.get("transaction") or {}).get("message") or {})
