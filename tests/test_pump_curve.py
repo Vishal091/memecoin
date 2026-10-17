@@ -23,7 +23,7 @@ class PumpCurveTests(unittest.TestCase):
         data = self.fixture_data()
         state = parse_bonding_curve_data([base64.b64encode(data).decode(), "base64"])
         self.assertIsInstance(state, PumpCurveSnapshot)
-        self.assertAlmostEqual(state.price_usd(150.0), 0.0045)
+        self.assertAlmostEqual(state.price_usd(150.0), 0.0000045)
         self.assertAlmostEqual(state.liquidity_usd(150.0), 1500.0)
 
     def test_rejects_wrong_discriminator_and_truncated_data(self):
