@@ -77,6 +77,7 @@ class NativeBuildFailureTests(unittest.TestCase):
     def test_pool_account_not_found_is_classified_as_pre_submission_failure(self):
         executor = object.__new__(NativePumpExecutor)
         executor.node = "node"
+        executor.timeout = 12
         completed = SimpleNamespace(
             returncode=1,
             stderr="Error: Pool account not found",
