@@ -48,7 +48,7 @@ class Store:
                 initial_amount_raw TEXT NOT NULL, peak_price_usd REAL NOT NULL,
                 tp1_done INTEGER NOT NULL DEFAULT 0, tp2_done INTEGER NOT NULL DEFAULT 0,
                 opened_at TEXT NOT NULL, last_price_usd REAL NOT NULL,
-                invested_usd REAL NOT NULL
+                invested_usd REAL NOT NULL, source_wallet TEXT, source_signature TEXT
             );
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
@@ -67,6 +67,13 @@ class Store:
             self.db.execute("INSERT OR IGNORE INTO state(key,value) VALUES('day_start_equity','0')")
             self.db.execute("INSERT OR IGNORE INTO state(key,value) VALUES('daily_entries','0')")
             self.db.execute("INSERT OR IGNORE INTO state(key,value) VALUES('daily_realized_pnl','0')")
+            self.db.execute("INSERT OR IGNORE INTO state(key,value) VALUES('live_equity_initialized','0')")
+            # Add columns when upgrading an existing local database created by an earlier version.
+            pos_columns = {row[1] for row in self.db.execute("PRAGMA table_info(positions)").fetchall()}
+            if "source_wallet" not in pos_columns:
+                self.db.execute("ALTER TABLE positions ADD COLUMN source_wallet TEXT")
+            if "source_signature" not in pos_columns:
+                self.db.execute("ALTER TABLE positions ADD COLUMN source_signature TEXT")
 
     def close(self) -> None:
         self.db.close()
@@ -117,7 +124,8 @@ class Store:
 
     def upsert_position(self, p: dict) -> None:
         columns = ("mint", "decimals", "amount_raw", "entry_price_usd", "initial_amount_raw",
-                   "peak_price_usd", "tp1_done", "tp2_done", "opened_at", "last_price_usd", "invested_usd")
+                   "peak_price_usd", "tp1_done", "tp2_done", "opened_at", "last_price_usd", "invested_usd",
+                   "source_wallet", "source_signature")
         with self.db:
             self.db.execute(
                 "INSERT INTO positions (" + ",".join(columns) + ") VALUES (" + ",".join("?" for _ in columns) + ") "
@@ -151,6 +159,19 @@ class Store:
 
     def recent_trades(self, limit: int = 20) -> list[dict]:
         return [dict(r) for r in self.db.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
+
+    def trader_performance(self) -> list[dict]:
+        rows = self.db.execute("""
+            SELECT source_wallet,
+                   SUM(CASE WHEN action='BUY' THEN 1 ELSE 0 END) AS buys,
+                   SUM(CASE WHEN action='SELL' THEN 1 ELSE 0 END) AS sells,
+                   SUM(CASE WHEN action='SELL' THEN pnl_usd ELSE 0 END) AS realized_pnl,
+                   SUM(CASE WHEN action='SELL' AND pnl_usd > 0 THEN 1 ELSE 0 END) AS winning_exits,
+                   SUM(CASE WHEN action='SELL' AND pnl_usd <= 0 THEN 1 ELSE 0 END) AS losing_exits
+            FROM trades WHERE source_wallet IS NOT NULL AND source_wallet != ''
+            GROUP BY source_wallet ORDER BY realized_pnl DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
 
     def daily_entries(self) -> int:
         return int(self.get_state("daily_entries", "0"))
