@@ -484,10 +484,11 @@ class CopyBot:
                 liquidate_all = self.store.get_state("liquidate_all_pending", "0") == "1"
                 if liquidate_all:
                     for p in self.store.list_positions():
-                        self.sell(p["mint"], int(p["amount_raw"]), "total loss limit liquidation")
+                        self.store.set_state(f"exit_pending:{p['mint']}", "total loss limit liquidation")
                 if expired:
                     for p in self.store.list_positions():
-                        self.sell(p["mint"], int(p["amount_raw"]), "experiment expiry liquidation")
+                        self.store.set_state(f"exit_pending:{p['mint']}", "experiment expiry liquidation")
+                # Position manager performs at most one exit attempt per position in each cycle.
                 self.manage_positions()
                 if liquidate_all and not self.store.list_positions():
                     self.store.set_state("liquidate_all_pending", "0")
