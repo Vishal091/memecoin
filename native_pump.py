@@ -18,6 +18,18 @@ from solders.transaction import VersionedTransaction
 
 logger = logging.getLogger("native_pump")
 
+
+class TransactionConfirmationUnknown(TimeoutError):
+    """A signed live transaction was submitted, but its final outcome is unknown."""
+
+    def __init__(self, signature: str, detail: str):
+        self.signature = str(signature)
+        self.detail = str(detail)
+        super().__init__(
+            f"Transaction confirmation is unknown for {self.signature}: "
+            f"{self.detail}; do not retry before reconciliation"
+        )
+
 ROOT = Path(__file__).resolve().parent
 BUILDER = ROOT / "native_pump_builder.mjs"
 
@@ -376,10 +388,18 @@ class NativePumpExecutor:
         ])
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            result = self.rpc.call(
-                "getSignatureStatuses",
-                [[signature], {"searchTransactionHistory": True}],
-            ) or {}
+            try:
+                result = self.rpc.call(
+                    "getSignatureStatuses",
+                    [[signature], {"searchTransactionHistory": True}],
+                ) or {}
+            except Exception as exc:
+                # sendTransaction returned a signature. A subsequent status-query
+                # failure is ambiguous, not proof of failure; preserve the signature.
+                raise TransactionConfirmationUnknown(
+                    str(signature),
+                    f"signature-status lookup failed ({type(exc).__name__}): {exc}",
+                ) from exc
             statuses = result.get("value") or []
             status = statuses[0] if statuses else None
             if status:
@@ -388,7 +408,10 @@ class NativePumpExecutor:
                 if status.get("confirmationStatus") in {"confirmed", "finalized"}:
                     return str(signature)
             time.sleep(0.7)
-        raise TimeoutError(f"Confirmation timeout for {signature}; do not retry before checking this signature")
+        raise TransactionConfirmationUnknown(
+            str(signature),
+            "confirmation timeout after 30 seconds",
+        )
 
     def trade(self, owner: str, keypair: Keypair, mint: str, action: str, amount: float,
               denominated_in_sol: bool, slippage_bps: int, preferred_pool: str | None = None,
