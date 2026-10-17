@@ -143,6 +143,13 @@ class NativeBuilderRoutingRegressionTests(unittest.TestCase):
         self.assertLess(route_detection, sell_state_fetch)
         self.assertIn("if (!curve.complete)", route_guard)
 
+    def test_completed_coin_uses_its_actual_quote_mint_for_pool_pda(self):
+        builder = Path(__file__).resolve().parents[1] / "native_pump_builder.mjs"
+        source = builder.read_text(encoding="utf-8")
+        self.assertIn("const curveQuoteMint = curveSnapshot.quoteMint;", source)
+        self.assertIn("canonicalPumpPoolPda(mint, poolQuoteMint)", source)
+        self.assertIn("Unsupported PumpSwap quote mint", source)
+
 
 class NativeTransactionGuardTests(unittest.TestCase):
     def validate(self, tx, wallet, mint, action="buy", route="pump", budget=1_000, raw=100):
