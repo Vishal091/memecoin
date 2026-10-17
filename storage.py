@@ -130,12 +130,14 @@ class Store:
                             (signature, wallet, utc_now()))
 
     def add_signal(self, wallet: str, signature: str, mint: str, side: str,
-                   amount_ui: float, decimals: int) -> None:
+                   amount_ui: float, decimals: int) -> bool:
+        """Record an observed signal and return False when this exact event was already seen."""
         with self.db:
-            self.db.execute("""INSERT OR IGNORE INTO signals
+            cursor = self.db.execute("""INSERT OR IGNORE INTO signals
                 (wallet,signature,mint,side,amount_ui,decimals,created_at)
                 VALUES(?,?,?,?,?,?,?)""",
                 (wallet, signature, mint, side, amount_ui, decimals, utc_now()))
+            return cursor.rowcount > 0
 
     def list_positions(self) -> list[dict]:
         rows = self.db.execute("SELECT * FROM positions").fetchall()
