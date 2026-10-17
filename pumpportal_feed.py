@@ -129,7 +129,7 @@ class PumpPortalAccountFeed(threading.Thread):
                                 notice = " ".join(notice.split())[:200]
                                 if notice != self.last_notice:
                                     self.last_notice = notice
-                                    if message.get("error") or any(word in notice.lower() for word in ("error", "insufficient", "limit", "invalid", "unauthorized", "denied")):
+                                    if message.get("error") or any(word in notice.lower() for word in ("error", "insufficient", "limit", "invalid", "unauthorized", "denied", "only available", "funded with", "0.02 sol")):
                                         logger.warning("PumpPortal provider notice: %s", notice)
                                     else:
                                         logger.info("PumpPortal provider notice: %s", notice)
