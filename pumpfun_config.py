@@ -39,6 +39,8 @@ class PumpFunSettings:
     leaderboard_refresh_seconds: int
     top_traders_count: int
     dashboard_port: int
+    auto_copy_on_start: bool
+    default_leaderboard_window: str
     rpc_url: str
     keypair_path: Path
     max_entry_usd: float
@@ -81,6 +83,8 @@ class PumpFunSettings:
             leaderboard_refresh_seconds=max(60, _int("LEADERBOARD_REFRESH_SECONDS", 300)),
             top_traders_count=min(10, max(1, _int("TOP_TRADERS_COUNT", 10))),
             dashboard_port=max(1024, min(65535, _int("DASHBOARD_PORT", 8765))),
+            auto_copy_on_start=os.getenv("AUTO_COPY_ON_START", "true").strip().lower() in {"1", "true", "yes", "on"},
+            default_leaderboard_window=os.getenv("DEFAULT_LEADERBOARD_WINDOW", "day").strip().lower(),
             rpc_url=os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip(),
             keypair_path=Path(os.getenv("KEYPAIR_PATH", "./wallet.json")).expanduser(),
             max_entry_usd=_float("MAX_ENTRY_USD", 2.0),
@@ -114,6 +118,8 @@ class PumpFunSettings:
     def validate(self) -> None:
         if not self.rpc_url.startswith("https://"):
             raise ValueError("SOLANA_RPC_URL must use HTTPS")
+        if self.default_leaderboard_window not in {"overall", "day", "week", "month"}:
+            raise ValueError("DEFAULT_LEADERBOARD_WINDOW must be overall, day, week or month")
         if self.max_entry_usd <= 0 or self.max_total_exposure_usd <= 0:
             raise ValueError("Entry and exposure limits must be positive")
         if not (0 <= self.slippage_bps <= 500):
