@@ -72,5 +72,48 @@ class TransactionRetryTests(unittest.TestCase):
         bot.store.mark_signature_seen.assert_not_called()
 
 
+    def test_detector_retries_when_transaction_details_are_missing(self):
+        bot = PumpFunBot.__new__(PumpFunBot)
+        bot.rpc = Mock()
+        bot.rpc.transaction.return_value = None
+
+        with self.assertRaises(SolanaTransactionNotReady):
+            bot.detect_pump_signal(WALLET, SIGNATURE)
+
+    def test_signer_requirement_rejects_fee_recipient_mention(self):
+        from pumpportal import PUMP_PROGRAM_ID
+        from unittest.mock import patch
+
+        mint = "7VzWURCfosjxvT7KKM9gib5CzqnCg4vKU2UobGp3pump"
+        for signer, expected_count in ((False, 0), (True, 1)):
+            bot = PumpFunBot.__new__(PumpFunBot)
+            bot.rpc = Mock()
+            bot.rpc.transaction.return_value = {
+                "transaction": {"message": {"accountKeys": [
+                    {"pubkey": WALLET, "signer": signer}
+                ]}},
+                "meta": {
+                    "err": None,
+                    "preTokenBalances": [],
+                    "postTokenBalances": [],
+                },
+                "blockTime": 1,
+            }
+            bot.rpc.wallet_token_deltas.return_value = (
+                {mint: {"delta_raw": 1_000_000, "delta_ui": 1.0, "decimals": 6}},
+                -1_000_000_000,
+            )
+            bot._tx_programs = Mock(return_value=({PUMP_PROGRAM_ID}, {PUMP_PROGRAM_ID}))
+            bot.market = Mock()
+            with patch("pumpfun_bot.fetch_pump_curve", return_value=None):
+                result = bot.detect_pump_signal(WALLET, SIGNATURE)
+            self.assertEqual(len(result), expected_count)
+            if not signer:
+                bot.rpc.wallet_token_deltas.assert_not_called()
+            else:
+                self.assertEqual(result[0]["side"], "buy")
+                self.assertEqual(result[0]["mint"], mint)
+
+
 if __name__ == "__main__":
     unittest.main()
