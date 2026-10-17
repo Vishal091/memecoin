@@ -131,7 +131,7 @@ class PumpFunBot:
         self.last_leaderboard_refresh = now
         if not self.leaderboard_client.ready:
             self.last_leaderboard_error = (
-                "Automatic discovery needs PUMPFUN_BEARER_TOKEN in the local .env. "
+                "Automatic discovery needs PUMPFUN_AUTH_TOKEN in the local .env. "
                 "No trader wallet addresses need to be entered."
             )
             if not self.s.watch_wallets:
