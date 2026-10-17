@@ -3,9 +3,30 @@ import unittest
 from pathlib import Path
 
 from market_data import MarketData, WSOL_MINT
-from pumpfun_bot import position_source_matches_wallet
+from pumpfun_bot import normalize_pending_exit_reason, position_source_matches_wallet
 from solana_rpc import SolanaRPC
 from storage import Store
+
+
+class PendingExitReasonTests(unittest.TestCase):
+    def test_normal_exit_reason_is_unchanged(self):
+        self.assertEqual(normalize_pending_exit_reason("trailing stop"), "trailing stop")
+
+    def test_repeated_pending_exit_prefixes_are_removed(self):
+        self.assertEqual(
+            normalize_pending_exit_reason(
+                "pending exit: pending exit: pending exit: trailing stop"
+            ),
+            "trailing stop",
+        )
+
+    def test_wrapped_leader_exit_reason_is_preserved(self):
+        self.assertEqual(
+            normalize_pending_exit_reason(
+                "pending exit: pending exit: followed wallet Leader123 partial/full sell on pump-amm"
+            ),
+            "followed wallet Leader123 partial/full sell on pump-amm",
+        )
 
 
 class SourceWalletSellMatchingTests(unittest.TestCase):
