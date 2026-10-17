@@ -57,6 +57,7 @@ class Settings:
     take_profit_1_sell_fraction: float
     take_profit_2_sell_fraction: float
     poll_seconds: int
+    experiment_duration_days: int
     request_timeout_seconds: int
     paper_swap_cost_usd: float
     database_path: Path
@@ -96,6 +97,7 @@ class Settings:
             take_profit_1_sell_fraction=_float("TAKE_PROFIT_1_SELL_FRACTION", 0.40),
             take_profit_2_sell_fraction=_float("TAKE_PROFIT_2_SELL_FRACTION", 0.30),
             poll_seconds=max(2, _int("POLL_SECONDS", 4)),
+            experiment_duration_days=max(1, _int("EXPERIMENT_DURATION_DAYS", 7)),
             request_timeout_seconds=max(3, _int("REQUEST_TIMEOUT_SECONDS", 12)),
             paper_swap_cost_usd=_float("PAPER_SWAP_COST_USD", 0.02),
             database_path=Path(os.getenv("DATABASE_PATH", "memecoin.db")),
