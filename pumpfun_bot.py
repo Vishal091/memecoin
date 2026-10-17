@@ -1276,8 +1276,18 @@ class PumpFunBot:
     def process_signal(self, signal: dict):
         if signal.get("wallet") not in self.active_wallets:
             return
-        self.store.add_signal(signal["wallet"], signal["signature"], signal["mint"], signal["side"],
-                              signal["amount_ui"], signal["decimals"])
+        is_new_signal = self.store.add_signal(
+            signal["wallet"], signal["signature"], signal["mint"], signal["side"],
+            signal["amount_ui"], signal["decimals"],
+        )
+        if not is_new_signal:
+            self.signal_stats["duplicate_events"] += 1
+            logger.debug(
+                "Ignoring duplicate copy signal wallet=%s signature=%s mint=%s side=%s",
+                str(signal["wallet"])[:8], str(signal["signature"])[:10],
+                str(signal["mint"])[:8], signal["side"],
+            )
+            return
         if self.wallet_address and signal["wallet"] == self.wallet_address:
             return
         if signal["side"] == "buy":
