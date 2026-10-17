@@ -32,6 +32,8 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px 8px
 <div class="grid"><div class="metric"><small>Estimated equity</small><strong id="equity">—</strong></div>
 <div class="metric"><small>Open positions</small><strong id="posCount">0</strong></div><div class="metric"><small>Auto-copy</small><strong id="copyStatus">OFF</strong></div>
 <div class="metric"><small>Active traders</small><strong id="walletCount">0</strong></div></div>
+ <section class="panel"><h2>Trade-feed diagnostics</h2><div id="feedSummary" class="status">Checking feed status…</div>
+ <div id="feedDetail" class="muted">Waiting for feed counters…</div><div id="signalDetail" class="muted" style="margin-top:8px"></div></section>
 <section class="panel"><div class="toolbar"><div><h2>Top Pump.fun traders</h2><div class="muted">Choose a period, then copy its current top 10.</div></div>
 <div><select id="window"><option value="overall">Overall composite</option><option value="month">Month (1M)</option><option value="week">Week (1W)</option><option value="day" selected>Day (1D)</option></select>
 <button class="primary" id="copyTop">Copy this Top 10</button> <button id="stopCopy">Stop copying</button></div></div>
@@ -50,7 +52,13 @@ async function action(body){try{var r=await fetch("/api/action",{method:"POST",h
 function render(d){
  el("mode").textContent=(d.mode||"unknown").toUpperCase();el("equity").textContent=d.equity_usd===null?"—":"$"+num(d.equity_usd);
  el("posCount").textContent=(d.positions||[]).length;el("copyStatus").textContent=d.auto_copy?"ON":"OFF";el("walletCount").textContent=(d.active_wallets||[]).length;
- var period=el("window").value;var leaders=((d.leaderboards||{})[period]||[]);
+ var f=d.feed_stats||{};var ss=d.signal_stats||{};
+  function ago(ts){if(!ts)return "never";var sec=Math.max(0,Math.floor(Date.now()/1000-Number(ts)));return sec<60?sec+"s ago":Math.floor(sec/60)+"m "+(sec%60)+"s ago"}
+  el("feedSummary").textContent=(f.connected?"WebSocket connected":"WebSocket disconnected")+" · "+(f.subscribed_wallet_count||0)+" account subscriptions · "+(f.account_trade_events_received||0)+" account trade events";
+  el("feedDetail").textContent="Messages received: "+(f.messages_received||0)+" · Trade events: "+(f.trade_events_received||0)+" · Last message: "+ago(f.last_message_at)+" · Last account trade: "+ago(f.last_account_trade_at);
+  var notices=[];if(f.error)notices.push("Feed error: "+f.error);if(f.last_notice)notices.push("Provider notice: "+f.last_notice);if(f.last_event_summary)notices.push("Last event: "+f.last_event_summary);
+  el("signalDetail").textContent=notices.join(" · ")+" · Parsed signals: "+(ss.parsed_signals||0)+" · Unparsed: "+(ss.unparsed_events||0)+" · Duplicate: "+(ss.duplicate_events||0)+" · Unwatched: "+(ss.unwatched_events||0)+" · Sells with no position: "+(ss.sell_without_position||0);
+  var period=el("window").value;var leaders=((d.leaderboards||{})[period]||[]);
  el("leaders").innerHTML=leaders.length?leaders.map(function(x,i){var score=period==="overall"?"Composite "+(x.rank_score||""):x.profit===null||x.profit===undefined?"—":num(x.profit);return "<tr><td>"+(x.rank||i+1)+"</td><td><div class='addr' title='"+x.wallet+"'>"+short(x.wallet)+"</div><a class='muted' target='_blank' rel='noreferrer' href='https://pump.fun/profile/"+x.wallet+"'>Profile ↗</a></td><td class='hide-sm'>"+score+"</td><td>"+((d.active_wallets||[]).includes(x.wallet)?"Copying":"Not copying")+"</td></tr>"}).join(""):"<tr><td colspan='4' class='empty'>No leaderboard loaded. Check API access/configuration.</td></tr>";
  var ps=d.positions||[];el("positions").innerHTML=ps.length?ps.map(function(p){var m=Number(p.move_pct||0);return "<tr><td><div class='addr' title='"+p.mint+"'>"+short(p.mint)+"</div><a target='_blank' rel='noreferrer' href='https://pump.fun/coin/"+p.mint+"'>Pump.fun ↗</a></td><td>$"+num(p.entry_price_usd)+"</td><td>$"+num(p.last_price_usd)+"</td><td class='"+(m>=0?"green":"red")+"'>"+(m>=0?"+":"")+m.toFixed(1)+"%</td><td><button class='danger exitOne' data-mint='"+p.mint+"'>Manual exit</button></td></tr>"}).join(""):"<tr><td colspan='5' class='empty'>No open positions.</td></tr>";
  document.querySelectorAll(".exitOne").forEach(function(b){b.onclick=function(){if(confirm("Submit manual exit attempt for this position?"))action({action:"manual_exit",mint:b.dataset.mint})}});
