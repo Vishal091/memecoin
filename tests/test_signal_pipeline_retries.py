@@ -47,7 +47,8 @@ class TransactionRetryTests(unittest.TestCase):
         bot.process_signal.assert_not_called()
 
     def test_valid_non_trade_transaction_is_marked_seen_once(self):
-        bot = make_bot([])
+        bot = make_bot(None)
+        bot.detect_pump_signal.return_value = []
         bot.solana_log_events.put({"wallet": WALLET, "signature": SIGNATURE})
 
         bot._consume_solana_log_events()
