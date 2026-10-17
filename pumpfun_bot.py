@@ -381,10 +381,10 @@ class PumpFunBot:
             initial_raw = max(1, int(position["initial_amount_raw"]))
             entry = float(position["entry_price_usd"])
             if price <= entry * (1 - self.s.max_marked_loss_pct):
-                self.store.set_state(f"exit_pending:{mint}", "marked loss stop")
+                self.sell(mint, current_raw, "marked loss stop")
                 continue
             if peak > entry and price <= peak * (1 - self.s.trailing_stop_pct):
-                self.store.set_state(f"exit_pending:{mint}", "trailing stop")
+                self.sell(mint, current_raw, "trailing stop")
                 continue
             if not int(position["tp1_done"]) and price >= entry * (1 + self.s.take_profit_1_pct):
                 qty = min(current_raw, int(initial_raw * self.s.take_profit_1_sell_fraction))
