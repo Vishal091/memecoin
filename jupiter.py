@@ -12,6 +12,10 @@ from solders.transaction import VersionedTransaction
 from solders.message import to_bytes_versioned
 
 logger = logging.getLogger(__name__)
+
+class NoExecutableRoute(RuntimeError):
+    """Jupiter found no executable route for the requested swap."""
+
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 JUPITER_BASE = "https://api.jup.ag/swap/v2"
 
@@ -34,18 +38,22 @@ class JupiterExecutor:
             raise ValueError(f"Could not load local keypair file {path}: {exc}") from exc
 
     def order(self, *, input_mint: str, output_mint: str, amount_raw: int,
-              taker: str, slippage_bps: int) -> dict[str, Any]:
+              taker: str | None, slippage_bps: int, require_transaction: bool = True) -> dict[str, Any]:
         params = {
             "inputMint": input_mint, "outputMint": output_mint, "amount": str(amount_raw),
-            "taker": taker, "slippageBps": str(slippage_bps),
+            "slippageBps": str(slippage_bps),
         }
+        if taker:
+            params["taker"] = taker
         r = self.session.get(f"{JUPITER_BASE}/order", params=params, timeout=self.timeout)
         r.raise_for_status()
         data = r.json()
         if not data.get("requestId"):
             raise RuntimeError(f"Jupiter order response missing requestId: {data}")
-        if not data.get("transaction"):
-            raise RuntimeError(f"Jupiter cannot build an executable transaction for this order: router={data.get('router')} code={data.get('errorCode')} message={data.get('errorMessage')}")
+        if int(data.get("outAmount") or 0) <= 0:
+            raise NoExecutableRoute(f"Jupiter returned no output quote: router={data.get('router')} code={data.get('errorCode')}")
+        if require_transaction and not data.get("transaction"):
+            raise NoExecutableRoute(f"Jupiter cannot build an executable transaction: router={data.get('router')} code={data.get('errorCode')} message={data.get('errorMessage')}")
         return data
 
     def execute(self, order: dict[str, Any], keypair: Keypair) -> dict[str, Any]:
