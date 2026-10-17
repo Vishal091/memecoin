@@ -104,6 +104,72 @@ class NativeBuildFailureHandlingTests(unittest.TestCase):
         )
 
 
+
+class CopySafetyGateTests(unittest.TestCase):
+    class FakeStore:
+        def __init__(self, state=None, positions=None):
+            self.state = dict(state or {})
+            self.positions = list(positions or [])
+
+        def get_state(self, key, default=""):
+            return self.state.get(key, default)
+
+        def set_state(self, key, value):
+            self.state[key] = str(value)
+
+        def list_positions(self):
+            return list(self.positions)
+
+    def _bot(self, state=None, positions=None):
+        bot = object.__new__(PumpFunBot)
+        bot.store = self.FakeStore(state, positions)
+        bot.s = SimpleNamespace(
+            watch_wallets=(),
+            top_traders_count=10,
+            stream_token_prices=False,
+        )
+        bot.auto_copy_enabled = True
+        bot.selected_window = "day"
+        bot.leaderboards = {"day": [{"wallet": "leader-wallet"}]}
+        bot.feed = None
+        bot.logs_feed = None
+        return bot
+
+    def test_overall_loss_halt_has_clear_copy_block_reason(self):
+        bot = self._bot({"halted": "1", "halt_reason": "Total loss limit reached"})
+        self.assertEqual(
+            bot._copy_block_reason(),
+            "Overall loss halt active: Total loss limit reached",
+        )
+
+    def test_manual_review_halt_has_clear_copy_block_reason(self):
+        bot = self._bot({
+            "manual_review_halt": "1",
+            "manual_review_reason": "Reconcile wallet before resuming",
+        })
+        self.assertEqual(
+            bot._copy_block_reason(),
+            "Manual-review halt active: Reconcile wallet before resuming",
+        )
+
+    def test_blocked_copy_does_not_subscribe_to_new_leaders(self):
+        bot = self._bot({
+            "manual_review_halt": "1",
+            "manual_review_reason": "Reconcile wallet before resuming",
+        })
+        bot._refresh_feed_subscriptions()
+        self.assertEqual(bot.active_wallets, set())
+
+    def test_held_position_leader_remains_monitored_when_copy_is_blocked(self):
+        position = {"mint": "open-mint", "source_wallet": "held-leader"}
+        bot = self._bot({
+            "manual_review_halt": "1",
+            "manual_review_reason": "Reconcile wallet before resuming",
+        }, positions=[position])
+        bot._refresh_feed_subscriptions()
+        self.assertEqual(bot.active_wallets, {"held-leader"})
+
+
 class ParserTests(unittest.TestCase):
     def setUp(self):
         self.rpc = SolanaRPC("https://example.invalid", timeout=1)
