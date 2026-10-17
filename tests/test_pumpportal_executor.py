@@ -31,6 +31,23 @@ class PumpPortalRouteFailureTests(unittest.TestCase):
                 keypair=None,
             )
 
+    def test_top_level_program_ids_are_resolved_from_instruction_indexes(self):
+        from types import SimpleNamespace
+
+        message = SimpleNamespace(
+            account_keys=["ComputeBudget111", "PumpProgram111", "TokenProgram111"],
+            instructions=[
+                SimpleNamespace(program_id_index=0),
+                SimpleNamespace(program_id_index=1),
+                SimpleNamespace(program_id_index=2),
+                SimpleNamespace(program_id_index=1),
+            ],
+        )
+        self.assertEqual(
+            PumpPortalExecutor._top_level_program_ids(message),
+            ["ComputeBudget111", "PumpProgram111", "TokenProgram111"],
+        )
+
     def test_all_route_build_errors_are_preserved_and_no_transaction_is_sent(self):
         def fail_build(owner, mint, action, amount, denominated_in_sol,
                        slippage_bps, pool, keypair):
