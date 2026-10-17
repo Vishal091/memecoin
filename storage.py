@@ -14,7 +14,7 @@ def utc_now() -> str:
 
 
 class Store:
-    def __init__(self, path: Path, starting_cash: float):
+    def __init__(self, path: Path, starting_cash: float, mode: str = "paper"):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
@@ -23,6 +23,25 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self._init(starting_cash)
+        existing_mode = self.get_state("database_mode", "")
+        has_history = (
+            self.db.execute("SELECT COUNT(*) FROM trades").fetchone()[0] > 0 or
+            self.db.execute("SELECT COUNT(*) FROM positions").fetchone()[0] > 0
+        )
+        if existing_mode and existing_mode != mode:
+            self.db.close()
+            raise RuntimeError(
+                f"This database is locked to {existing_mode!r} mode, not {mode!r}. "
+                "Use a different DATABASE_PATH for paper and live trading."
+            )
+        if not existing_mode and has_history:
+            self.db.close()
+            raise RuntimeError(
+                "This database contains old trading history but has no mode marker. "
+                "Use a new, separate DATABASE_PATH for this mode."
+            )
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO state(key,value) VALUES('database_mode',?)", (mode,))
 
     def _init(self, starting_cash: float) -> None:
         with self.db:
