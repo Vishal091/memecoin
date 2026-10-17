@@ -69,6 +69,8 @@ The bot refreshes the selected leaderboard at the configured interval and update
 
 Paper mode uses estimate-based token prices and a fixed simulated per-side cost; it cannot fully model launchpad slippage, priority fees, or PumpPortal's event-stream costs. Paper performance is not a guarantee of live performance.
 
+The default ALLOW_UNINDEXED_PUMP_CURVE=true supports aggressive entries from a live Pump/PumpSwap event before a third-party market-data pair appears. This does **not** mean liquidity has been verified. The bot deliberately does not treat virtual bonding-curve reserves as real liquidity. Disable this option if you'd rather wait for indexed market data; leaving it enabled raises the risk of buying a token that becomes difficult or impossible to exit.
+
 ## Live mode setup — do not skip validation
 
 1. Use a brand-new dedicated Solana wallet, not your main wallet. Fund it only with the amount you are willing to lose, plus a SOL fee reserve and any provider minimums that you have verified.
