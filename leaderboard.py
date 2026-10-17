@@ -109,7 +109,12 @@ class PumpFunLeaderboard:
             "month": os.getenv("PUMPFUN_LEADERBOARD_MONTH_VALUE", "1M").strip(),
         }
         self.session = requests.Session()
-        self.session.headers.update({"Accept": "application/json", "User-Agent": "memecoin-local-bot/1.0"})
+        self.session.headers.update({
+            "Accept": "application/json",
+            "Origin": "https://pump.fun",
+            "Referer": "https://pump.fun/callouts/leaderboard",
+            "User-Agent": "memecoin-local-bot/1.0",
+        })
         if self.bearer_token:
             self.session.headers["Authorization"] = "Bearer " + self.bearer_token
 
