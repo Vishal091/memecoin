@@ -8,16 +8,22 @@ are eligible copy signals.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import queue
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from solders.pubkey import Pubkey
 
+from dashboard import DashboardServer
+from leaderboard import LeaderboardError, PumpFunLeaderboard
 from market_data import MarketData
 from pumpfun_config import PumpFunSettings
+from pumpportal_feed import PumpPortalAccountFeed
 from pumpportal import (
     PUMP_PROGRAM_ID,
     PUMPSWAP_PROGRAM_ID,
@@ -60,6 +66,27 @@ class PumpFunBot:
             self.keypair = PumpPortalExecutor.load_keypair(self.s.keypair_path)
             self.wallet_address = str(self.keypair.pubkey())
         self._validate_addresses()
+
+        self.leaderboard_client = PumpFunLeaderboard(timeout=self.s.request_timeout_seconds)
+        self.leaderboards = {}
+        self.selected_window = self.store.get_state("leaderboard_window", self.s.default_leaderboard_window)
+        saved_auto = self.store.get_state("auto_copy_enabled", "1" if self.s.auto_copy_on_start else "0")
+        self.auto_copy_enabled = saved_auto == "1"
+        self.active_wallets = set(self.s.watch_wallets)
+        self.last_leaderboard_refresh = 0.0
+        self.last_leaderboard_error = ""
+        self.message = "Ready. Configure Pump.fun leaderboard access to discover traders automatically."
+        self.last_equity_usd = None
+        self.state_lock = threading.RLock()
+        self.commands = queue.Queue()
+        self.trade_events = queue.Queue()
+        self.feed = (PumpPortalAccountFeed(self.s.pumpportal_api_key, self.trade_events,
+                                           self.s.request_timeout_seconds)
+                     if self.s.pumpportal_api_key else None)
+        self.dashboard = None
+        self.last_processed_event = set()
+        self.store.set_state("auto_copy_enabled", 1 if self.auto_copy_enabled else 0)
+        self.store.set_state("leaderboard_window", self.selected_window)
 
     def _validate_addresses(self):
         for wallet in self.s.watch_wallets:
