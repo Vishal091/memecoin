@@ -32,6 +32,15 @@ class PumpPortalAccountFeed(threading.Thread):
         self.connected = threading.Event()
         self.last_error = ""
         self.last_message_at = 0.0
+        self.connected_at = 0.0
+        self.messages_received = 0
+        self.trade_events_received = 0
+        self.account_trade_events_received = 0
+        self.last_account_trade_at = 0.0
+        self.last_event_summary = ""
+        self.last_notice = ""
+        self.subscribed_wallet_count = 0
+        self.subscription_updates = 0
 
     def set_subscriptions(self, wallets: Iterable[str], tokens: Iterable[str] = ()) -> None:
         account_list = tuple(dict.fromkeys(w for w in wallets if w))
@@ -65,6 +74,7 @@ class PumpPortalAccountFeed(threading.Thread):
                 with connect(uri, open_timeout=self.timeout, close_timeout=3, ping_interval=20, max_size=2**20) as ws:
                     subscribed_wallets: set[str] = set()
                     subscribed_tokens: set[str] = set()
+                    self.connected_at = time.time()
                     self.connected.set()
                     self.last_error = ""
                     logger.info("Connected to PumpPortal data feed")
@@ -74,6 +84,9 @@ class PumpPortalAccountFeed(threading.Thread):
                     self._send_diff(ws, "subscribeTokenTrade", "unsubscribeTokenTrade",
                                     subscribed_tokens, set(desired_tokens))
                     subscribed_wallets, subscribed_tokens = set(desired_wallets), set(desired_tokens)
+                    self.subscribed_wallet_count = len(subscribed_wallets)
+                    self.subscription_updates += 1
+                    logger.info("PumpPortal account-trade subscription requested for %d wallet(s)", self.subscribed_wallet_count)
                     while not self._stop_event.is_set():
                         desired_wallets, desired_tokens = self.get_subscriptions()
                         desired_wallets, desired_tokens = set(desired_wallets), set(desired_tokens)
@@ -81,7 +94,9 @@ class PumpPortalAccountFeed(threading.Thread):
                             self._send_diff(ws, "subscribeAccountTrade", "unsubscribeAccountTrade",
                                             subscribed_wallets, desired_wallets)
                             subscribed_wallets = desired_wallets
-                            logger.info("PumpPortal account subscriptions updated: %d wallets", len(subscribed_wallets))
+                            self.subscribed_wallet_count = len(subscribed_wallets)
+                            self.subscription_updates += 1
+                            logger.info("PumpPortal account-trade subscription updated for %d wallet(s)", len(subscribed_wallets))
                         if desired_tokens != subscribed_tokens:
                             self._send_diff(ws, "subscribeTokenTrade", "unsubscribeTokenTrade",
                                             subscribed_tokens, desired_tokens)
@@ -94,6 +109,7 @@ class PumpPortalAccountFeed(threading.Thread):
                         if not isinstance(raw, str):
                             continue
                         self.last_message_at = time.time()
+                        self.messages_received += 1
                         try:
                             message = json.loads(raw)
                         except json.JSONDecodeError:
@@ -106,12 +122,29 @@ class PumpPortalAccountFeed(threading.Thread):
                         mint = message.get("mint")
                         tx_type = str(message.get("txType") or message.get("side") or "").lower()
                         if tx_type not in {"buy", "sell"} or not mint:
+                            # PumpPortal can send subscription/error notices as JSON too.
+                            # Keep a safe, short status line rather than logging whole payloads.
+                            notice = str(message.get("error") or message.get("message") or message.get("status") or "")
+                            if notice:
+                                notice = " ".join(notice.split())[:200]
+                                if notice != self.last_notice:
+                                    self.last_notice = notice
+                                    if message.get("error") or any(word in notice.lower() for word in ("error", "insufficient", "limit", "invalid", "unauthorized", "denied")):
+                                        logger.warning("PumpPortal provider notice: %s", notice)
+                                    else:
+                                        logger.info("PumpPortal provider notice: %s", notice)
                             continue
+                        self.trade_events_received += 1
                         if trader and trader in subscribed_wallets:
                             event = dict(message)
                             event["wallet"] = trader
                             event["side"] = tx_type
                             event["source"] = "account_trade"
+                            self.account_trade_events_received += 1
+                            self.last_account_trade_at = time.time()
+                            self.last_event_summary = f"{tx_type} {str(mint)[:8]}… wallet {str(trader)[:6]}…"
+                            logger.info("PumpPortal account trade received: %s wallet=%s mint=%s",
+                                        tx_type, str(trader)[:6], str(mint)[:8])
                             self.output_queue.put(event)
                         elif mint in subscribed_tokens:
                             event = dict(message)
@@ -119,6 +152,8 @@ class PumpPortalAccountFeed(threading.Thread):
                             event["side"] = tx_type
                             event["source"] = "token_trade"
                             self.output_queue.put(event)
+                        else:
+                            self.last_notice = f"Trade event did not match active account/token subscriptions (side={tx_type})."
             except Exception as exc:
                 self.connected.clear()
                 self.last_error = f"{type(exc).__name__}: {exc}"
