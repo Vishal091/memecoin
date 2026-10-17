@@ -928,7 +928,12 @@ class PumpFunBot:
                      reason.startswith("total loss limit") or reason.startswith("pending exit:"))
         pending_key = f"exit_pending:{mint}"
         if full_exit:
-            self.store.set_state(pending_key, reason)
+            # Keep a stable underlying reason across retry cycles instead of
+            # nesting "pending exit:" on every failed build/simulation attempt.
+            pending_reason = reason
+            while pending_reason.lower().startswith("pending exit:"):
+                pending_reason = pending_reason.split(":", 1)[1].strip()
+            self.store.set_state(pending_key, pending_reason or reason)
         current_raw = int(position["amount_raw"])
         requested_raw = min(max(0, int(amount_raw)), current_raw)
         if requested_raw <= 0:

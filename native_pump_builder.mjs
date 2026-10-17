@@ -42,6 +42,10 @@ function sanitizeError(error, rpcUrl) {
 
 async function checkRuntime() {
   assert(typeof OnlinePumpSdk === "function", "Missing OnlinePumpSdk from @pump-fun/pump-sdk");
+  assert(
+    typeof OnlinePumpSdk.prototype.fetchBondingCurve === "function",
+    "Missing on-chain bonding-curve state lookup from @pump-fun/pump-sdk",
+  );
   assert(typeof PUMP_SDK?.buyExactQuoteInV3Instructions === "function", "Missing official Pump v3 buy builder");
   assert(typeof PUMP_SDK?.sellV3Instructions === "function", "Missing official Pump v3 sell builder");
   assert(typeof getBuyV3TokenAmountFromQuoteAmount === "function", "Missing Pump v3 quote helper");
@@ -74,15 +78,26 @@ async function build(input) {
     confirmTransactionInitialTimeout: 20_000,
   });
   const onlinePump = new OnlinePumpSdk(connection);
-  const state = action === "buy"
-    ? await onlinePump.fetchBuyState(mint, wallet)
-    : await onlinePump.fetchSellState(mint, wallet);
-  const curve = state.bondingCurve;
-  const quoteMint = state.quoteMint.toBase58();
-  assert(
-    quoteMint === WRAPPED_SOL_MINT || quoteMint === ZERO_PUBKEY,
-    "Native executor only supports SOL-quoted Pump tokens; refusing a token-quoted coin.",
-  );
+
+  // Determine the venue from on-chain curve state before requesting route-specific
+  // state. fetchSellState requires the user's token ATA and can throw for graduated
+  // tokens; graduated coins must be routed directly through the PumpSwap SDK.
+  const curveSnapshot = await onlinePump.fetchBondingCurve(mint);
+  assert(curveSnapshot, "Pump bonding curve was not found; refusing to guess a route.");
+  let curve = curveSnapshot;
+  let state = null;
+  if (!curve.complete) {
+    state = action === "buy"
+      ? await onlinePump.fetchBuyState(mint, wallet)
+      : await onlinePump.fetchSellState(mint, wallet);
+    curve = state.bondingCurve;
+    const quoteMint = state.quoteMint.toBase58();
+    assert(
+      quoteMint === WRAPPED_SOL_MINT || quoteMint === ZERO_PUBKEY,
+      "Native executor only supports SOL-quoted Pump tokens; refusing a token-quoted coin.",
+    );
+  }
+
   const slippagePercent = slippageBps / 100;
   let instructions;
   let route;

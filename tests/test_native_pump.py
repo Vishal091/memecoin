@@ -1,6 +1,7 @@
 import hashlib
 import struct
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from solders.pubkey import Pubkey
@@ -66,6 +67,17 @@ def fake_tx(route_program, trade_data, route="pump", accounts=None, extra_progra
         ],
     ))
     return tx, wallet, mint
+
+
+class NativeBuilderRoutingRegressionTests(unittest.TestCase):
+    def test_detect_amm_route_before_fetching_pump_sell_state(self):
+        builder = Path(__file__).resolve().parents[1] / "native_pump_builder.mjs"
+        source = builder.read_text(encoding="utf-8")
+        route_detection = source.index("await onlinePump.fetchBondingCurve(mint)")
+        sell_state_fetch = source.index("await onlinePump.fetchSellState(mint, wallet)")
+        route_guard = source[route_detection:sell_state_fetch]
+        self.assertLess(route_detection, sell_state_fetch)
+        self.assertIn("if (!curve.complete)", route_guard)
 
 
 class NativeTransactionGuardTests(unittest.TestCase):
