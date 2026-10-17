@@ -38,10 +38,29 @@ class MarketData:
             age = max(0, int(time.time()-created_ms/1000)) if created_ms else 0
         except (TypeError, ValueError):
             return None
+
+        # DexScreener exposes marketCap when available and FDV as a fallback.
+        # Keep the source label so the UI can distinguish reported market cap
+        # from a fully-diluted estimate.
+        market_cap_source = ""
+        try:
+            market_cap_usd = float(pair.get("marketCap") or 0)
+            if market_cap_usd > 0:
+                market_cap_source = "DexScreener market cap"
+            else:
+                market_cap_usd = float(pair.get("fdv") or 0)
+                if market_cap_usd > 0:
+                    market_cap_source = "DexScreener FDV estimate"
+        except (TypeError, ValueError):
+            market_cap_usd = 0.0
+        if market_cap_usd <= 0:
+            market_cap_usd = None
+            market_cap_source = ""
         # Never treat a quote-side token's base price as its own price.
         if (pair.get("baseToken") or {}).get("address") != mint or price <= 0:
             return None
         return {"mint":mint,"price_usd":price,"liquidity_usd":liquidity,"pair_age_seconds":age,
+                "market_cap_usd": market_cap_usd, "market_cap_source": market_cap_source,
                 "pair_address":pair.get("pairAddress"),"dex_id":pair.get("dexId"),"url":pair.get("url"),
                 "base_token":pair.get("baseToken") or {},"quote_token":pair.get("quoteToken") or {},"raw":pair}
 
