@@ -23,18 +23,6 @@ class TransactionBuildFailed(RuntimeError):
     """The native SDK could not build an unsigned transaction; nothing was submitted."""
 
 
-class TransactionConfirmationUnknown(TimeoutError):
-    """A signed live transaction was submitted, but its final outcome is unknown."""
-
-    def __init__(self, signature: str, detail: str):
-        self.signature = str(signature)
-        self.detail = str(detail)
-        super().__init__(
-            f"Transaction confirmation is unknown for {self.signature}: "
-            f"{self.detail}; do not retry before reconciliation"
-        )
-
-
 ROOT = Path(__file__).resolve().parent
 BUILDER = ROOT / "native_pump_builder.mjs"
 
