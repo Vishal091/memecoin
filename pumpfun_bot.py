@@ -187,6 +187,8 @@ class PumpFunBot:
     def _can_enter(self, equity: float) -> tuple[bool, str]:
         if self.store.get_state("experiment_expired", "0") == "1":
             return False, "Seven-day experiment is over"
+        if self.store.get_state("manual_review_halt", "0") == "1":
+            return False, "Manual review halt active: " + self.store.get_state("manual_review_reason", "")
         if self.store.get_state("halted", "0") == "1":
             return False, "Overall loss halt active: " + self.store.get_state("halt_reason")
         if self.store.get_state("daily_paused", "0") == "1":
