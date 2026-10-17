@@ -18,6 +18,23 @@ from solders.transaction import VersionedTransaction
 
 logger = logging.getLogger("native_pump")
 
+
+class TransactionBuildFailed(RuntimeError):
+    """The native SDK could not build an unsigned transaction; nothing was submitted."""
+
+
+class TransactionConfirmationUnknown(TimeoutError):
+    """A signed live transaction was submitted, but its final outcome is unknown."""
+
+    def __init__(self, signature: str, detail: str):
+        self.signature = str(signature)
+        self.detail = str(detail)
+        super().__init__(
+            f"Transaction confirmation is unknown for {self.signature}: "
+            f"{self.detail}; do not retry before reconciliation"
+        )
+
+
 ROOT = Path(__file__).resolve().parent
 BUILDER = ROOT / "native_pump_builder.mjs"
 
@@ -337,13 +354,15 @@ class NativePumpExecutor:
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "Native SDK build failed").strip()[-1800:]
-            raise RuntimeError("Native Pump SDK transaction build failed: " + detail)
+            # The builder only constructs an unsigned payload. A failed build means
+            # no transaction was signed or submitted and must not halt wallet monitoring.
+            raise TransactionBuildFailed("Native Pump SDK transaction build failed: " + detail)
         try:
             built = json.loads(result.stdout)
             raw = base64.b64decode(built["transaction"], validate=True)
             transaction = VersionedTransaction.from_bytes(raw)
         except Exception as exc:
-            raise RuntimeError("Native Pump SDK returned an invalid unsigned transaction response") from exc
+            raise TransactionBuildFailed("Native Pump SDK returned an invalid unsigned transaction response") from exc
         return transaction, built
 
     def _simulate(self, transaction: VersionedTransaction, expected_program: str) -> None:
