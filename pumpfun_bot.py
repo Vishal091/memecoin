@@ -25,11 +25,8 @@ from market_data import MarketData
 from pumpfun_config import PumpFunSettings
 from pumpportal_feed import PumpPortalAccountFeed
 from solana_logs_feed import SolanaLogsFeed
-from pumpportal import (
-    PUMP_PROGRAM_ID,
-    PUMPSWAP_PROGRAM_ID,
-    PumpPortalExecutor,
-)
+from pumpportal import PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID
+from native_pump import NativePumpExecutor
 from solana_rpc import SolanaRPC, SolanaRPCRateLimited, SolanaTransactionNotReady
 from pump_curve import fetch_pump_curve
 from storage import Store
@@ -59,14 +56,19 @@ class PumpFunBot:
         self.rpc = SolanaRPC(self.s.rpc_url, self.s.request_timeout_seconds)
         # Aggressive launchpad filters; still require a tracked market pair for price marks.
         self.market = MarketData(self.s.request_timeout_seconds, self.s.min_liquidity_usd, self.s.min_pair_age_seconds)
-        self.executor = PumpPortalExecutor(
-            self.rpc, self.s.request_timeout_seconds, self.s.pumpportal_priority_fee_sol
-        )
+        self.executor = None
         self.keypair = None
         self.wallet_address = None
         if self.s.mode == "live":
-            self.keypair = PumpPortalExecutor.load_keypair(self.s.keypair_path)
+            self.keypair = NativePumpExecutor.load_keypair(self.s.keypair_path)
             self.wallet_address = str(self.keypair.pubkey())
+            self.executor = NativePumpExecutor(
+                self.rpc,
+                self.s.rpc_url,
+                self.s.request_timeout_seconds,
+                self.s.pumpportal_priority_fee_sol,
+                self.s.min_sol_reserve,
+            )
         self._validate_addresses()
 
         self.leaderboard_client = PumpFunLeaderboard(timeout=self.s.request_timeout_seconds)
@@ -849,6 +851,7 @@ class PumpFunBot:
                 owner=self.wallet_address, keypair=self.keypair, mint=mint, action="sell",
                 amount=units_requested, denominated_in_sol=False,
                 slippage_bps=self.s.slippage_bps, preferred_pool=preferred,
+                amount_raw=requested_raw,
             )
             tx_sig = result["signature"]
             sold_raw = abs(int(result["token_delta_raw"]))
