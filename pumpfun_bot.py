@@ -132,12 +132,30 @@ class PumpFunBot:
                 "equity_usd": None,
             }), default=str))
 
+    def _copy_block_reason(self) -> str:
+        """Explain durable safety gates that must be cleared before new copy entries."""
+        if self.store.get_state("halted", "0") == "1":
+            return "Overall loss halt active: " + self.store.get_state("halt_reason", "reconcile the account before resuming")
+        if self.store.get_state("manual_review_halt", "0") == "1":
+            return "Manual-review halt active: " + self.store.get_state(
+                "manual_review_reason", "reconcile wallet and transactions before resuming"
+            )
+        if self.store.get_state("experiment_expired", "0") == "1":
+            return "The seven-day experiment has expired."
+        if self.store.get_state("daily_paused", "0") == "1":
+            return "Daily loss pause is active until the UTC day resets."
+        return ""
+
     def _refresh_feed_subscriptions(self) -> None:
         held_leaders = {
             str(p.get("source_wallet")) for p in self.store.list_positions()
             if p.get("source_wallet")
         }
-        if self.auto_copy_enabled and self.store.get_state("copy_paused", "0") != "1":
+        if (
+            self.auto_copy_enabled
+            and self.store.get_state("copy_paused", "0") != "1"
+            and not self._copy_block_reason()
+        ):
             base_wallets = set(self.s.watch_wallets) | held_leaders
             rows = self.leaderboards.get(self.selected_window, [])
             base_wallets.update(str(row["wallet"]) for row in rows[:self.s.top_traders_count] if row.get("wallet"))
@@ -212,8 +230,9 @@ class PumpFunBot:
             "leaderboard_error": self.last_leaderboard_error,
             "leaderboards": leaders,
             "selected_window": self.selected_window,
-            "auto_copy": bool(self.auto_copy_enabled and not paused),
+            "auto_copy": bool(self.auto_copy_enabled and not paused and not self._copy_block_reason()),
             "copy_paused": paused,
+            "copy_block_reason": self._copy_block_reason(),
             "active_wallets": sorted(self.active_wallets),
             "equity_usd": self.last_equity_usd,
             "positions": positions,
@@ -284,6 +303,15 @@ class PumpFunBot:
                 window = str(command.get("window", "day")).lower()
                 if window not in {"overall", "day", "week", "month"}:
                     self.message = "Invalid leaderboard window."
+                    continue
+                block_reason = self._copy_block_reason()
+                if block_reason:
+                    self.auto_copy_enabled = False
+                    self.store.set_state("auto_copy_enabled", "0")
+                    self.store.set_state("copy_paused", "1")
+                    self._refresh_feed_subscriptions()
+                    self.message = "Auto-copy blocked: " + block_reason
+                    logger.warning("%s", self.message)
                     continue
                 if not self.leaderboards:
                     self.refresh_leaderboards(force=True)
@@ -1125,6 +1153,10 @@ class PumpFunBot:
                         "manual_review_reason",
                         f"RPC wallet monitoring error for {wallet}; reconcile transactions before resuming",
                     )
+                    self.auto_copy_enabled = False
+                    self.store.set_state("auto_copy_enabled", "0")
+                    self.store.set_state("copy_paused", "1")
+                    self._refresh_feed_subscriptions()
 
     def run(self, once=False):
         logger.warning("Pump.fun bot mode=%s; automatic leaderboard discovery=%s",
@@ -1237,6 +1269,13 @@ class PumpFunBot:
                             "manual_review_reason",
                             "Runtime exception; reconcile wallet and transactions before resuming",
                         )
+                        self.auto_copy_enabled = False
+                        self.store.set_state("auto_copy_enabled", "0")
+                        self.store.set_state("copy_paused", "1")
+                        try:
+                            self._refresh_feed_subscriptions()
+                        except Exception:
+                            logger.exception("Could not refresh subscriptions after entering manual-review halt")
                     self.message = "Runtime error; inspect console. Live entries are halted pending reconciliation."
                     # The normal refresh at the bottom of the loop is skipped when
                     # manage_positions() or another step raises. Publish directly from
