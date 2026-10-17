@@ -16,6 +16,10 @@ class SolanaRPCRateLimited(RuntimeError):
     """Raised while the shared RPC endpoint is rate-limiting requests."""
 
 
+class SolanaTransactionNotReady(RuntimeError):
+    """Raised when a confirmed signature is visible but its transaction is not indexed yet."""
+
+
 class SolanaRPC:
     def __init__(self, url: str, timeout: int = 12):
         self.url, self.timeout = url, timeout
