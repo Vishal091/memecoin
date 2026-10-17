@@ -19,6 +19,10 @@ from solders.transaction import VersionedTransaction
 logger = logging.getLogger("native_pump")
 
 
+class TransactionBuildFailed(RuntimeError):
+    """The native SDK could not build a transaction; nothing was submitted."""
+
+
 class TransactionConfirmationUnknown(TimeoutError):
     """A signed live transaction was submitted, but its final outcome is unknown."""
 
@@ -349,7 +353,9 @@ class NativePumpExecutor:
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "Native SDK build failed").strip()[-1800:]
-            raise RuntimeError("Native Pump SDK transaction build failed: " + detail)
+            # This failure occurs before signing/submission; a bad or unavailable pool
+            # must not masquerade as a watched-wallet monitor failure.
+            raise TransactionBuildFailed("Native Pump SDK transaction build failed: " + detail)
         try:
             built = json.loads(result.stdout)
             raw = base64.b64decode(built["transaction"], validate=True)

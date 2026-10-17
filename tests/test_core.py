@@ -10,7 +10,7 @@ from pumpfun_bot import (
     position_source_matches_wallet,
     resolve_pending_exit_raw_amount,
 )
-from native_pump import TransactionConfirmationUnknown
+from native_pump import TransactionBuildFailed, TransactionConfirmationUnknown
 from types import SimpleNamespace
 from solana_rpc import SolanaRPC
 from storage import Store
@@ -136,6 +136,94 @@ class StaleMonitorHaltRecoveryTests(unittest.TestCase):
 
         self.assertFalse(bot.resolve_stale_monitor_halt())
         self.assertEqual(bot.store.state["manual_review_halt"], "1")
+
+
+class BuildFailureHandlingTests(unittest.TestCase):
+    class FakeStore:
+        def __init__(self, position=None):
+            self.position = position
+            self.state = {}
+
+        def get_position(self, mint):
+            return self.position if self.position and self.position.get("mint") == mint else None
+
+        def get_state(self, key, default=""):
+            return self.state.get(key, default)
+
+        def set_state(self, key, value):
+            self.state[key] = str(value)
+
+    class FakeMarket:
+        def sol_price_usd(self):
+            return 150.0
+
+        def token_market(self, mint):
+            return {"price_usd": 1.0, "liquidity_usd": 10_000.0, "pair_age_seconds": 120}
+
+    class FakeExecutor:
+        def trade(self, **kwargs):
+            raise TransactionBuildFailed("Native SDK transaction build failed: Error: Pool account not found")
+
+        def token_balance_raw(self, wallet, mint):
+            return 1_000
+
+    def test_unbuildable_buy_skips_only_that_signal_without_raising_monitor_error(self):
+        bot = object.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(
+            mode="live", min_liquidity_usd=5_000, min_pair_age_seconds=60,
+            allow_unindexed_pump_curve=False, max_entry_usd=1.0,
+            max_total_exposure_usd=10.0, slippage_bps=100,
+        )
+        bot.store = self.FakeStore()
+        bot.market = self.FakeMarket()
+        bot.executor = self.FakeExecutor()
+        bot.keypair = object()
+        bot.wallet_address = "test-wallet"
+        bot._estimate_market_cap_usd = lambda *args, **kwargs: (None, "")
+        bot.equity = lambda: 10.0
+        bot._refresh_risk_state = lambda equity: None
+        bot._can_enter = lambda equity: (True, "allowed")
+        bot._current_positions_value = lambda: 0.0
+        bot._refresh_feed_subscriptions = lambda: None
+        bot.price_cache = {}
+        bot.price_cache_at = {}
+
+        bot.buy({
+            "mint": "test-mint", "observed_price_usd": 1.0,
+            "wallet": "leader-wallet", "signature": "leader-signature",
+            "venue": "pump-amm", "source": "account_trade", "decimals": 6,
+        })
+
+        self.assertEqual(bot.store.state, {})
+        self.assertFalse(bot.store.get_position("test-mint"))
+
+    def test_unbuildable_sell_leaves_pending_exit_without_raising_monitor_error(self):
+        position = {
+            "mint": "test-mint", "amount_raw": "1000", "decimals": 6,
+            "invested_usd": 1.0, "last_price_usd": 1.0,
+            "source_wallet": "leader-wallet", "source_signature": "leader-signature",
+        }
+        bot = object.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(mode="live", slippage_bps=100)
+        bot.store = self.FakeStore(position)
+        bot.market = self.FakeMarket()
+        bot.executor = self.FakeExecutor()
+        bot.wallet_address = "test-wallet"
+        bot.keypair = object()
+
+        result = bot.sell(
+            "test-mint", 500,
+            "followed wallet leader-wallet partial/full sell on pump",
+            "leader-wallet", "leader-sell-signature",
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(
+            bot.store.get_state("exit_pending:test-mint"),
+            "followed wallet leader-wallet partial/full sell on pump",
+        )
+        self.assertEqual(bot.store.get_state("exit_pending_amount:test-mint"), "500")
+        self.assertEqual(bot.store.get_state("manual_review_halt"), "")
 
 
 class PendingExitReasonTests(unittest.TestCase):

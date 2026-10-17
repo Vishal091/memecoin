@@ -26,7 +26,7 @@ from pumpfun_config import PumpFunSettings
 from pumpportal_feed import PumpPortalAccountFeed
 from solana_logs_feed import SolanaLogsFeed
 from pumpportal import PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID
-from native_pump import NativePumpExecutor, TransactionConfirmationUnknown
+from native_pump import NativePumpExecutor, TransactionBuildFailed, TransactionConfirmationUnknown
 from solana_rpc import SolanaRPC, SolanaRPCRateLimited, SolanaTransactionNotReady
 from pump_curve import fetch_pump_curve
 from storage import Store
@@ -1008,6 +1008,13 @@ class PumpFunBot:
                     amount=requested_sol, denominated_in_sol=True,
                     slippage_bps=self.s.slippage_bps, preferred_pool=venue,
                 )
+            except TransactionBuildFailed as exc:
+                logger.warning(
+                    "Skip copied buy for %s: native SDK could not build a transaction; "
+                    "nothing was submitted, and other watched-wallet signals will continue: %s",
+                    mint, exc,
+                )
+                return
             except TransactionConfirmationUnknown as exc:
                 self._record_ambiguous_live_transaction(
                     "buy", mint, exc,
@@ -1122,6 +1129,14 @@ class PumpFunBot:
                     slippage_bps=self.s.slippage_bps, preferred_pool=preferred,
                     amount_raw=requested_raw,
                 )
+            except TransactionBuildFailed as exc:
+                # This is a pre-submission failure. Keep the pending exit queued, but
+                # do not misclassify the watched-wallet feed as broken or halt all entries.
+                logger.warning(
+                    "Sell for %s could not be built; no transaction was submitted. "
+                    "Pending exit remains queued for retry: %s", mint, exc,
+                )
+                return False
             except TransactionConfirmationUnknown as exc:
                 self._record_ambiguous_live_transaction(
                     "sell", mint, exc,

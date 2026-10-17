@@ -16,6 +16,7 @@ from native_pump import (
     PUMP_SELL_V3,
     PUMPSWAP_BUY_V2,
     NativePumpExecutor,
+    TransactionBuildFailed,
     TransactionConfirmationUnknown,
     validate_native_transaction,
 )
@@ -71,6 +72,20 @@ def fake_tx(route_program, trade_data, route="pump", accounts=None, extra_progra
     ))
     return tx, wallet, mint
 
+
+class NativeBuildFailureTests(unittest.TestCase):
+    def test_pool_account_not_found_is_classified_as_pre_submission_failure(self):
+        executor = object.__new__(NativePumpExecutor)
+        executor.node = "node"
+        executor.timeout = 12
+        completed = SimpleNamespace(
+            returncode=1,
+            stderr="Error: Pool account not found",
+            stdout="",
+        )
+        with patch("native_pump.subprocess.run", return_value=completed):
+            with self.assertRaisesRegex(TransactionBuildFailed, "Pool account not found"):
+                executor._build_unsigned({"mint": "test-mint", "action": "buy"})
 
 class NativeConfirmationUnknownTests(unittest.TestCase):
     class FakeTransaction:
