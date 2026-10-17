@@ -513,8 +513,10 @@ class PumpFunBot:
             except Exception:
                 logger.exception("Loop error; inspect logs before re-arming after any ambiguous transaction")
                 if self.s.mode == "live":
-                    self.store.set_state("halted", "1")
-                    self.store.set_state("halt_reason", "Runtime exception; manual reconciliation required")
+                    # Do not automatically liquidate after an ambiguous runtime/network error.
+                    # Block new entries until the operator reconciles the wallet and ledger.
+                    self.store.set_state("manual_review_halt", "1")
+                    self.store.set_state("manual_review_reason", "Runtime exception; reconcile wallet and transactions before resuming")
             if once:
                 break
             time.sleep(self.s.poll_seconds)
