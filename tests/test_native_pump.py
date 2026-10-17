@@ -2,6 +2,7 @@ import hashlib
 import struct
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from solders.pubkey import Pubkey
 
@@ -13,6 +14,8 @@ from native_pump import (
     PUMP_BUY_EXACT_QUOTE_IN_V3,
     PUMP_SELL_V3,
     PUMPSWAP_BUY_V2,
+    NativePumpExecutor,
+    TransactionBuildFailed,
     validate_native_transaction,
 )
 
@@ -66,6 +69,29 @@ def fake_tx(route_program, trade_data, route="pump", accounts=None, extra_progra
         ],
     ))
     return tx, wallet, mint
+
+
+
+class NativePreSubmissionBuildFailureTests(unittest.TestCase):
+    def test_nonzero_builder_exit_is_a_pre_submission_failure(self):
+        executor = object.__new__(NativePumpExecutor)
+        executor.node = "node"
+        executor.timeout = 12
+        completed = SimpleNamespace(
+            returncode=2,
+            stderr="Error: Associated token account not found for mint",
+            stdout="",
+        )
+        with patch("native_pump.subprocess.run", return_value=completed):
+            with self.assertRaisesRegex(TransactionBuildFailed, "Associated token account not found"):
+                executor._build_unsigned({"mint": "test-mint", "action": "sell"})
+
+    def test_builder_passes_mint_token_program_to_sell_state_fetcher(self):
+        from pathlib import Path
+        builder = Path(__file__).resolve().parents[1] / "native_pump_builder.mjs"
+        source = builder.read_text(encoding="utf-8")
+        self.assertIn("connection.getAccountInfo(mint, \"confirmed\")", source)
+        self.assertIn("fetchSellState(mint, wallet, tokenProgram)", source)
 
 
 class NativeTransactionGuardTests(unittest.TestCase):

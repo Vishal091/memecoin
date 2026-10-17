@@ -6,6 +6,7 @@ import {
   VersionedTransaction,
 } from "@solana/web3.js";
 import BN from "bn.js";
+import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 import {
   OnlinePumpSdk,
   PUMP_SDK,
@@ -73,10 +74,22 @@ async function build(input) {
     commitment: "confirmed",
     confirmTransactionInitialTimeout: 20_000,
   });
+  // Pump coins can use either legacy SPL Token or Token-2022. The SDK state
+  // fetchers have historically defaulted to the legacy program; derive the
+  // correct token program from the mint account and pass it explicitly so the
+  // sell-side ATA lookup matches the account created by the buy transaction.
+  const mintAccountInfo = await connection.getAccountInfo(mint, "confirmed");
+  assert(mintAccountInfo, "Mint account does not exist on the configured RPC.");
+  const tokenProgram = mintAccountInfo.owner;
+  assert(
+    tokenProgram.equals(TOKEN_PROGRAM_ID) || tokenProgram.equals(TOKEN_2022_PROGRAM_ID),
+    `Mint is owned by unsupported token program ${tokenProgram.toBase58()}.`,
+  );
+
   const onlinePump = new OnlinePumpSdk(connection);
   const state = action === "buy"
-    ? await onlinePump.fetchBuyState(mint, wallet)
-    : await onlinePump.fetchSellState(mint, wallet);
+    ? await onlinePump.fetchBuyState(mint, wallet, tokenProgram)
+    : await onlinePump.fetchSellState(mint, wallet, tokenProgram);
   const curve = state.bondingCurve;
   const quoteMint = state.quoteMint.toBase58();
   assert(

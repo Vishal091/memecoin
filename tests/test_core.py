@@ -1,9 +1,11 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from market_data import MarketData, WSOL_MINT
-from pumpfun_bot import PumpFunBot
+from pumpfun_bot import PumpFunBot, native_build_retry_delay_seconds
+from native_pump import TransactionBuildFailed
 from solana_rpc import SolanaRPC
 from storage import Store
 
@@ -32,6 +34,74 @@ class DashboardErrorRefreshTests(unittest.TestCase):
             bot._publish_dashboard_state_after_error()
 
         self.assertTrue(any("Could not refresh dashboard state" in line for line in captured.output))
+
+
+
+class NativeBuildFailureHandlingTests(unittest.TestCase):
+    class FakeStore:
+        def __init__(self, position):
+            self.position = position
+            self.state = {}
+
+        def get_position(self, mint):
+            return self.position if self.position and self.position.get("mint") == mint else None
+
+        def get_state(self, key, default=""):
+            return self.state.get(key, default)
+
+        def set_state(self, key, value):
+            self.state[key] = str(value)
+
+    class FakeMarket:
+        def token_market(self, mint):
+            return {"price_usd": 1.0}
+
+        def sol_price_usd(self):
+            return 150.0
+
+    class FakeExecutor:
+        def token_balance_raw(self, wallet, mint):
+            return 1000
+
+        def trade(self, **kwargs):
+            raise TransactionBuildFailed(
+                "Native Pump SDK transaction build failed: Associated token account not found"
+            )
+
+    def test_failed_sell_build_retains_position_and_pending_exit_without_raising(self):
+        position = {
+            "mint": "test-mint", "amount_raw": "1000", "decimals": 6,
+            "invested_usd": 1.0, "last_price_usd": 1.0,
+            "source_wallet": "leader-wallet", "source_signature": "leader-signature",
+        }
+        bot = object.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(mode="live", slippage_bps=100)
+        bot.store = self.FakeStore(position)
+        bot.market = self.FakeMarket()
+        bot.executor = self.FakeExecutor()
+        bot.wallet_address = "test-wallet"
+        bot.keypair = object()
+
+        result = bot.sell("test-mint", 1000, "marked loss stop")
+
+        self.assertFalse(result)
+        self.assertEqual(bot.store.get_position("test-mint"), position)
+        self.assertEqual(bot.store.get_state("exit_pending:test-mint"), "marked loss stop")
+        self.assertGreater(float(bot.store.get_state("native_build_retry_after:test-mint")), 0)
+        self.assertIn("Associated token account not found", bot.store.get_state("native_build_failure:test-mint"))
+        self.assertNotIn("manual_review_halt", bot.store.state)
+
+    def test_unsupported_quote_build_is_deferred_for_six_hours(self):
+        self.assertEqual(
+            native_build_retry_delay_seconds("Unsupported PumpSwap quote mint"),
+            6 * 60 * 60,
+        )
+
+    def test_missing_associated_token_account_build_gets_one_minute_cooldown(self):
+        self.assertEqual(
+            native_build_retry_delay_seconds("Associated token account not found for mint"),
+            60,
+        )
 
 
 class ParserTests(unittest.TestCase):
