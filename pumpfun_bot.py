@@ -82,6 +82,30 @@ def _pubkey_string(value) -> str:
         return str(value.get("pubkey", ""))
     return str(value)
 
+def wallet_is_transaction_signer(wallet: str, message: dict) -> bool:
+    """Recognize a signer in both jsonParsed and plain JSON-RPC account-key formats."""
+    account_keys = message.get("accountKeys") or []
+    if any(
+        isinstance(key, dict)
+        and _pubkey_string(key) == wallet
+        and key.get("signer") is True
+        for key in account_keys
+    ):
+        return True
+
+    # Some RPC providers return account keys as strings even when jsonParsed was
+    # requested. In Solana messages the first numRequiredSignatures static keys
+    # are signers, so use the message header as a format-independent fallback.
+    header = message.get("header") or {}
+    try:
+        required_signatures = int(header.get("numRequiredSignatures", 0))
+    except (TypeError, ValueError):
+        return False
+    return required_signatures > 0 and any(
+        _pubkey_string(key) == wallet
+        for key in account_keys[:required_signatures]
+    )
+
 
 class PumpFunBot:
     def __init__(self, settings: PumpFunSettings):
@@ -690,14 +714,8 @@ class PumpFunBot:
             )
         if tx.get("meta", {}).get("err") is not None:
             return []
-        account_keys = (((tx.get("transaction") or {}).get("message") or {}).get("accountKeys") or [])
-        wallet_signed = any(
-            isinstance(key, dict)
-            and _pubkey_string(key) == wallet
-            and key.get("signer") is True
-            for key in account_keys
-        )
-        if not wallet_signed:
+        message = ((tx.get("transaction") or {}).get("message") or {})
+        if not wallet_is_transaction_signer(wallet, message):
             return []
         all_programs, top_programs = self._tx_programs(tx)
         # Strictly exclude generic DEX swaps. We copy only Pump bonding-curve/PumpSwap activity.

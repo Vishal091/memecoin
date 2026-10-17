@@ -10,11 +10,47 @@ from pumpfun_bot import (
     position_source_matches_wallet,
     resolve_pending_exit_raw_amount,
     native_build_retry_delay_seconds,
+    wallet_is_transaction_signer,
 )
 from native_pump import TransactionBuildFailed, TransactionConfirmationUnknown
 from types import SimpleNamespace
 from solana_rpc import SolanaRPC
 from storage import Store
+
+
+class TransactionSignerDetectionTests(unittest.TestCase):
+    def test_parsed_account_key_signer_flag_is_respected(self):
+        message = {
+            "accountKeys": [
+                {"pubkey": "leader", "signer": True},
+                {"pubkey": "other", "signer": False},
+            ],
+            "header": {"numRequiredSignatures": 1},
+        }
+        self.assertTrue(wallet_is_transaction_signer("leader", message))
+        self.assertFalse(wallet_is_transaction_signer("other", message))
+
+    def test_plain_string_account_keys_use_required_signature_count(self):
+        message = {
+            "accountKeys": ["leader", "other"],
+            "header": {"numRequiredSignatures": 1},
+        }
+        self.assertTrue(wallet_is_transaction_signer("leader", message))
+        self.assertFalse(wallet_is_transaction_signer("other", message))
+
+    def test_non_signer_account_key_is_not_promoted_to_signer(self):
+        message = {
+            "accountKeys": [
+                {"pubkey": "fee-payer", "signer": True},
+                {"pubkey": "leader", "signer": False},
+            ],
+            "header": {"numRequiredSignatures": 1},
+        }
+        self.assertFalse(wallet_is_transaction_signer("leader", message))
+
+    def test_malformed_header_fails_closed(self):
+        message = {"accountKeys": ["leader"], "header": {"numRequiredSignatures": "bad"}}
+        self.assertFalse(wallet_is_transaction_signer("leader", message))
 
 
 class AmbiguousLiveTransactionStateTests(unittest.TestCase):
