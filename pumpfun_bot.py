@@ -38,6 +38,11 @@ def raw_to_units(amount_raw: int | str, decimals: int) -> float:
     return int(amount_raw) / (10 ** decimals)
 
 
+def position_source_matches_wallet(position: dict | None, wallet: str | None) -> bool:
+    """Only mirror a leader's sell into a position originally opened from that leader."""
+    return bool(position and wallet and position.get("source_wallet") == wallet)
+
+
 def _pubkey_string(value) -> str:
     if isinstance(value, str):
         return value
@@ -1046,9 +1051,22 @@ class PumpFunBot:
         if signal["side"] == "buy":
             self.signal_stats["buy_signals"] += 1
             self.buy(signal)
-        elif signal["side"] == "sell" and self.store.get_position(signal["mint"]):
-            self.signal_stats["sell_signals"] += 1
+        elif signal["side"] == "sell":
             position = self.store.get_position(signal["mint"])
+            if not position:
+                self.signal_stats["sell_without_position"] += 1
+                logger.info("Leader sell observed but no tracked position is open for mint=%s; no sell copied",
+                            signal["mint"][:8])
+                return
+            if not position_source_matches_wallet(position, signal.get("wallet")):
+                logger.info(
+                    "Ignoring sell for mint=%s from wallet=%s; tracked position source_wallet=%s. "
+                    "A different leader's sell must not close this position.",
+                    signal["mint"][:8], str(signal.get("wallet", ""))[:8],
+                    str(position.get("source_wallet") or "(unknown)")[:8],
+                )
+                return
+            self.signal_stats["sell_signals"] += 1
             our_raw = int(position["amount_raw"])
             leader_remaining = int(signal.get("leader_post_raw", 0))
             leader_sold = int(signal.get("amount_raw", 0))
@@ -1061,10 +1079,6 @@ class PumpFunBot:
             self.sell(signal["mint"], our_sell_raw,
                       f"followed wallet {signal['wallet']} partial/full sell on {signal['venue']}",
                       signal["wallet"], signal["signature"])
-        elif signal["side"] == "sell":
-            self.signal_stats["sell_without_position"] += 1
-            logger.info("Leader sell observed but no matching paper position is open for mint=%s; no sell copied",
-                        signal["mint"][:8])
 
     def poll_wallet(self, wallet: str) -> int:
         sigs = self.rpc.signatures(wallet, limit=1000)

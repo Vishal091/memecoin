@@ -3,8 +3,24 @@ import unittest
 from pathlib import Path
 
 from market_data import MarketData, WSOL_MINT
+from pumpfun_bot import position_source_matches_wallet
 from solana_rpc import SolanaRPC
 from storage import Store
+
+
+class SourceWalletSellMatchingTests(unittest.TestCase):
+    def test_matching_source_wallet_allows_copy_sell(self):
+        position = {"mint": "same-mint", "source_wallet": "leader-A"}
+        self.assertTrue(position_source_matches_wallet(position, "leader-A"))
+
+    def test_different_wallet_cannot_trigger_copy_sell_for_same_mint(self):
+        position = {"mint": "same-mint", "source_wallet": "leader-A"}
+        self.assertFalse(position_source_matches_wallet(position, "leader-B"))
+
+    def test_missing_position_or_source_wallet_fails_closed(self):
+        self.assertFalse(position_source_matches_wallet(None, "leader-A"))
+        self.assertFalse(position_source_matches_wallet({"mint": "same-mint"}, "leader-A"))
+        self.assertFalse(position_source_matches_wallet({"source_wallet": "leader-A"}, None))
 
 
 class ParserTests(unittest.TestCase):
