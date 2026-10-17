@@ -213,7 +213,7 @@ class CopyBot:
             logger.warning("LIVE BUY submitted/confirmed: %s", tx_sig)
 
     def sell(self, mint: str, amount_raw: int, reason: str,
-             source_wallet: str | None = None, source_signature: str | None = None) -> None:
+             source_wallet: str | None = None, source_signature: str | None = None) -> bool:
         p = self.store.get_position(mint)
         if not p:
             return False
@@ -275,8 +275,9 @@ class CopyBot:
         self.store.set_state("daily_realized_pnl", float(self.store.get_state("daily_realized_pnl", "0")) + realized_pnl)
         self.store.add_trade(mode=self.s.mode, action="SELL", mint=mint, amount_raw=str(sell_raw),
                              price_usd=(proceeds / units_sold if units_sold else price), value_usd=value,
-                             pnl_usd=realized_pnl, reason=reason, source_wallet=source_wallet,
-                             source_signature=source_signature, tx_signature=tx_sig)
+                             pnl_usd=realized_pnl, reason=reason,
+                             source_wallet=p.get("source_wallet") or source_wallet,
+                             source_signature=source_signature or p.get("source_signature"), tx_signature=tx_sig)
         if remaining <= 0:
             self.store.delete_position(mint)
         else:
