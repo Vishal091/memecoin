@@ -164,14 +164,25 @@ async function build(input) {
   } else {
     // Graduated coins use the canonical PumpSwap pool. The SDK builds the
     // official PumpSwap instruction directly; no PumpPortal router is involved.
-    const poolKey = canonicalPumpPoolPda(mint);
+    // Canonical pools use the quote mint stored on the bonding curve. Since 2026,
+    // some graduated tokens are paired with PUMP or other quote tokens rather than WSOL.
+    // Derive the matching PDA instead of accidentally looking for a nonexistent SOL pool.
+    const curveQuoteMint = curveSnapshot.quoteMint;
+    const curveQuoteMintAddress = curveQuoteMint.toBase58();
+    const poolQuoteMint = curveQuoteMintAddress === ZERO_PUBKEY
+      ? new PublicKey(WRAPPED_SOL_MINT)
+      : curveQuoteMint;
+    const poolKey = canonicalPumpPoolPda(mint, poolQuoteMint);
     const onlineAmm = new OnlinePumpAmmSdk(connection);
     const swapState = await onlineAmm.swapSolanaState(poolKey, wallet);
     assert(swapState.pool.baseMint.equals(mint), "Canonical PumpSwap pool base mint does not match the requested mint.");
-    assert(
-      swapState.pool.quoteMint.toBase58() === WRAPPED_SOL_MINT,
-      "Native executor only supports WSOL-quoted canonical PumpSwap pools.",
-    );
+    const actualQuoteMint = swapState.pool.quoteMint.toBase58();
+    if (actualQuoteMint !== WRAPPED_SOL_MINT) {
+      throw new Error(
+        `Unsupported PumpSwap quote mint ${actualQuoteMint}; this executor spends SOL and only supports WSOL-quoted pools. ` +
+        "No transaction was signed or submitted.",
+      );
+    }
 
     if (action === "buy") {
       // PumpSwap's quote-input helper raises maxQuote by slippage. Lower the
