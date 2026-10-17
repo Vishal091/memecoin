@@ -199,6 +199,7 @@ class CopyBot:
             "entry_price_usd": effective_price, "initial_amount_raw": str(raw_out),
             "peak_price_usd": float(market["price_usd"]), "tp1_done": 0, "tp2_done": 0,
             "opened_at": now, "last_price_usd": float(market["price_usd"]), "invested_usd": spend,
+            "source_wallet": signal["wallet"], "source_signature": signal["signature"],
         }
         self.store.upsert_position(position)
         self.store.increment_daily_entries()
@@ -216,7 +217,7 @@ class CopyBot:
         p = self.store.get_position(mint)
         if not p:
             return False
-        full_exit = reason in {"marked loss stop", "trailing stop", "followed wallet sell"} or reason.startswith("pending exit:")
+        full_exit = reason in {"marked loss stop", "trailing stop"} or reason.startswith("followed wallet ") or reason.startswith("pending exit:")
         pending_key = f"exit_pending:{mint}"
         if full_exit:
             self.store.set_state(pending_key, reason)
@@ -343,7 +344,7 @@ class CopyBot:
         elif signal["side"] == "sell":
             if self.store.get_position(signal["mint"]):
                 self.sell(signal["mint"], int(self.store.get_position(signal["mint"])["amount_raw"]),
-                          "followed wallet sell", signal["wallet"], signal["signature"])
+                          f"followed wallet {signal['wallet']} sold token", signal["wallet"], signal["signature"])
 
     def poll_wallet(self, wallet: str) -> int:
         signatures = self.rpc.signatures(wallet, limit=25)
@@ -395,6 +396,10 @@ class CopyBot:
         for t in self.store.recent_trades(10):
             logger.warning("TRADE #%s %s %s value=%.4f pnl=%.4f %s",
                            t["id"], t["action"], t["mint"], t["value_usd"], t["pnl_usd"], t["reason"])
+        for score in self.store.trader_performance():
+            logger.warning("COPY SCORE %s realized_pnl=%.4f exits=%s wins=%s losses=%s",
+                           score["source_wallet"], score["realized_pnl"] or 0.0, score["sells"],
+                           score["winning_exits"], score["losing_exits"])
 
     def run(self, once: bool = False) -> None:
         logger.warning("Starting Solana copy bot: mode=%s; live transactions %s",
