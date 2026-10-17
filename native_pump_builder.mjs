@@ -42,6 +42,10 @@ function sanitizeError(error, rpcUrl) {
 
 async function checkRuntime() {
   assert(typeof OnlinePumpSdk === "function", "Missing OnlinePumpSdk from @pump-fun/pump-sdk");
+  assert(
+    typeof OnlinePumpSdk.prototype.fetchBondingCurve === "function",
+    "Missing on-chain bonding-curve state lookup from @pump-fun/pump-sdk",
+  );
   assert(typeof PUMP_SDK?.buyExactQuoteInV3Instructions === "function", "Missing official Pump v3 buy builder");
   assert(typeof PUMP_SDK?.sellV3Instructions === "function", "Missing official Pump v3 sell builder");
   assert(typeof getBuyV3TokenAmountFromQuoteAmount === "function", "Missing Pump v3 quote helper");
