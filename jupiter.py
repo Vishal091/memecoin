@@ -63,17 +63,17 @@ class JupiterExecutor:
             message = unsigned.message
             header = message.header
             signer_keys = list(message.account_keys[:header.num_required_signatures])
-            if str(keypair.pubkey()) not in {str(k) for k in signer_keys}:
+            signer_strings = [str(k) for k in signer_keys]
+            if str(keypair.pubkey()) not in signer_strings:
                 raise RuntimeError("Jupiter transaction does not request a signature from the configured keypair")
-            # This refuses transactions requiring unknown additional signer(s).
-            if len(signer_keys) != 1:
-                raise RuntimeError(f"Refusing transaction requiring {len(signer_keys)} signers; expected one wallet signer")
-            signer_index = [str(k) for k in signer_keys].index(str(keypair.pubkey()))
             router = str(order.get("router", "")).lower()
+            # Standard aggregator routes need only the user's signature. JupiterZ can
+            # require a market-maker signature supplied by Jupiter during /execute.
             if len(signer_keys) != 1 and not (router == "jupiterz" and len(signer_keys) == 2):
                 raise RuntimeError(
                     f"Refusing unexpected multi-signer transaction: router={router}, signers={len(signer_keys)}"
                 )
+            signer_index = signer_strings.index(str(keypair.pubkey()))
             # Sign only our wallet's slot and preserve other signatures/placeholders.
             # JupiterZ may add its market-maker signature during /execute.
             signatures = list(unsigned.signatures)
