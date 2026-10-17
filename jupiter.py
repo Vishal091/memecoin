@@ -41,8 +41,10 @@ class JupiterExecutor:
         r = self.session.get(f"{JUPITER_BASE}/order", params=params, timeout=self.timeout)
         r.raise_for_status()
         data = r.json()
-        if not data.get("transaction") or not data.get("requestId"):
-            raise RuntimeError(f"Jupiter order response missing transaction/requestId: {data}")
+        if not data.get("requestId"):
+            raise RuntimeError(f"Jupiter order response missing requestId: {data}")
+        if not data.get("transaction"):
+            raise RuntimeError(f"Jupiter cannot build an executable transaction for this order: router={data.get('router')} code={data.get('errorCode')} message={data.get('errorMessage')}")
         return data
 
     def execute(self, order: dict[str, Any], keypair: Keypair) -> dict[str, Any]:
@@ -67,12 +69,14 @@ class JupiterExecutor:
         r.raise_for_status()
         result = r.json()
         status = str(result.get("status", "")).lower()
-        if status and status not in {"success", "confirmed"}:
+        if status != "success" or int(result.get("code", -1)) != 0:
             raise RuntimeError(f"Jupiter execution did not confirm success: {result}")
         signature = result.get("signature") or result.get("txid")
         if not signature:
             raise RuntimeError(f"Jupiter execution response has no transaction signature: {result}")
-        return {"signature": signature, "response": result}
+        return {"signature": signature, "response": result,
+                "total_input_amount": int(result.get("totalInputAmount") or result.get("inputAmountResult") or 0),
+                "total_output_amount": int(result.get("totalOutputAmount") or result.get("outputAmountResult") or 0)}
 
     def swap(self, *, input_mint: str, output_mint: str, amount_raw: int,
              taker: str, keypair: Keypair, slippage_bps: int) -> dict[str, Any]:
