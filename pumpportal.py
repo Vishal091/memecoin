@@ -1,7 +1,10 @@
 """PumpPortal Local Transaction API adapter for Pump.fun/PumpSwap."""
 import base64
+import json
 import time
+from pathlib import Path
 import requests
+from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
 PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -18,6 +21,18 @@ class PumpPortalExecutor:
         self.timeout = timeout
         self.priority_fee_sol = priority_fee_sol
         self.http = requests.Session()
+
+    @staticmethod
+    def load_keypair(path: Path) -> Keypair:
+        """Load a standard Solana CLI JSON keypair locally; never commit the file."""
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, list) or len(raw) != 64:
+            raise ValueError("Expected a standard Solana CLI keypair JSON array of 64 bytes")
+        return Keypair.from_bytes(bytes(raw))
+
+    def sol_balance_lamports(self, owner):
+        result = self.rpc.call("getBalance", [owner, {"commitment":"confirmed"}]) or {}
+        return int(result.get("value", 0))
 
     def token_balance_raw(self, owner, mint):
         result = self.rpc.call("getTokenAccountsByOwner", [
@@ -74,18 +89,32 @@ class PumpPortalExecutor:
         pools = [preferred_pool] + [p for p in ("pump", "pump-amm") if p != preferred_pool]
         for pool in pools:
             token_before = self.token_balance_raw(owner, mint)
+            sol_before = self.sol_balance_lamports(owner)
             try:
                 tx = self._build(owner, mint, action, amount, denominated_in_sol, slippage_bps, pool, keypair)
             except Exception as exc:
                 last_error = exc
                 continue
             signature = self._send_confirm(tx)
-            token_after = self.token_balance_raw(owner, mint)
+            deadline = time.monotonic() + 8
+            token_after = token_before
+            sol_after = sol_before
+            while time.monotonic() < deadline:
+                token_after = self.token_balance_raw(owner, mint)
+                sol_after = self.sol_balance_lamports(owner)
+                delta = token_after - token_before
+                if (action == "buy" and delta > 0) or (action == "sell" and delta < 0):
+                    break
+                time.sleep(0.5)
             delta = token_after - token_before
+            sol_delta = sol_after - sol_before
             if action == "buy" and delta <= 0:
                 raise RuntimeError(f"Buy {signature} confirmed but token balance did not increase; reconcile manually")
             if action == "sell" and delta >= 0:
                 raise RuntimeError(f"Sell {signature} confirmed but token balance did not decrease; reconcile manually")
             return {"signature": signature, "pool": pool, "token_before_raw": token_before,
-                    "token_after_raw": token_after, "total_output_amount": delta if action == "buy" else abs(delta)}
+                    "token_after_raw": token_after, "token_delta_raw": delta,
+                    "sol_delta_lamports": sol_delta,
+                    "total_input_amount": max(0, -sol_delta) if action == "buy" else abs(delta),
+                    "total_output_amount": delta if action == "buy" else max(0, sol_delta)}
         raise RuntimeError(f"No Pump ecosystem route for {mint}: {last_error}")
