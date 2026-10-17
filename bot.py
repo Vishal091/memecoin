@@ -30,7 +30,7 @@ class CopyBot:
         db_path = self.s.database_path
         if not db_path.is_absolute():
             db_path = Path(__file__).resolve().parent / db_path
-        self.store = Store(db_path, self.s.starting_paper_cash_usd)
+        self.store = Store(db_path, self.s.starting_paper_cash_usd, mode=self.s.mode)
         self.rpc = SolanaRPC(self.s.rpc_url, self.s.request_timeout_seconds)
         self.market = MarketData(self.s.request_timeout_seconds, self.s.min_liquidity_usd, self.s.min_pair_age_seconds)
         self.jupiter = JupiterExecutor(self.s.jupiter_api_key, self.s.request_timeout_seconds) if self.s.jupiter_api_key else None
