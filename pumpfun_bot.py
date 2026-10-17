@@ -254,6 +254,15 @@ class PumpFunBot:
         with self.state_lock:
             self.dashboard_state = state
 
+    def _publish_dashboard_state_after_error(self) -> None:
+        """Keep the dashboard current even when a loop iteration raises after a trade."""
+        try:
+            self._publish_dashboard_state(self.last_equity_usd)
+        except Exception:
+            # Preserve the original loop error; a secondary dashboard refresh error
+            # must not hide it or terminate the monitor.
+            logger.exception("Could not refresh dashboard state after loop error")
+
     def _process_dashboard_commands(self) -> None:
         while True:
             try:
@@ -1180,6 +1189,10 @@ class PumpFunBot:
                             "Runtime exception; reconcile wallet and transactions before resuming",
                         )
                     self.message = "Runtime error; inspect console. Live entries are halted pending reconciliation."
+                    # The normal refresh at the bottom of the loop is skipped when
+                    # manage_positions() or another step raises. Publish directly from
+                    # the ledger so confirmed buys do not remain invisible in the UI.
+                    self._publish_dashboard_state_after_error()
 
                 if once:
                     break
