@@ -38,6 +38,11 @@ def raw_to_units(amount_raw: int | str, decimals: int) -> float:
     return int(amount_raw) / (10 ** decimals)
 
 
+def position_source_matches_wallet(position: dict | None, wallet: str | None) -> bool:
+    """Only mirror a leader's sell into a position originally opened from that leader."""
+    return bool(position and wallet and position.get("source_wallet") == wallet)
+
+
 def _pubkey_string(value) -> str:
     if isinstance(value, str):
         return value
