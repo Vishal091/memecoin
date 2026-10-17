@@ -491,29 +491,49 @@ class PumpFunBot:
         mint = signal["mint"]
         if self.store.get_position(mint):
             return
+        sol_price = self.market.sol_price_usd()
         market = self.market.token_market(mint)
-        eligible, reason = self.market.is_entry_eligible(market)
-        if not eligible:
-            logger.info("Reject Pump.fun buy %s: %s", mint, reason)
+        observed_price = float(signal.get("observed_price_usd") or 0)
+        if observed_price <= 0 and market:
+            observed_price = float(market.get("price_usd") or 0)
+        if observed_price <= 0:
+            logger.info("Reject Pump.fun buy %s: no reliable trade or market price yet", mint)
             return
+
+        curve_liquidity = float(signal.get("curve_liquidity_usd") or 0)
+        pair_liquidity = float(market.get("liquidity_usd") or 0) if market else 0.0
+        effective_liquidity = max(curve_liquidity, pair_liquidity)
+        is_realtime_signal = signal.get("source") == "account_trade"
+        if effective_liquidity < self.s.min_liquidity_usd:
+            logger.info("Reject Pump.fun buy %s: estimated liquidity %.0f USD below %.0f USD",
+                        mint, effective_liquidity, self.s.min_liquidity_usd)
+            return
+        if market and int(market.get("pair_age_seconds") or 0) < self.s.min_pair_age_seconds:
+            # Fresh Pump.fun curve trades are accepted using the curve reserve estimate;
+            # a Dexscreener pair-age signal alone should not block a newly launched curve.
+            if not (is_realtime_signal and curve_liquidity >= self.s.min_liquidity_usd):
+                logger.info("Reject Pump.fun buy %s: pair age below filter", mint)
+                return
+
         equity = self.equity()
         self._refresh_risk_state(equity)
         allowed, reason = self._can_enter(equity)
         if not allowed:
             logger.info("Reject buy %s: %s", mint, reason)
             return
-        assert market
         spend = min(self.s.max_entry_usd, self.s.max_total_exposure_usd - self._current_positions_value())
         if spend < 0.50:
             return
-        decimals = int(signal["decimals"])
+
+        decimals = int(signal.get("decimals") or 6)
         timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         venue = str(signal.get("venue", "pump"))
-        sol_price = self.market.sol_price_usd()
+        if venue not in {"pump", "pump-amm"}:
+            venue = "pump"
 
         if self.s.mode == "paper":
             cost = self.s.paper_swap_cost_usd
-            raw_out = int(spend / float(market["price_usd"]) * (10 ** decimals))
+            raw_out = int(spend / observed_price * (10 ** decimals))
             if raw_out <= 0:
                 logger.info("Reject %s: estimated output rounds to zero", mint)
                 return
@@ -542,8 +562,8 @@ class PumpFunBot:
         position = {
             "mint": mint, "decimals": decimals, "amount_raw": str(raw_out),
             "entry_price_usd": effective_price, "initial_amount_raw": str(raw_out),
-            "peak_price_usd": float(market["price_usd"]), "tp1_done": 0, "tp2_done": 0,
-            "opened_at": timestamp, "last_price_usd": float(market["price_usd"]),
+            "peak_price_usd": observed_price, "tp1_done": 0, "tp2_done": 0,
+            "opened_at": timestamp, "last_price_usd": observed_price,
             "invested_usd": cost_basis, "source_wallet": signal["wallet"],
             "source_signature": signal["signature"],
         }
@@ -553,7 +573,9 @@ class PumpFunBot:
         self.store.add_trade(mode=self.s.mode, action="BUY", mint=mint, amount_raw=str(raw_out),
                              price_usd=effective_price, value_usd=cost_basis, reason=f"copied Pump.fun {used_pool} buy",
                              source_wallet=signal["wallet"], source_signature=signal["signature"], tx_signature=tx_sig)
+        self.price_cache[mint] = observed_price
         logger.warning("BUY %s raw=%s cost=%.4f USD leader=%s pool=%s", mint, raw_out, cost_basis, signal["wallet"], used_pool)
+        self._refresh_feed_subscriptions()
         if self.s.mode == "live":
             logger.warning("Live transaction confirmed: https://solscan.io/tx/%s", tx_sig)
 
