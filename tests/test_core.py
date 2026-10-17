@@ -247,6 +247,39 @@ class BuildFailureHandlingTests(unittest.TestCase):
         self.assertEqual(bot.store.get_state("manual_review_halt"), "")
 
 
+class DuplicateSignalHandlingTests(unittest.TestCase):
+    class FakeStore:
+        def __init__(self):
+            self.keys = set()
+
+        def add_signal(self, wallet, signature, mint, side, amount_ui, decimals):
+            key = (wallet, signature, mint, side)
+            if key in self.keys:
+                return False
+            self.keys.add(key)
+            return True
+
+    def test_same_transaction_from_websocket_and_logs_is_copied_once(self):
+        bot = object.__new__(PumpFunBot)
+        bot.active_wallets = {"leader-wallet"}
+        bot.wallet_address = None
+        bot.store = self.FakeStore()
+        bot.signal_stats = {"duplicate_events": 0, "buy_signals": 0}
+        attempted = []
+        bot.buy = lambda signal: attempted.append(signal["signature"])
+        signal = {
+            "wallet": "leader-wallet", "signature": "same-transaction",
+            "mint": "test-mint", "side": "buy", "amount_ui": 1.0, "decimals": 6,
+        }
+
+        bot.process_signal(signal)
+        bot.process_signal(signal)
+
+        self.assertEqual(attempted, ["same-transaction"])
+        self.assertEqual(bot.signal_stats["duplicate_events"], 1)
+        self.assertEqual(bot.signal_stats["buy_signals"], 1)
+
+
 class PendingExitReasonTests(unittest.TestCase):
     def test_normal_exit_reason_is_unchanged(self):
         self.assertEqual(normalize_pending_exit_reason("trailing stop"), "trailing stop")
@@ -446,6 +479,14 @@ class MarketTests(unittest.TestCase):
 
 
 class StorageTests(unittest.TestCase):
+    def test_duplicate_signals_are_reported_as_not_new(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = Store(Path(temp) / "signals.db", 10)
+            args = ("leader", "signature", "mint", "buy", 1.0, 6)
+            self.assertTrue(store.add_signal(*args))
+            self.assertFalse(store.add_signal(*args))
+            store.close()
+
     def test_position_and_daily_pause_persist(self):
         with tempfile.TemporaryDirectory() as temp:
             store = Store(Path(temp) / "test.db", 10)
