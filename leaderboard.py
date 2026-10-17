@@ -1,9 +1,8 @@
 """Pump.fun leaderboard discovery.
 
-The official UI exposes 1D, 1W and 1M trader views. Access to the underlying
-leaderboard endpoint may require a Pump.fun bearer token. The endpoint and
-period query names are configurable because these are frontend endpoints and
-can change without notice. This module never invents wallet addresses.
+Uses the current frontend PnL leaderboard endpoint observed from the Pump.fun
+UI. Authentication uses the value of the auth_token cookie (not the full
+Cookie header). The frontend endpoint is not a stable public API.
 """
 from __future__ import annotations
 
@@ -17,7 +16,7 @@ from solders.pubkey import Pubkey
 logger = logging.getLogger(__name__)
 
 WINDOWS = ("day", "week", "month")
-DEFAULT_VALUES = {"day": "1D", "week": "1W", "month": "1M"}
+DEFAULT_VALUES = {"day": "daily", "week": "weekly", "month": "monthly"}
 WALLET_FIELDS = (
     "wallet", "walletAddress", "wallet_address", "publicKey", "public_key",
     "address", "userAddress", "user_address", "traderPublicKey",
@@ -99,48 +98,59 @@ class PumpFunLeaderboard:
         self.timeout = timeout
         self.endpoint = os.getenv(
             "PUMPFUN_LEADERBOARD_URL",
-            "https://advanced-api-v2.pump.fun/callout/leaderboard",
+            "https://frontend-api-v3.pump.fun/pnl-leaderboard",
         ).strip()
+        # The browser request uses Cookie: auth_token=<JWT>. Keep backwards
+        # compatibility with the former bearer-token configuration.
+        self.auth_token = os.getenv("PUMPFUN_AUTH_TOKEN", "").strip()
         self.bearer_token = os.getenv("PUMPFUN_BEARER_TOKEN", "").strip()
         self.period_param = os.getenv("PUMPFUN_LEADERBOARD_PERIOD_PARAM", "period").strip()
         self.period_values = {
-            "day": os.getenv("PUMPFUN_LEADERBOARD_DAY_VALUE", "1D").strip(),
-            "week": os.getenv("PUMPFUN_LEADERBOARD_WEEK_VALUE", "1W").strip(),
-            "month": os.getenv("PUMPFUN_LEADERBOARD_MONTH_VALUE", "1M").strip(),
+            "day": os.getenv("PUMPFUN_LEADERBOARD_DAY_VALUE", "daily").strip(),
+            "week": os.getenv("PUMPFUN_LEADERBOARD_WEEK_VALUE", "weekly").strip(),
+            "month": os.getenv("PUMPFUN_LEADERBOARD_MONTH_VALUE", "monthly").strip(),
         }
+        self.sort_param = os.getenv("PUMPFUN_LEADERBOARD_SORT_PARAM", "sort").strip()
+        self.sort_value = os.getenv("PUMPFUN_LEADERBOARD_SORT_VALUE", "combined").strip()
+        self.fetch_limit = max(10, min(100, int(os.getenv("PUMPFUN_LEADERBOARD_LIMIT", "100"))))
         self.session = requests.Session()
         self.session.headers.update({
             "Accept": "application/json",
             "Origin": "https://pump.fun",
-            "Referer": "https://pump.fun/callouts/leaderboard",
-            "User-Agent": "memecoin-local-bot/1.0",
+            "Referer": "https://pump.fun/leaderboard",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155.0.0.0 Safari/537.36",
         })
-        if self.bearer_token:
+        if self.auth_token:
+            self.session.headers["Cookie"] = "auth_token=" + self.auth_token
+        elif self.bearer_token:
             self.session.headers["Authorization"] = "Bearer " + self.bearer_token
 
     @property
     def ready(self) -> bool:
-        return bool(self.endpoint and self.bearer_token)
+        return bool(self.endpoint and (self.auth_token or self.bearer_token))
 
     def _fetch(self, window: str) -> list[dict]:
         if window not in WINDOWS:
             raise ValueError(f"Unsupported Pump.fun leaderboard window: {window}")
         if not self.ready:
             raise LeaderboardError(
-                "Automatic trader discovery needs PUMPFUN_BEARER_TOKEN in your local .env. "
+                "Automatic trader discovery needs PUMPFUN_AUTH_TOKEN in your local .env. "
+                "Copy only the auth_token cookie value, not the full Cookie header. "
                 "No wallet addresses are required."
             )
-        params = {"limit": "50"}
+        params = {"limit": str(self.fetch_limit)}
         if self.period_param:
             params[self.period_param] = self.period_values[window]
+        if self.sort_param:
+            params[self.sort_param] = self.sort_value
         try:
             response = self.session.get(self.endpoint, params=params, timeout=self.timeout)
         except requests.RequestException as exc:
             raise LeaderboardError(f"Pump.fun leaderboard request failed: {exc}") from exc
         if response.status_code in (401, 403):
             raise LeaderboardError(
-                "Pump.fun rejected the leaderboard request. Refresh PUMPFUN_BEARER_TOKEN locally "
-                "or verify the endpoint and period query settings."
+                "Pump.fun rejected the leaderboard request. Refresh PUMPFUN_AUTH_TOKEN locally "
+                "from a fresh logged-in session or verify the endpoint/query settings."
             )
         if response.status_code == 429:
             raise LeaderboardError("Pump.fun leaderboard rate-limited the request; retry later.")
