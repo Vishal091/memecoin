@@ -72,24 +72,31 @@ class SolanaRPC:
         if not tx: return []
         deltas, native_delta = self.wallet_token_deltas(wallet, tx)
         sol_delta = native_delta / 1_000_000_000
-        if abs(sol_delta) < 0.001: return []
-        # Restrict to simple SOL-funded entries/exits. Token-to-token swaps often change
-        # SOL only by the network fee; copying those would misclassify them as buys.
+        # Recognize simple SOL or canonical USDC/USDT-funded swaps. Token-to-token
+        # trades between volatile assets are ambiguous and deliberately ignored.
         wsol_mint = "So11111111111111111111111111111111111111112"
+        stablecoin_mints = {
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # native USDC
+            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # native USDT
+        }
         non_wsol = {m: d for m, d in deltas.items() if m != wsol_mint}
-        if not non_wsol:
+        quote_deltas = {m: d for m, d in non_wsol.items() if m in stablecoin_mints}
+        assets = {m: d for m, d in non_wsol.items() if m not in stablecoin_mints}
+        if not assets:
             return []
-        if sol_delta < 0:
-            candidates = [(m,d) for m,d in non_wsol.items() if d["delta_raw"] > 0]
-            if len(candidates) != 1 or any(d["delta_raw"] < 0 for d in non_wsol.values()):
-                return []
+        added = [(m, d) for m, d in assets.items() if d["delta_raw"] > 0]
+        removed = [(m, d) for m, d in assets.items() if d["delta_raw"] < 0]
+        stablecoin_spent = any(d["delta_raw"] < 0 for d in quote_deltas.values())
+        stablecoin_received = any(d["delta_raw"] > 0 for d in quote_deltas.values())
+
+        if len(added) == 1 and not removed and (sol_delta < -0.001 or stablecoin_spent):
+            mint, d = added[0]
             side = "buy"
-        else:
-            candidates = [(m,d) for m,d in non_wsol.items() if d["delta_raw"] < 0]
-            if len(candidates) != 1 or any(d["delta_raw"] > 0 for d in non_wsol.values()):
-                return []
+        elif len(removed) == 1 and not added and (sol_delta > 0.001 or stablecoin_received):
+            mint, d = removed[0]
             side = "sell"
-        mint, d = candidates[0]
+        else:
+            return []
         return [{"wallet":wallet,"signature":signature,"mint":mint,"side":side,
                  "amount_ui":abs(float(d["delta_ui"])),"amount_raw":abs(int(d["delta_raw"])),
                  "decimals":int(d["decimals"]),"native_delta_sol":sol_delta,"block_time":tx.get("blockTime")}]
