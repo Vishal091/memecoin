@@ -43,6 +43,14 @@ def position_source_matches_wallet(position: dict | None, wallet: str | None) ->
     return bool(position and wallet and position.get("source_wallet") == wallet)
 
 
+def normalize_pending_exit_reason(reason: str) -> str:
+    """Remove retry-wrapper prefixes so a pending exit keeps one stable reason."""
+    normalized = str(reason or "").strip()
+    while normalized.lower().startswith("pending exit:"):
+        normalized = normalized.split(":", 1)[1].strip()
+    return normalized
+
+
 def _pubkey_string(value) -> str:
     if isinstance(value, str):
         return value
@@ -923,17 +931,20 @@ class PumpFunBot:
         position = self.store.get_position(mint)
         if not position:
             return False
-        full_exit = (reason in {"marked loss stop", "trailing stop"} or
-                     reason.startswith("followed wallet ") or reason.startswith("experiment expiry") or
-                     reason.startswith("total loss limit") or reason.startswith("pending exit:"))
+        normalized_reason = normalize_pending_exit_reason(reason)
+        lower_reason = normalized_reason.lower()
+        full_exit = (
+            lower_reason in {"marked loss stop", "trailing stop"}
+            or lower_reason.startswith("followed wallet ")
+            or lower_reason.startswith("experiment expiry")
+            or lower_reason.startswith("total loss limit")
+            or str(reason).strip().lower().startswith("pending exit:")
+        )
         pending_key = f"exit_pending:{mint}"
         if full_exit:
-            # Keep a stable underlying reason across retry cycles instead of
-            # nesting "pending exit:" on every failed build/simulation attempt.
-            pending_reason = reason
-            while pending_reason.lower().startswith("pending exit:"):
-                pending_reason = pending_reason.split(":", 1)[1].strip()
-            self.store.set_state(pending_key, pending_reason or reason)
+            # Persist only the underlying exit reason. Retry wrappers are for
+            # control flow and must not accumulate in state or trade history.
+            self.store.set_state(pending_key, normalized_reason or str(reason).strip())
         current_raw = int(position["amount_raw"])
         requested_raw = min(max(0, int(amount_raw)), current_raw)
         if requested_raw <= 0:
@@ -981,7 +992,7 @@ class PumpFunBot:
         self.store.set_state("daily_realized_pnl", float(self.store.get_state("daily_realized_pnl", "0")) + realized_pnl)
         self.store.add_trade(mode=self.s.mode, action="SELL", mint=mint, amount_raw=str(sold_raw),
                              price_usd=proceeds / units_sold if units_sold else mark_price,
-                             value_usd=proceeds, pnl_usd=realized_pnl, reason=reason,
+                             value_usd=proceeds, pnl_usd=realized_pnl, reason=normalized_reason,
                              source_wallet=position.get("source_wallet") or source_wallet,
                              source_signature=source_signature or position.get("source_signature"), tx_signature=tx_sig)
         if remaining == 0:
@@ -1000,7 +1011,7 @@ class PumpFunBot:
             self.price_cache_at[mint] = time.time()
         self.store.set_state(pending_key, "")
         self._refresh_feed_subscriptions()
-        logger.warning("SELL %s raw=%s proceeds=%.4f PnL=%.4f reason=%s", mint, sold_raw, proceeds, realized_pnl, reason)
+        logger.warning("SELL %s raw=%s proceeds=%.4f PnL=%.4f reason=%s", mint, sold_raw, proceeds, realized_pnl, normalized_reason)
         if self.s.mode == "live":
             logger.warning("Live transaction confirmed: https://solscan.io/tx/%s", tx_sig)
         return True
