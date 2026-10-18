@@ -135,7 +135,8 @@ class PumpFunSettings:
             # Hard ceiling: configuration can reduce this but never raise it above $0.50.
             token_discovery_max_entry_usd=min(0.50, _float("TOKEN_DISCOVERY_MAX_ENTRY_USD", 0.50)),
             token_discovery_max_watched_tokens=max(1, min(10, _int("TOKEN_DISCOVERY_MAX_WATCHED_TOKENS", 5))),
-            token_discovery_watch_seconds=max(30, min(600, _int("TOKEN_DISCOVERY_WATCH_SECONDS", 180))),
+            # Observe flow for at least five minutes even if an older local .env says 180 seconds.
+            token_discovery_watch_seconds=max(300, min(600, _int("TOKEN_DISCOVERY_WATCH_SECONDS", 300))),
             token_discovery_max_launches_per_minute=max(1, min(60, _int("TOKEN_DISCOVERY_MAX_LAUNCHES_PER_MINUTE", 12))),
             # Conservative discovery floors cannot be lowered by local config.
             token_discovery_min_liquidity_usd=max(5000.0, _float("TOKEN_DISCOVERY_MIN_LIQUIDITY_USD", 5000.0)),
