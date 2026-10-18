@@ -1,10 +1,13 @@
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from pumpfun_bot import PumpFunBot
+from pumpfun_config import PumpFunSettings
 from storage import Store
 
 
@@ -63,6 +66,38 @@ class FakeExecutor:
             "total_output_amount": 1_000_000,
             "sol_delta_lamports": -3_333_333,
         }
+
+
+class LiveDiscoveryConfigTests(unittest.TestCase):
+    def test_live_discovery_is_off_by_default_and_cap_cannot_exceed_50_cents(self):
+        with patch.dict(os.environ, {
+            "BOT_MODE": "paper",
+            "TOKEN_DISCOVERY_ENABLED": "true",
+            "TOKEN_DISCOVERY_LIVE_ENABLED": "false",
+            "TOKEN_DISCOVERY_MAX_ENTRY_USD": "9.00",
+        }):
+            config = PumpFunSettings.load()
+        self.assertFalse(config.token_discovery_live_enabled)
+        self.assertEqual(config.token_discovery_max_entry_usd, 0.50)
+
+    def test_live_discovery_requires_live_mode_and_scanner_enabled(self):
+        with patch.dict(os.environ, {
+            "BOT_MODE": "paper",
+            "TOKEN_DISCOVERY_ENABLED": "true",
+            "TOKEN_DISCOVERY_LIVE_ENABLED": "true",
+            "TOKEN_DISCOVERY_MAX_ENTRY_USD": "0.50",
+        }):
+            with self.assertRaisesRegex(ValueError, "requires BOT_MODE=live"):
+                PumpFunSettings.load()
+
+        with patch.dict(os.environ, {
+            "BOT_MODE": "live",
+            "TOKEN_DISCOVERY_ENABLED": "false",
+            "TOKEN_DISCOVERY_LIVE_ENABLED": "true",
+            "LIVE_CONFIRMATION": "I_ACCEPT_THE_RISK_AND_UNDERSTAND_LIVE_TRADING",
+        }):
+            with self.assertRaisesRegex(ValueError, "requires TOKEN_DISCOVERY_ENABLED=true"):
+                PumpFunSettings.load()
 
 
 class LiveDiscoveryBuyTests(unittest.TestCase):
