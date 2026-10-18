@@ -789,7 +789,8 @@ class PumpFunBot:
         if strategy == "token_discovery":
             configured_cap = min(0.50, configured_cap, float(self.s.token_discovery_max_entry_usd))
         spend = min(self.s.max_entry_usd, configured_cap, room)
-        if spend < 0.50:
+        minimum_practical_spend = 0.10 if strategy == "token_discovery" else 0.50
+        if spend < minimum_practical_spend:
             return False, "Too little exposure headroom for a practical trade"
         if self.s.mode == "paper":
             cash = float(self.store.get_state("paper_cash", "0"))
@@ -1024,7 +1025,8 @@ class PumpFunBot:
                 float(entry_cap_usd if entry_cap_usd is not None else self.s.token_discovery_max_entry_usd),
             )
         spend = min(effective_entry_cap, self.s.max_total_exposure_usd - self._current_positions_value())
-        if spend < 0.50:
+        minimum_practical_spend = 0.10 if strategy == "token_discovery" else 0.50
+        if spend < minimum_practical_spend:
             return
 
         decimals = int(signal.get("decimals") or 6)
