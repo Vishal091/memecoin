@@ -75,7 +75,7 @@ def score_candidate_metrics(
 
 
 class TokenDiscoveryShadow:
-    """Find and rank launch candidates without making live or paper-balance trades."""
+    """Screen new launches and record shadow returns; live execution is owned by the opt-in bot path."""
 
     def __init__(self, settings, rpc, market, store, feed=None):
         self.settings = settings
