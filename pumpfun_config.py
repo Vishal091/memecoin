@@ -50,6 +50,7 @@ class PumpFunSettings:
     max_total_exposure_usd: float
     max_open_positions: int
     max_entries_per_day: int
+    max_consecutive_losses: int
     daily_loss_limit_usd: float
     total_loss_limit_usd: float
     min_sol_reserve: float
@@ -109,6 +110,8 @@ class PumpFunSettings:
             max_total_exposure_usd=_float("MAX_TOTAL_EXPOSURE_USD", 3.0),
             max_open_positions=_int("MAX_OPEN_POSITIONS", 3),
             max_entries_per_day=_int("MAX_ENTRIES_PER_DAY", 3),
+            # Pause new entries after three losing exits in a row; allow only a narrow safe override range.
+            max_consecutive_losses=max(2, min(10, _int("MAX_CONSECUTIVE_LOSSES", 3))),
             daily_loss_limit_usd=_float("DAILY_LOSS_LIMIT_USD", 1.5),
             total_loss_limit_usd=_float("TOTAL_LOSS_LIMIT_USD", 3.0),
             min_sol_reserve=_float("MIN_SOL_RESERVE", 0.008),
