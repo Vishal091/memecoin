@@ -126,6 +126,95 @@ class TokenBalanceFallbackTests(unittest.TestCase):
         self.assertEqual(len(executor.rpc.calls), 3)
 
 
+class ConfirmedSaleReconciliationTests(unittest.TestCase):
+    MINT = "test-mint"
+    OWNER = "test-wallet"
+    ATA = "test-token-account"
+    RAW = 110_517_218
+    PUMPSWAP = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+
+    class FakeRPC:
+        def __init__(self, *, sell_instruction=True, signer=True, post_raw="0"):
+            self.sell_instruction = sell_instruction
+            self.signer = signer
+            self.post_raw = post_raw
+
+        def call(self, method, params):
+            if method == "getTokenAccountsByOwner":
+                return {"value": [{
+                    "pubkey": ConfirmedSaleReconciliationTests.ATA,
+                    "account": {"data": {"parsed": {"info": {
+                        "mint": ConfirmedSaleReconciliationTests.MINT,
+                        "tokenAmount": {"amount": "0", "decimals": 6},
+                    }}}},
+                }]}
+            if method == "getSignaturesForAddress":
+                return [
+                    {"signature": "sale-signature", "blockTime": 200, "err": None},
+                    {"signature": "buy-signature", "blockTime": 100, "err": None},
+                ]
+            raise AssertionError(f"Unexpected RPC call {method}: {params}")
+
+        def transaction(self, signature):
+            if signature != "sale-signature":
+                return None
+            message = {"accountKeys": [
+                {"pubkey": ConfirmedSaleReconciliationTests.OWNER, "signer": self.signer},
+                {"pubkey": ConfirmedSaleReconciliationTests.ATA, "signer": False},
+                {"pubkey": ConfirmedSaleReconciliationTests.PUMPSWAP, "signer": False},
+            ]}
+            logs = [
+                f"Program {ConfirmedSaleReconciliationTests.PUMPSWAP} invoke [1]",
+                "Program log: Instruction: SellV2" if self.sell_instruction else
+                    "Program log: Instruction: TransferChecked",
+                f"Program {ConfirmedSaleReconciliationTests.PUMPSWAP} success",
+            ]
+            return {
+                "transaction": {"message": message},
+                "meta": {
+                    "err": None,
+                    "logMessages": logs,
+                    "preTokenBalances": [{
+                        "accountIndex": 1,
+                        "owner": ConfirmedSaleReconciliationTests.OWNER,
+                        "mint": ConfirmedSaleReconciliationTests.MINT,
+                        "uiTokenAmount": {"amount": str(ConfirmedSaleReconciliationTests.RAW), "decimals": 6},
+                    }],
+                    "postTokenBalances": [{
+                        "accountIndex": 1,
+                        "owner": ConfirmedSaleReconciliationTests.OWNER,
+                        "mint": ConfirmedSaleReconciliationTests.MINT,
+                        "uiTokenAmount": {"amount": self.post_raw, "decimals": 6},
+                    }],
+                },
+            }
+
+    def _find(self, rpc):
+        executor = object.__new__(NativePumpExecutor)
+        executor.rpc = rpc
+        return executor.find_confirmed_full_sale(
+            owner=self.OWNER,
+            mint=self.MINT,
+            expected_raw=self.RAW,
+            opened_at="1970-01-01T00:02:30+00:00",
+        )
+
+    def test_finds_wallet_signed_full_pumpswap_sell_after_position_open(self):
+        result = self._find(self.FakeRPC())
+        self.assertEqual(result["signature"], "sale-signature")
+        self.assertEqual(result["raw_sold"], self.RAW)
+        self.assertEqual(result["post_raw"], 0)
+
+    def test_does_not_treat_transfer_without_sell_instruction_as_sale(self):
+        self.assertIsNone(self._find(self.FakeRPC(sell_instruction=False)))
+
+    def test_does_not_treat_sale_signed_by_another_wallet_as_our_exit(self):
+        self.assertIsNone(self._find(self.FakeRPC(signer=False)))
+
+    def test_does_not_reconcile_partial_exit_or_nonzero_post_balance(self):
+        self.assertIsNone(self._find(self.FakeRPC(post_raw="1")))
+
+
 class NativeTransactionGuardTests(unittest.TestCase):
     def validate(self, tx, wallet, mint, action="buy", route="pump", budget=1_000, raw=100):
         validate_native_transaction(
