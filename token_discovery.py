@@ -504,9 +504,11 @@ class TokenDiscoveryShadow:
                     c["price_usd"] = float(market["price_usd"])
                     c["shadow_mark_source"] = "indexed market price; migrated pool reserves not independently verified"
                     c["reason"] = "Graduated; shadow performance marked from indexed market price only"
-                    c["last_chain_check"] = time.time()
-                    self._last_chain_check[mint] = c["last_chain_check"]
-                    return c
+                else:
+                    c["reason"] = "Graduated; waiting for an indexed price to measure shadow performance"
+                c["last_chain_check"] = time.time()
+                self._last_chain_check[mint] = c["last_chain_check"]
+                return c
             c["status"] = "graduated_unverified"
             c["reason"] = "Bonding curve completed before shadow entry; migrated PumpSwap reserves are not verified by this version"
             c["subscribed"] = False
@@ -520,6 +522,23 @@ class TokenDiscoveryShadow:
             c["price_usd"] = price
         c["last_chain_check"] = time.time()
         self._last_chain_check[mint] = c["last_chain_check"]
+        return c
+
+    def _maybe_shadow_enter(self, c: dict, now: float) -> dict:
+        c = self._apply_score(c)
+        if c.get("would_buy") and float(c.get("price_usd", 0)) > 0:
+            c["status"] = "shadow_open"
+            c["shadow_entry_price_usd"] = float(c["price_usd"])
+            c["shadow_entry_at"] = now
+            c["peak_price_usd"] = float(c["price_usd"])
+            c["reason"] = "SHADOW ENTRY only; no wallet transaction was submitted"
+            self.stats["shadow_entries"] += 1
+            self.stats["last_would_buy_at"] = now
+            logger.warning(
+                "SHADOW WOULD-BUY mint=%s score=%d buyers=%d real_curve_liquidity=$%.0f buy_sol=%.3f sell_sol=%.3f; NO LIVE ORDER",
+                str(c["mint"])[:8], c["score"], c["unique_buyers"], c["real_liquidity_usd"],
+                c["buy_volume_sol"], c["sell_volume_sol"],
+            )
         return c
 
     def _apply_score(self, c: dict) -> dict:
@@ -611,23 +630,12 @@ class TokenDiscoveryShadow:
                 return
 
         if c.get("status") == "watching":
-            c = self._apply_score(c)
-            if c.get("would_buy") and float(c.get("price_usd", 0)) > 0:
-                c["status"] = "shadow_open"
-                c["shadow_entry_price_usd"] = float(c["price_usd"])
-                c["shadow_entry_at"] = now
-                c["peak_price_usd"] = float(c["price_usd"])
-                c["reason"] = "SHADOW ENTRY only; no wallet transaction was submitted"
-                self.stats["shadow_entries"] += 1
-                self.stats["last_would_buy_at"] = now
-                logger.warning(
-                    "SHADOW WOULD-BUY mint=%s score=%d buyers=%d real_curve_liquidity=$%.0f buy_sol=%.3f sell_sol=%.3f; NO LIVE ORDER",
-                    mint[:8], c["score"], c["unique_buyers"], c["real_liquidity_usd"],
-                    c["buy_volume_sol"], c["sell_volume_sol"],
-                )
+            c = self._maybe_shadow_enter(c, now)
         elif c.get("status") == "shadow_open":
             self._mark_shadow_return(c, now)
         self._save(c)
+        if not c.get("subscribed") or c.get("status") not in {"watching", "shadow_open"}:
+            self._update_feed_subscriptions()
 
     def _mark_shadow_return(self, c: dict, now: float) -> None:
         entry = float(c.get("shadow_entry_price_usd") or 0)
@@ -673,7 +681,9 @@ class TokenDiscoveryShadow:
             if due:
                 try:
                     c = self._refresh_curve(c)
-                    if c.get("status") == "shadow_open":
+                    if c.get("status") == "watching":
+                        c = self._maybe_shadow_enter(c, now)
+                    elif c.get("status") == "shadow_open":
                         self._mark_shadow_return(c, now)
                 except Exception as exc:
                     if c.get("status") == "watching":
