@@ -23,6 +23,20 @@ class TransactionBuildFailed(RuntimeError):
     """The unsigned transaction builder failed before any signing or submission."""
 
 
+class TransactionOutcomeUncertain(RuntimeError):
+    """A signed transaction may have been submitted, but its outcome was not verified."""
+
+    def __init__(self, signature: str, action: str, mint: str, detail: str):
+        self.signature = str(signature)
+        self.action = str(action)
+        self.mint = str(mint)
+        self.detail = str(detail)
+        super().__init__(
+            f"{self.action.upper()} outcome requires reconciliation for mint {self.mint}; "
+            f"signature={self.signature}; {self.detail}; do not retry automatically"
+        )
+
+
 ROOT = Path(__file__).resolve().parent
 BUILDER = ROOT / "native_pump_builder.mjs"
 
@@ -373,27 +387,63 @@ class NativePumpExecutor:
         if not any(f"Program {expected_program} invoke" in str(line) for line in logs):
             raise RuntimeError("Simulation did not invoke the expected official Pump venue")
 
-    def _send_confirm(self, transaction: VersionedTransaction) -> str:
+    def _send_confirm(
+        self, transaction: VersionedTransaction, *, action: str, mint: str
+    ) -> str:
+        # A signed Solana transaction has a deterministic first signature. Capture it
+        # before submission so a lost sendTransaction response cannot hide the signature.
+        signatures = getattr(transaction, "signatures", None) or []
+        if not signatures:
+            raise RuntimeError("Signed transaction has no signature; refusing submission")
+        local_signature = str(signatures[0])
         encoded = base64.b64encode(bytes(transaction)).decode("ascii")
-        signature = self.rpc.call("sendTransaction", [
-            encoded,
-            {"encoding": "base64", "preflightCommitment": "confirmed", "maxRetries": 3},
-        ])
+
+        try:
+            signature = self.rpc.call("sendTransaction", [
+                encoded,
+                {"encoding": "base64", "preflightCommitment": "confirmed", "maxRetries": 3},
+            ])
+        except Exception as exc:
+            # The RPC may accept the transaction even if its response is lost.
+            raise TransactionOutcomeUncertain(
+                local_signature, action, mint,
+                f"sendTransaction response was inconclusive ({type(exc).__name__})",
+            ) from exc
+
+        if not signature or str(signature) != local_signature:
+            raise TransactionOutcomeUncertain(
+                local_signature, action, mint,
+                "sendTransaction response did not match the locally derived signature",
+            )
+        signature = local_signature
+
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            result = self.rpc.call(
-                "getSignatureStatuses",
-                [[signature], {"searchTransactionHistory": True}],
-            ) or {}
+            try:
+                result = self.rpc.call(
+                    "getSignatureStatuses",
+                    [[signature], {"searchTransactionHistory": True}],
+                ) or {}
+            except Exception as exc:
+                raise TransactionOutcomeUncertain(
+                    signature, action, mint,
+                    f"submitted transaction status lookup failed ({type(exc).__name__})",
+                ) from exc
+
             statuses = result.get("value") or []
             status = statuses[0] if statuses else None
             if status:
                 if status.get("err") is not None:
-                    raise RuntimeError(f"Transaction failed on-chain: {status['err']}; signature={signature}")
+                    raise RuntimeError(
+                        f"Transaction failed on-chain: {status['err']}; signature={signature}"
+                    )
                 if status.get("confirmationStatus") in {"confirmed", "finalized"}:
-                    return str(signature)
+                    return signature
             time.sleep(0.7)
-        raise TimeoutError(f"Confirmation timeout for {signature}; do not retry before checking this signature")
+
+        raise TransactionOutcomeUncertain(
+            signature, action, mint, "confirmation timed out after 30 seconds"
+        )
 
     def trade(self, owner: str, keypair: Keypair, mint: str, action: str, amount: float,
               denominated_in_sol: bool, slippage_bps: int, preferred_pool: str | None = None,
@@ -469,29 +519,36 @@ class NativePumpExecutor:
         self._simulate(unsigned, expected_program)
 
         signed = VersionedTransaction(unsigned.message, [keypair])
-        signature = self._send_confirm(signed)
+        signature = self._send_confirm(signed, action=action, mint=mint)
 
         deadline = time.monotonic() + 10
         token_after = token_before
         sol_after = sol_before
-        while time.monotonic() < deadline:
-            token_after = self.token_balance_raw(owner, mint)
-            sol_after = self.sol_balance_lamports(owner)
-            delta = token_after - token_before
-            if (action == "buy" and delta > 0) or (action == "sell" and delta < 0):
-                break
-            time.sleep(0.5)
+        try:
+            while time.monotonic() < deadline:
+                token_after = self.token_balance_raw(owner, mint)
+                sol_after = self.sol_balance_lamports(owner)
+                delta = token_after - token_before
+                if (action == "buy" and delta > 0) or (action == "sell" and delta < 0):
+                    break
+                time.sleep(0.5)
+        except Exception as exc:
+            raise TransactionOutcomeUncertain(
+                signature, action, mint,
+                f"transaction confirmed but post-trade balance verification failed ({type(exc).__name__})",
+            ) from exc
+
         token_delta = token_after - token_before
         sol_delta = sol_after - sol_before
         if action == "buy" and token_delta <= 0:
-            raise RuntimeError(
-                f"Transaction {signature} confirmed but token balance did not increase; "
-                f"reconcile manually before retrying"
+            raise TransactionOutcomeUncertain(
+                signature, action, mint,
+                "transaction confirmed but token balance did not increase",
             )
         if action == "sell" and token_delta >= 0:
-            raise RuntimeError(
-                f"Transaction {signature} confirmed but token balance did not decrease; "
-                f"reconcile manually before retrying"
+            raise TransactionOutcomeUncertain(
+                signature, action, mint,
+                "transaction confirmed but token balance did not decrease",
             )
 
         logger.warning("Native %s transaction confirmed route=%s signature=%s", action, route, signature)

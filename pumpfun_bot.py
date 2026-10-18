@@ -26,7 +26,7 @@ from pumpfun_config import PumpFunSettings
 from pumpportal_feed import PumpPortalAccountFeed
 from solana_logs_feed import SolanaLogsFeed
 from pumpportal import PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID
-from native_pump import NativePumpExecutor, TransactionBuildFailed
+from native_pump import NativePumpExecutor, TransactionBuildFailed, TransactionOutcomeUncertain
 from solana_rpc import SolanaRPC, SolanaRPCRateLimited, SolanaTransactionNotReady
 from pump_curve import fetch_pump_curve
 from storage import Store
@@ -758,8 +758,63 @@ class PumpFunBot:
         self.store.set_state(f"native_build_failure:{mint}", " ".join(str(detail).split())[:500])
         return delay
 
+    def _handle_uncertain_trade(
+        self,
+        exc: TransactionOutcomeUncertain,
+        *,
+        source_wallet: str | None = None,
+        source_signature: str | None = None,
+    ) -> None:
+        """Persist ambiguous submitted trades and fail closed without replaying the source signal."""
+        record = {
+            "signature": exc.signature,
+            "action": exc.action,
+            "mint": exc.mint,
+            "detail": exc.detail,
+            "source_wallet": source_wallet or "",
+            "source_signature": source_signature or "",
+            "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        self.store.set_state(
+            f"unresolved_trade:{exc.mint}",
+            json.dumps(record, sort_keys=True, separators=(",", ":")),
+        )
+        self.store.set_state("manual_review_halt", "1")
+        self.store.set_state(
+            "manual_review_reason",
+            f"{exc.action.upper()} outcome unresolved for mint {exc.mint}; "
+            f"signature {exc.signature}; reconcile wallet/transaction before resuming",
+        )
+        self.auto_copy_enabled = False
+        self.store.set_state("auto_copy_enabled", "0")
+        self.store.set_state("copy_paused", "1")
+
+        # Consume the triggering leader event so clearing the halt later cannot
+        # replay the same stale signal. poll_wallet also advances its cursor.
+        if source_wallet and source_signature:
+            self.store.mark_signature_seen(
+                self._dedupe_key(source_wallet, source_signature), source_wallet
+            )
+
+        try:
+            self._refresh_feed_subscriptions()
+        except Exception:
+            logger.exception("Could not refresh subscriptions after uncertain transaction outcome")
+
+        logger.critical(
+            "Manual reconciliation required: action=%s mint=%s signature=%s; "
+            "no automatic retry will be attempted for this mint",
+            exc.action, exc.mint, exc.signature,
+        )
+
     def buy(self, signal: dict):
         mint = signal["mint"]
+        if self.store.get_state(f"unresolved_trade:{mint}", ""):
+            logger.warning(
+                "Skipping buy for %s because an earlier transaction outcome remains unresolved",
+                mint[:8],
+            )
+            return
         if self.store.get_position(mint):
             return
         if self._native_build_retry_deferred(mint):
@@ -846,6 +901,13 @@ class PumpFunBot:
                     amount=round(spend / sol_price, 9), denominated_in_sol=True,
                     slippage_bps=self.s.slippage_bps, preferred_pool=venue,
                 )
+            except TransactionOutcomeUncertain as exc:
+                self._handle_uncertain_trade(
+                    exc,
+                    source_wallet=str(signal.get("wallet") or ""),
+                    source_signature=str(signal.get("signature") or ""),
+                )
+                return
             except TransactionBuildFailed as exc:
                 delay = self._defer_native_build_retry(mint, str(exc))
                 logger.warning(
@@ -886,6 +948,12 @@ class PumpFunBot:
 
     def sell(self, mint: str, amount_raw: int, reason: str,
              source_wallet: str | None = None, source_signature: str | None = None) -> bool:
+        if self.store.get_state(f"unresolved_trade:{mint}", ""):
+            logger.debug(
+                "Skipping sell retry for %s because an earlier transaction outcome remains unresolved",
+                mint[:8],
+            )
+            return False
         position = self.store.get_position(mint)
         if not position:
             return False
@@ -931,6 +999,13 @@ class PumpFunBot:
                     slippage_bps=self.s.slippage_bps, preferred_pool=preferred,
                     amount_raw=requested_raw,
                 )
+            except TransactionOutcomeUncertain as exc:
+                self._handle_uncertain_trade(
+                    exc,
+                    source_wallet=source_wallet,
+                    source_signature=source_signature,
+                )
+                return False
             except TransactionBuildFailed as exc:
                 delay = self._defer_native_build_retry(mint, str(exc))
                 logger.error(
