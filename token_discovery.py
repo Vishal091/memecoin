@@ -447,7 +447,7 @@ class TokenDiscoveryShadow:
         saw_older_than_window = False
         for row in rows:
             mint = str(row.get("mint") or row.get("address") or row.get("tokenAddress") or "").strip()
-            if not mint or self._load(mint):
+            if not mint:
                 continue
             created_at = self._coin_created_at(row)
             if created_at is None or created_at > now + 300:
@@ -458,6 +458,10 @@ class TokenDiscoveryShadow:
                 continue
             if age_seconds > self.max_token_age_seconds:
                 saw_older_than_window = True
+                continue
+            # Determine age before checking the local ledger so already-seen older
+            # coins still tell pagination when it has crossed the 24-hour boundary.
+            if self._load(mint):
                 continue
             creator = str(
                 row.get("creator") or row.get("user") or row.get("traderPublicKey") or ""
