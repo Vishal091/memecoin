@@ -1147,7 +1147,6 @@ class PumpFunBot:
         total_supply_tokens = float(signal.get("total_supply_tokens") or 0)
         if total_supply_tokens <= 0:
             total_supply_tokens = self._read_total_supply_tokens(mint)
-        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         venue = str(signal.get("venue", "pump"))
         if venue not in {"pump", "pump-amm"}:
             venue = "pump"
@@ -1209,6 +1208,8 @@ class PumpFunBot:
             cost_basis = effective_spend if effective_spend > 0 else spend
             effective_price = spend / raw_to_units(raw_out, decimals)
 
+        # Start the hold timer only after the buy has succeeded and its fill is known.
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         position = {
             "mint": mint, "decimals": decimals, "amount_raw": str(raw_out),
             "entry_price_usd": effective_price, "initial_amount_raw": str(raw_out),
