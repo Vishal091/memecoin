@@ -869,6 +869,24 @@ class PumpFunBot:
                 return False, "SOL balance insufficient for entry plus fee reserve"
         return True, "allowed"
 
+    def _read_total_supply_tokens(self, mint: str) -> float:
+        try:
+            result = self.rpc.call(
+                "getTokenSupply", [mint, {"commitment": "confirmed"}]
+            ) or {}
+            value = result.get("value") or {}
+            raw_supply = int(value.get("amount") or 0)
+            decimals = int(value.get("decimals") or 0)
+            if raw_supply <= 0 or decimals < 0 or decimals > 18:
+                return 0.0
+            return raw_supply / (10 ** decimals)
+        except Exception as exc:
+            # Market-cap metadata is optional; failure must never suppress or delay
+            # the existing execution/risk result beyond this one best-effort lookup.
+            logger.debug("Could not read token supply for market-cap estimate %s: %s",
+                         str(mint)[:8], type(exc).__name__)
+            return 0.0
+
     def _native_build_retry_deferred(self, mint: str) -> bool:
         if self.s.mode != "live":
             return False
@@ -1093,6 +1111,9 @@ class PumpFunBot:
             return
 
         decimals = int(signal.get("decimals") or 6)
+        total_supply_tokens = float(signal.get("total_supply_tokens") or 0)
+        if total_supply_tokens <= 0:
+            total_supply_tokens = self._read_total_supply_tokens(mint)
         timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         venue = str(signal.get("venue", "pump"))
         if venue not in {"pump", "pump-amm"}:
@@ -1156,6 +1177,12 @@ class PumpFunBot:
             "opened_at": timestamp, "last_price_usd": observed_price,
             "invested_usd": cost_basis, "source_wallet": source_wallet,
             "source_signature": source_signature, "strategy": strategy,
+            "total_supply_tokens": total_supply_tokens,
+            "entry_market_cap_usd": effective_price * total_supply_tokens if total_supply_tokens > 0 else 0.0,
+            "entry_market_cap_source": (
+                "Estimated: executed average token price × total supply (FDV-style)"
+                if total_supply_tokens > 0 else ""
+            ),
         }
         self.store.upsert_position(position)
         self.store.set_state(f"pool:{mint}", used_pool)
@@ -1469,6 +1496,7 @@ class PumpFunBot:
                 "source": "token_discovery",
                 "curve_state_verified": True,
                 "fresh_security_verified": True,
+                "total_supply_tokens": total_supply_tokens,
             }
             try:
                 self.buy(signal, strategy="token_discovery", entry_cap_usd=hard_cap)
