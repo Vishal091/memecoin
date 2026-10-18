@@ -241,6 +241,26 @@ class TokenDiscoveryMarketCapTests(unittest.TestCase):
         self.assertEqual(candidate["total_supply_tokens"], 1_000_000_000)
         self.assertEqual(candidate["entry_market_cap_usd"], 0.0)
 
+    def test_market_cap_snapshot_prefers_live_entry_for_open_position(self):
+        store = FakeStore()
+        scanner = TokenDiscoveryShadow(settings(), FakeRPC(), FakeMarket(), store)
+        scanner._save({
+            "mint": MINT,
+            "entry_market_cap_usd": 100_000,
+            "entry_market_cap_source": "shadow estimate",
+            "live_entry_market_cap_usd": 95_000,
+            "live_entry_market_cap_source": "live entry estimate",
+            "market_cap_usd": 110_000,
+            "market_cap_source": "current estimate",
+        })
+
+        snapshot = scanner.market_cap_snapshot(MINT)
+
+        self.assertEqual(snapshot["entry_market_cap_usd"], 95_000)
+        self.assertEqual(snapshot["entry_market_cap_source"], "live entry estimate")
+        self.assertEqual(snapshot["current_market_cap_usd"], 110_000)
+        self.assertEqual(snapshot["current_market_cap_source"], "current estimate")
+
     def test_price_times_supply_is_labeled_as_estimate(self):
         scanner = TokenDiscoveryShadow(settings(), FakeRPC(), FakeMarket(), FakeStore())
         candidate = scanner._new_candidate(
