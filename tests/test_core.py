@@ -95,6 +95,36 @@ class NativeBuildFailureHandlingTests(unittest.TestCase):
         self.assertIn("Associated token account not found", bot.store.get_state("native_build_failure:test-mint"))
         self.assertNotIn("manual_review_halt", bot.store.state)
 
+    def test_pending_exit_reason_does_not_accumulate_wrappers_on_retry(self):
+        position = {
+            "mint": "test-mint", "amount_raw": "1000", "decimals": 6,
+            "invested_usd": 1.0, "last_price_usd": 1.0,
+            "source_wallet": "leader-wallet", "source_signature": "leader-signature",
+        }
+        bot = object.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(mode="live", slippage_bps=100)
+        bot.store = self.FakeStore(position)
+        bot.store.set_state(
+            "exit_pending:test-mint",
+            "pending exit: pending exit: marked loss stop",
+        )
+        bot.market = self.FakeMarket()
+        bot.executor = self.FakeExecutor()
+        bot.wallet_address = "test-wallet"
+        bot.keypair = object()
+
+        result = bot.sell(
+            "test-mint", 1000,
+            "pending exit: pending exit: marked loss stop",
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(
+            bot.store.get_state("exit_pending:test-mint"),
+            "marked loss stop",
+        )
+        self.assertEqual(bot.store.get_position("test-mint"), position)
+
     def test_unsupported_quote_build_is_deferred_for_six_hours(self):
         self.assertEqual(
             native_build_retry_delay_seconds("Unsupported PumpSwap quote mint"),
