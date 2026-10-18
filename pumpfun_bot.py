@@ -1770,10 +1770,17 @@ class PumpFunBot:
                 observed_launch_at = float(candidate.get("created_at") or entry_at)
             except (TypeError, ValueError):
                 observed_launch_at = entry_at
-            if observed_launch_at > now or now - observed_launch_at > max_age_hours * 3600:
+            max_entry_age_seconds = max(
+                60, min(600, int(getattr(self.s, "token_discovery_max_entry_age_seconds", 300)))
+            )
+            if (
+                observed_launch_at > now
+                or now - observed_launch_at > max_age_hours * 3600
+                or now - observed_launch_at > max_entry_age_seconds
+            ):
                 self._set_discovery_live_status(
                     candidate, "skipped_stale",
-                    f"Launch event is outside the maximum {max_age_hours}-hour age window; no live buy",
+                    f"Launch is older than the {max_entry_age_seconds}s sniper entry window; no live buy",
                 )
                 continue
 
@@ -2043,7 +2050,13 @@ class PumpFunBot:
             if price <= entry * (1 - self.s.max_marked_loss_pct):
                 self.sell(mint, current_raw, "marked loss stop")
                 continue
-            if peak > entry and price <= peak * (1 - self.s.trailing_stop_pct):
+            # Do not trail a small unbanked bounce into an early full exit. Arm
+            # the trailing stop only after TP1 has actually sold part of the position.
+            if (
+                int(position["tp1_done"])
+                and peak > entry
+                and price <= peak * (1 - self.s.trailing_stop_pct)
+            ):
                 self.sell(mint, current_raw, "trailing stop")
                 continue
             if not int(position["tp1_done"]) and price >= entry * (1 + self.s.take_profit_1_pct):
