@@ -4,7 +4,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from market_data import MarketData, WSOL_MINT
-from pumpfun_bot import PumpFunBot, native_build_retry_delay_seconds
+from pumpfun_bot import (
+    PumpFunBot,
+    loss_exit_hold_remaining_seconds,
+    native_build_retry_delay_seconds,
+)
 from native_pump import (
     TransactionBuildFailed,
     TransactionExpiredNotLanded,
@@ -13,6 +17,123 @@ from native_pump import (
 from solana_rpc import SolanaRPC
 from storage import Store
 
+
+
+class LossExitGracePeriodTests(unittest.TestCase):
+    def test_losing_exit_waits_for_remaining_two_minute_window(self):
+        now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
+        position = {
+            "entry_price_usd": 1.0,
+            "opened_at": (now - timedelta(seconds=30)).isoformat(timespec="seconds"),
+        }
+        self.assertEqual(
+            loss_exit_hold_remaining_seconds(
+                position, 0.75, "marked loss stop", 120, now=now.timestamp()
+            ),
+            90.0,
+        )
+
+    def test_loss_exit_allowed_after_two_minutes(self):
+        now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
+        position = {
+            "entry_price_usd": 1.0,
+            "opened_at": (now - timedelta(seconds=121)).isoformat(timespec="seconds"),
+        }
+        self.assertEqual(
+            loss_exit_hold_remaining_seconds(
+                position, 0.75, "marked loss stop", 120, now=now.timestamp()
+            ),
+            0.0,
+        )
+
+    def test_profit_and_emergency_liquidation_bypass_loss_grace_period(self):
+        now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
+        position = {
+            "entry_price_usd": 1.0,
+            "opened_at": (now - timedelta(seconds=10)).isoformat(timespec="seconds"),
+        }
+        self.assertEqual(
+            loss_exit_hold_remaining_seconds(
+                position, 1.05, "followed wallet leader-wallet sell", 120,
+                now=now.timestamp(),
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            loss_exit_hold_remaining_seconds(
+                position, 0.50, "total loss limit liquidation", 120,
+                now=now.timestamp(),
+            ),
+            0.0,
+        )
+
+    class FakeStore:
+        def __init__(self, position):
+            self.position = position
+            self.state = {}
+
+        def get_state(self, key, default=""):
+            return self.state.get(key, default)
+
+        def set_state(self, key, value):
+            self.state[key] = str(value)
+
+        def get_position(self, mint):
+            return self.position if self.position.get("mint") == mint else None
+
+    class FakeMarket:
+        def token_market(self, mint):
+            return {"price_usd": 0.75}
+
+    def _bot_with_fresh_position(self):
+        position = {
+            "mint": "test-mint",
+            "decimals": 6,
+            "amount_raw": "1000",
+            "entry_price_usd": 1.0,
+            "initial_amount_raw": "1000",
+            "peak_price_usd": 1.0,
+            "tp1_done": 0,
+            "tp2_done": 0,
+            "opened_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "last_price_usd": 1.0,
+            "invested_usd": 1.0,
+            "source_wallet": "entry-wallet",
+            "source_signature": "entry-signature",
+        }
+        bot = object.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(
+            mode="paper", min_hold_before_loss_exit_seconds=120,
+            paper_swap_cost_usd=0.02,
+        )
+        bot.store = self.FakeStore(position)
+        bot.market = self.FakeMarket()
+        return bot
+
+    def test_automatic_stop_wait_does_not_persist_stale_pending_trigger(self):
+        bot = self._bot_with_fresh_position()
+        self.assertFalse(bot.sell("test-mint", 1000, "marked loss stop"))
+        self.assertEqual(bot.store.get_state("exit_pending:test-mint", ""), "")
+        self.assertEqual(bot.store.get_state("exit_pending_amount_raw:test-mint", ""), "")
+
+    def test_losing_leader_sell_preserves_its_partial_amount_while_deferred(self):
+        bot = self._bot_with_fresh_position()
+        reason = "followed wallet leader-wallet partial/full sell on pump"
+        self.assertFalse(
+            bot.sell(
+                "test-mint", 300, reason,
+                "leader-wallet", "leader-sell-signature",
+            )
+        )
+        self.assertEqual(bot.store.get_state("exit_pending:test-mint"), reason)
+        self.assertEqual(bot.store.get_state("exit_pending_amount_raw:test-mint"), "300")
+        self.assertEqual(
+            bot.store.get_state("exit_pending_source_wallet:test-mint"), "leader-wallet"
+        )
+        self.assertEqual(
+            bot.store.get_state("exit_pending_source_signature:test-mint"),
+            "leader-sell-signature",
+        )
 
 
 class DashboardErrorRefreshTests(unittest.TestCase):
