@@ -620,7 +620,7 @@ class TokenDiscoveryShadow:
             # A shadow entry may graduate during its observation window. Continue
             # measuring its mark using indexed market data, but never claim that
             # Dexscreener's liquidity field is an on-chain reserve verification.
-            if c.get("status") == "shadow_open":
+            if c.get("status") == "shadow_open" or c.get("live_entry_status") == "opened":
                 try:
                     market = self.market.token_market(mint)
                 except Exception:
