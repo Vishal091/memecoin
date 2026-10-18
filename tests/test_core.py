@@ -604,6 +604,7 @@ class NativeBuildFailureHandlingTests(unittest.TestCase):
         bot.message = ""
         bot.store.set_state("native_build_retry_after:test-mint", "9999999999")
         bot.store.set_state("native_build_failure:test-mint", "old build failure")
+        bot.store.set_state("exit_blocked_balance_zero:test-mint", "previous zero-balance block")
         bot.store.set_state("exit_pending_amount_raw:test-mint", "300")
         bot.store.set_state("exit_pending_source_wallet:test-mint", "leader-wallet")
         bot.store.set_state("exit_pending_source_signature:test-mint", "leader-signature")
@@ -618,6 +619,7 @@ class NativeBuildFailureHandlingTests(unittest.TestCase):
         self.assertEqual(bot.store.get_state("exit_pending_source_wallet:test-mint"), "")
         self.assertEqual(bot.store.get_state("exit_pending_source_signature:test-mint"), "")
         self.assertEqual(bot.store.get_state("native_build_retry_after:test-mint"), "")
+        self.assertEqual(bot.store.get_state("exit_blocked_balance_zero:test-mint"), "")
         self.assertIn("Manual full exit queued", bot.message)
 
     def test_manual_exit_stays_queued_but_surfaces_unresolved_transaction_block(self):
@@ -644,6 +646,55 @@ class NativeBuildFailureHandlingTests(unittest.TestCase):
         self.assertEqual(bot.store.get_state("native_build_retry_after:test-mint"), "")
         self.assertIn("blocked until", bot.message)
         self.assertIn("reconciled", bot.message)
+
+    def test_zero_live_balance_pauses_pending_exit_instead_of_retrying_forever(self):
+        position = {
+            "mint": "test-mint", "amount_raw": "1000", "decimals": 6,
+            "invested_usd": 1.0, "last_price_usd": 1.0,
+        }
+        class ZeroBalanceExecutor:
+            def token_balance_raw(self, wallet, mint):
+                return 0
+
+            def trade(self, **kwargs):
+                raise AssertionError("A sell must not be submitted with zero token balance")
+
+        bot = object.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(mode="live", slippage_bps=100)
+        bot.store = self.FakeStore(position)
+        bot.market = self.FakeMarket()
+        bot.executor = ZeroBalanceExecutor()
+        bot.wallet_address = "test-wallet"
+        bot.keypair = object()
+        bot.message = ""
+        bot.store.set_state("exit_pending:test-mint", "manual exit requested from dashboard")
+        bot.store.set_state("exit_pending_amount_raw:test-mint", "1000")
+
+        result = bot.sell("test-mint", 1000, "manual exit requested from dashboard")
+
+        self.assertFalse(result)
+        self.assertEqual(bot.store.get_state("exit_pending:test-mint"), "")
+        self.assertEqual(bot.store.get_state("exit_pending_amount_raw:test-mint"), "")
+        self.assertIn("exit_blocked_balance_zero:test-mint", bot.store.state)
+        self.assertIn("paused", bot.message)
+        self.assertEqual(bot.store.get_position("test-mint"), position)
+
+    def test_position_manager_skips_zero_balance_block_until_manual_retry(self):
+        position = {"mint": "test-mint", "amount_raw": "1000"}
+        class BlockedStore:
+            def list_positions(self):
+                return [position]
+
+            def get_position(self, mint):
+                return position if mint == "test-mint" else None
+
+            def get_state(self, key, default=""):
+                return "reconcile first" if key == "exit_blocked_balance_zero:test-mint" else default
+
+        bot = object.__new__(PumpFunBot)
+        bot.store = BlockedStore()
+        # It must skip before attempting to read prices or call the sell path.
+        bot.manage_positions()
 
     def test_unsupported_quote_build_is_deferred_for_six_hours(self):
         self.assertEqual(
