@@ -185,6 +185,30 @@ class LiveDiscoveryBuyTests(unittest.TestCase):
         self.assertEqual(len(bot.executor.calls), 1)
         self.assertLessEqual(bot.executor.calls[0]["amount"] * 150.0, 0.25 + 1e-7)
 
+    def test_fixed_wallet_costs_do_not_inflate_token_entry_price_or_stop_threshold(self):
+        bot = self.make_bot()
+        bot.executor.trade = lambda **kwargs: {
+            "signature": "confirmed-cost-test",
+            "pool": "pump",
+            "total_output_amount": 1_000_000,  # 1 token
+            # $0.50 swap input plus ~$0.1586 in network/account overhead.
+            "sol_delta_lamports": -4_390_666,
+        }
+        signal = self.signal()
+        signal["observed_price_usd"] = 0.50
+        signal["total_supply_tokens"] = 10_000.0
+
+        bot.buy(signal, strategy="token_discovery", entry_cap_usd=0.50)
+
+        position = bot.store.get_position("discovery-mint")
+        self.assertAlmostEqual(position["entry_price_usd"], 0.50, places=6)
+        self.assertAlmostEqual(position["invested_usd"], 4_390_666 / 1_000_000_000 * 150.0, places=6)
+        self.assertGreater(position["invested_usd"], position["entry_price_usd"])
+        self.assertAlmostEqual(position["entry_market_cap_usd"], 5_000.0, places=4)
+        self.assertAlmostEqual(bot.store.trades[0]["price_usd"], 0.50, places=6)
+        self.assertAlmostEqual(bot.store.trades[0]["value_usd"], position["invested_usd"], places=6)
+        self.assertAlmostEqual(bot.price_cache["discovery-mint"], 0.50, places=6)
+
     def test_live_discovery_executor_hard_caps_spend_at_50_cents(self):
         # Even a malformed in-memory setting or caller argument cannot raise the code cap.
         bot = self.make_bot(max_entry=9.0)
