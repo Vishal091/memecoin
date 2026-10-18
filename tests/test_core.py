@@ -63,6 +63,54 @@ class NativeSimulationFailureTests(unittest.TestCase):
         self.assertFalse(raised.exception.retryable)
         self.assertIn("simulation failed", raised.exception.detail.lower())
 
+class LossStreakCircuitBreakerTests(unittest.TestCase):
+    class FakeStore:
+        def __init__(self, state=None):
+            self.state = dict(state or {})
+
+        def get_state(self, key, default=""):
+            return self.state.get(key, default)
+
+        def set_state(self, key, value):
+            self.state[str(key)] = str(value)
+
+    def _bot(self, state=None):
+        bot = object.__new__(PumpFunBot)
+        bot.store = self.FakeStore(state)
+        bot.s = SimpleNamespace(max_consecutive_losses=3)
+        return bot
+
+    def test_three_losing_exits_pause_new_entries_until_next_utc_day(self):
+        bot = self._bot()
+        with self.assertLogs("pumpfun", level="ERROR") as logs:
+            bot._record_realized_exit_risk(-0.10)
+            bot._record_realized_exit_risk(-0.05)
+            bot._record_realized_exit_risk(-0.02)
+
+        today = datetime.now(timezone.utc).date().isoformat()
+        self.assertEqual(bot.store.get_state("consecutive_losing_exits"), "3")
+        self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), today)
+        self.assertIn("Consecutive-loss circuit breaker activated", "\n".join(logs.output))
+        self.assertIn("Consecutive-loss pause active", bot._copy_block_reason())
+
+    def test_positive_realized_exit_resets_the_loss_streak(self):
+        bot = self._bot()
+        bot._record_realized_exit_risk(-0.10)
+        bot._record_realized_exit_risk(-0.05)
+        bot._record_realized_exit_risk(0.02)
+        self.assertEqual(bot.store.get_state("consecutive_losing_exits"), "0")
+        self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), "")
+
+    def test_stale_pause_is_cleared_on_a_later_utc_day(self):
+        bot = self._bot({
+            "consecutive_loss_pause_day": "2000-01-01",
+            "consecutive_losing_exits": "3",
+        })
+        self.assertEqual(bot._loss_streak_pause_reason(), "")
+        self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), "")
+        self.assertEqual(bot.store.get_state("consecutive_losing_exits"), "0")
+
+
 class DiscoveryQueueTests(unittest.TestCase):
     class FakeStore:
         def __init__(self):
