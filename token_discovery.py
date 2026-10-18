@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
+import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -109,6 +111,8 @@ class TokenDiscoveryShadow:
             self._backfill_offset = 0
         self._last_backfill_poll_at = 0.0
         self._last_backfill_error_log_at = 0.0
+        self._backfill_results = queue.SimpleQueue()
+        self._backfill_thread: threading.Thread | None = None
         self._recent_scans: deque[float] = deque()
         self._last_chain_check: dict[str, float] = {}
         self._last_skip_log_at = 0.0
@@ -394,17 +398,14 @@ class TokenDiscoveryShadow:
                     continue
         return None
 
-    def _poll_recent_launches(self, now: float) -> None:
-        """Page Pump.fun's latest-coins API for candidates created in the previous 24 hours."""
-        if not self.backfill_auth_token or now - self._last_backfill_poll_at < 60:
-            return
-        self._last_backfill_poll_at = now
+    def _fetch_recent_launch_page(self, offset: int) -> None:
+        """Fetch one catalogue page off-loop; this worker never mutates the ledger."""
         try:
             response = requests.get(
                 self.backfill_url,
                 params={
                     "limit": str(self.backfill_page_size),
-                    "offset": str(self._backfill_offset),
+                    "offset": str(offset),
                     "sort": "created_timestamp",
                     "searchTerm": "",
                     "order": "DESC",
@@ -428,66 +429,107 @@ class TokenDiscoveryShadow:
                 raise RuntimeError("Pump.fun latest-coins API rate-limited history backfill")
             response.raise_for_status()
             rows = self._coin_rows(response.json())
+            self._backfill_results.put({
+                "offset": offset, "rows": rows, "error": "",
+            })
         except Exception as exc:
-            self.stats["backfill_errors"] += 1
-            if now - self._last_backfill_error_log_at >= 60:
-                logger.warning(
-                    "Recent-launch backfill unavailable (%s); live new-token stream remains active",
-                    " ".join(str(exc).split())[:200],
+            self._backfill_results.put({
+                "offset": offset, "rows": [],
+                "error": " ".join(str(exc).split())[:240],
+            })
+
+    def _start_recent_launch_backfill(self, now: float) -> None:
+        """Start a bounded, non-blocking poll of Pump.fun's authenticated coin catalogue."""
+        if not self.backfill_auth_token or now - self._last_backfill_poll_at < 60:
+            return
+        if self._backfill_thread and self._backfill_thread.is_alive():
+            return
+        self._last_backfill_poll_at = now
+        self._backfill_thread = threading.Thread(
+            target=self._fetch_recent_launch_page,
+            args=(self._backfill_offset,),
+            daemon=True,
+            name="pumpfun-recent-launch-backfill",
+        )
+        self._backfill_thread.start()
+
+    def _drain_recent_launch_backfill(self, now: float) -> None:
+        """Process completed history results on the bot loop, without blocking on HTTP."""
+        while True:
+            try:
+                result = self._backfill_results.get_nowait()
+            except queue.Empty:
+                return
+
+            error = str(result.get("error") or "")
+            if error:
+                self.stats["backfill_errors"] += 1
+                if now - self._last_backfill_error_log_at >= 60:
+                    logger.warning(
+                        "Recent-launch backfill unavailable (%s); live new-token stream remains active",
+                        error,
+                    )
+                    self._last_backfill_error_log_at = now
+                continue
+
+            offset = int(result.get("offset") or 0)
+            rows = result.get("rows") or []
+            self.stats["backfill_polls"] += 1
+            if not rows:
+                self._backfill_offset = 0
+                self.store.set_state("token_discovery_backfill_offset", "0")
+                continue
+
+            saw_older_than_window = False
+            for row in rows:
+                mint = str(row.get("mint") or row.get("address") or row.get("tokenAddress") or "").strip()
+                if not mint:
+                    continue
+                created_at = self._coin_created_at(row)
+                if created_at is None or created_at > now + 300:
+                    # Do not assign a guessed age to history rows with missing timestamps.
+                    continue
+                age_seconds = now - created_at
+                if age_seconds < 0:
+                    continue
+                if age_seconds > self.max_token_age_seconds:
+                    saw_older_than_window = True
+                    continue
+                # Determine age before checking the local ledger so already-seen older
+                # coins still tell pagination when it has crossed the 24-hour boundary.
+                if self._load(mint):
+                    continue
+
+                creator = str(
+                    row.get("creator") or row.get("user") or row.get("traderPublicKey") or ""
                 )
-                self._last_backfill_error_log_at = now
-            return
+                event = {
+                    "mint": mint,
+                    "name": str(row.get("name") or "")[:80],
+                    "symbol": str(row.get("symbol") or "")[:24],
+                    "traderPublicKey": creator,
+                    "creator": creator,
+                    "_bot_observed_created_at": created_at,
+                    "source": "pumpfun_latest_backfill",
+                }
+                self.stats["backfill_candidates_seen"] += 1
+                # Queue rather than synchronously inspecting several candidates in
+                # one loop. The ordinary queue processor runs at most one on-chain
+                # safety scan per tick and observes its normal scan-rate/watch caps.
+                self._queue_launch_event(
+                    mint, event, "authenticated recent-launch backfill", now
+                )
 
-        self.stats["backfill_polls"] += 1
-        if not rows:
-            self._backfill_offset = 0
-            self.store.set_state("token_discovery_backfill_offset", "0")
-            return
-
-        saw_older_than_window = False
-        for row in rows:
-            mint = str(row.get("mint") or row.get("address") or row.get("tokenAddress") or "").strip()
-            if not mint:
-                continue
-            created_at = self._coin_created_at(row)
-            if created_at is None or created_at > now + 300:
-                # Do not assign a guessed age to history rows with missing timestamps.
-                continue
-            age_seconds = now - created_at
-            if age_seconds < 0:
-                continue
-            if age_seconds > self.max_token_age_seconds:
-                saw_older_than_window = True
-                continue
-            # Determine age before checking the local ledger so already-seen older
-            # coins still tell pagination when it has crossed the 24-hour boundary.
-            if self._load(mint):
-                continue
-            creator = str(
-                row.get("creator") or row.get("user") or row.get("traderPublicKey") or ""
-            )
-            event = {
-                "mint": mint,
-                "name": str(row.get("name") or "")[:80],
-                "symbol": str(row.get("symbol") or "")[:24],
-                "traderPublicKey": creator,
-                "creator": creator,
-                "_bot_observed_created_at": created_at,
-                "source": "pumpfun_latest_backfill",
-            }
-            self.stats["backfill_candidates_seen"] += 1
-            self.on_new_token_event(event)
-
-        # Continue down the newest-first catalogue while it still contains launches
-        # inside the configured age window. Reset once the page reaches older entries.
-        if saw_older_than_window or len(rows) < self.backfill_page_size:
-            next_offset = 0
-        else:
-            next_offset = self._backfill_offset + len(rows)
-            if next_offset > 10000:
+            # Continue down the newest-first catalogue while it still contains launches
+            # inside the configured age window. Reset once the page reaches older entries.
+            if saw_older_than_window or len(rows) < self.backfill_page_size:
                 next_offset = 0
-        self._backfill_offset = next_offset
-        self.store.set_state("token_discovery_backfill_offset", str(next_offset))
+            else:
+                next_offset = offset + len(rows)
+                if next_offset > 10000:
+                    next_offset = 0
+            self._backfill_offset = next_offset
+            self.store.set_state("token_discovery_backfill_offset", str(next_offset))
 
     def _queue_launch_event(self, mint: str, event: dict, reason: str, now: float) -> bool:
         queued = [c for c in self.candidates(1000) if c.get("status") == "queued"]
@@ -1130,7 +1172,8 @@ class TokenDiscoveryShadow:
         if not self.enabled:
             return
         now = time.time()
-        self._poll_recent_launches(now)
+        self._start_recent_launch_backfill(now)
+        self._drain_recent_launch_backfill(now)
         changed = False
         rows = self.candidates(500)
         # Only a bounded number of active tokens are polled. Candidates from the free
