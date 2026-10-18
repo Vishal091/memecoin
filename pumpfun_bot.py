@@ -52,15 +52,19 @@ def loss_exit_hold_remaining_seconds(
     reason: str,
     minimum_hold_seconds: int,
     *,
+    emergency_loss_bypass_pct: float = 0.50,
     now: float | None = None,
 ) -> float:
     """Seconds remaining in the minimum holding period for a loss-making exit."""
     entry_price = float(position.get("entry_price_usd") or 0)
     normalized_reason = str(reason or "").strip().lower()
-    # Hard portfolio-wide liquidation and experiment shutdown override this grace period.
-    if normalized_reason.startswith(("total loss limit", "experiment expiry")):
+    # Portfolio emergencies, experiment shutdown and an explicit human exit override the grace period.
+    if normalized_reason.startswith(("total loss limit", "experiment expiry", "manual exit")):
         return 0.0
     if entry_price <= 0 or mark_price <= 0 or mark_price >= entry_price:
+        return 0.0
+    emergency_threshold = max(0.40, min(0.90, float(emergency_loss_bypass_pct)))
+    if mark_price <= entry_price * (1 - emergency_threshold):
         return 0.0
     try:
         opened_at = datetime.fromisoformat(
@@ -1366,7 +1370,13 @@ class PumpFunBot:
             120, int(getattr(self.s, "min_hold_before_loss_exit_seconds", 120))
         )
         wait_seconds = loss_exit_hold_remaining_seconds(
-            position, mark_price, reason, minimum_hold
+            position,
+            mark_price,
+            reason,
+            minimum_hold,
+            emergency_loss_bypass_pct=float(
+                getattr(self.s, "emergency_loss_bypass_pct", 0.50)
+            ),
         )
         if wait_seconds > 0:
             # Recheck automatic stop conditions each tick instead of freezing a stale
