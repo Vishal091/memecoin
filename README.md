@@ -11,7 +11,7 @@ A local Windows/Python experiment for watching Pump.fun's trader leaderboard and
 - Copies buys and sells from the selected top 10 and keeps watching a leader while a position copied from them remains open. Partial leader sells are approximated proportionally; full exits are attempted when the leader's observed token balance goes to zero.
 - Runs Pump.fun/PumpSwap-only transaction building through PumpPortal's Local Transaction API, signing locally and submitting through your configured RPC.
 - Provides a local dashboard: period selector, top-10 copy button, stop-copy button, position-by-position manual exit, manual exit all, recent trades, and estimated P&L.
-- Tracks positions in a local SQLite ledger; staged take-profits, trailing exits, downside stops, daily pause, total-loss halt, and the seven-day experiment limit are included.
+- Tracks positions in a local SQLite ledger; staged take-profits, trailing exits, downside stops, daily pause, total-loss halt, a three-consecutive-loss daily entry circuit breaker, and the seven-day experiment limit are included. The 2-minute losing-exit grace period has explicit manual-exit and catastrophic-price-drop overrides.
 
 - Optional independent token discovery runs alongside leader copying in **shadow-only mode by default**. Live discovery remains separately opted in, with a $0.50 maximum swap input and at most one open discovery position.
 - Entry filters now enforce at least $5,000 verified real bonding-curve liquidity, a score of 80/100, at least eight unique buyers, creator/top-holder concentration checks, and fresh on-chain rechecks before live entry. Regular leader-copy entries also require indexed market data and the hard $5,000 liquidity floor.
@@ -58,7 +58,7 @@ The console should print a local dashboard URL, normally `http://127.0.0.1:8765`
 
 ### Independent token discovery (shadow by default; live execution separately opt-in)
 
-The scanner is an add-on; it does not replace or change leader-copy entry/exit behavior. To test both in the same run, add these lines to your **local** `.env` (the sample is `.env.pumpfun.example`):
+The scanner is an add-on, but entry gates for both discovery and leader-copy have been tightened. To test discovery alongside leader copying, add these lines to your **local** `.env` (the sample is `.env.pumpfun.example`):
 
 ```text
 TOKEN_DISCOVERY_ENABLED=true
