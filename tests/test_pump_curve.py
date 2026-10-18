@@ -36,6 +36,21 @@ class PumpCurveTests(unittest.TestCase):
         self.assertIsNone(state.price_usd(150.0))
         self.assertEqual(state.liquidity_usd(150.0), 0.0)
 
+    def test_parses_extended_quote_mint_for_sol_quote_validation(self):
+        from pump_curve import PumpCurveSnapshot
+        from native_pump import WRAPPED_SOL_MINT
+        from solders.pubkey import Pubkey
+
+        raw = (
+            self.fixture_data()
+            + bytes(32)  # creator
+            + bytes([0, 0])  # mayhem and cashback flags
+            + bytes(Pubkey.from_string(WRAPPED_SOL_MINT))
+        )
+        state = parse_bonding_curve_data(raw)
+        self.assertIsInstance(state, PumpCurveSnapshot)
+        self.assertEqual(state.quote_mint, WRAPPED_SOL_MINT)
+
     def test_derives_a_deterministic_curve_address(self):
         mint = "7VzWURCfosjxvT7KKM9gib5CzqnCg4vKU2UobGp3pump"
         self.assertEqual(bonding_curve_address(mint), bonding_curve_address(mint))
