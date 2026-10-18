@@ -305,7 +305,7 @@ class TokenDiscoveryShadow:
         if not self.feed:
             return
         now = time.time()
-        rows = self.candidates(500)
+        rows = self.candidates(10000)
         live_position_mints = set()
         if hasattr(self.store, "list_positions"):
             live_position_mints = {
@@ -339,7 +339,7 @@ class TokenDiscoveryShadow:
 
     def _active_watch_count(self, now: float) -> int:
         return sum(
-            1 for c in self.candidates(500)
+            1 for c in self.candidates(10000)
             if c.get("subscribed")
             and float(c.get("subscription_expires_at", 0)) > now
             and c.get("status") in {"watching", "shadow_open"}
@@ -1317,7 +1317,7 @@ class TokenDiscoveryShadow:
         self._drain_recent_launch_backfill(now)
         self._start_recent_launch_backfill(now)
         changed = False
-        rows = self.candidates(500)
+        rows = self.candidates(10000)
         # Only a bounded number of active tokens are polled. Candidates from the free
         # creation stream are capped before any RPC checks; no per-launch RPC storm.
         for c in rows:
