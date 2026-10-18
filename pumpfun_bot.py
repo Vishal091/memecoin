@@ -130,6 +130,26 @@ class PumpFunBot:
         self.leaderboards = {}
         self.selected_window = self.store.get_state("leaderboard_window", self.s.default_leaderboard_window)
         saved_auto = self.store.get_state("auto_copy_enabled", "1" if self.s.auto_copy_on_start else "0")
+        # Migrate old automatic safety-halt flags. Explicit user stop-copy state remains
+        # respected unless it was coupled to one of the old automatic halt latches.
+        legacy_auto_halt = any(
+            self.store.get_state(key, "0") == "1"
+            for key in ("manual_review_halt", "halted", "daily_paused", "experiment_expired")
+        ) or bool(self.store.get_state("consecutive_loss_pause_day", ""))
+        if legacy_auto_halt:
+            self.store.set_state("manual_review_halt", "0")
+            self.store.set_state("halted", "0")
+            self.store.set_state("daily_paused", "0")
+            self.store.set_state("consecutive_loss_pause_day", "")
+            self.store.set_state("experiment_expired", "0")
+            if saved_auto == "0" and self.store.get_state("copy_paused", "0") == "1":
+                # These flags were also written by automatic halt handlers; restore
+                # the prior default running state while leaving normal dashboard stop
+                # controls available afterward.
+                saved_auto = "1"
+                self.store.set_state("auto_copy_enabled", "1")
+                self.store.set_state("copy_paused", "0")
+            logger.warning("Cleared legacy automatic halt flags; diagnostic reason is retained.")
         self.auto_copy_enabled = saved_auto == "1"
         self.active_wallets = set(self.s.watch_wallets)
         self.last_leaderboard_refresh = 0.0
@@ -184,83 +204,46 @@ class PumpFunBot:
             }), default=str))
 
     def _activate_manual_review_halt(self, reason: str, *, append_reason: bool = False) -> None:
-        """Latch a manual-review halt without losing the first actionable diagnosis."""
-        already_halted = self.store.get_state("manual_review_halt", "0") == "1"
-        existing = self.store.get_state("manual_review_reason", "").strip()
+        """Record an operational warning; automatic global entry halts are disabled."""
         incoming = " ".join(str(reason or "").split()).strip()
-        if already_halted and existing:
-            if append_reason and incoming and incoming not in existing:
-                combined = f"{existing}; additionally: {incoming}"
-            else:
-                combined = existing
-                if incoming and incoming not in existing:
-                    logger.warning(
-                        "Preserving existing manual-review reason while recording another issue: %s",
-                        incoming[:240],
-                    )
+        existing = self.store.get_state("manual_review_reason", "").strip()
+        if append_reason and existing and incoming and incoming not in existing:
+            combined = f"{existing}; additionally: {incoming}"
         else:
-            combined = incoming
-        self.store.set_state("manual_review_halt", "1")
+            combined = incoming or existing
+        # Keep the reason for diagnosis, but never latch a global trading halt.
+        self.store.set_state("manual_review_halt", "0")
         self.store.set_state("manual_review_reason", combined)
+        if incoming:
+            logger.error("Operational warning (automatic global halts disabled): %s", incoming[:500])
 
     def _loss_streak_pause_reason(self) -> str:
-        """Pause new entries for the remainder of the UTC day after a loss streak."""
-        today = datetime.now(timezone.utc).date().isoformat()
-        pause_day = self.store.get_state("consecutive_loss_pause_day", "")
-        if pause_day and pause_day != today:
+        """Loss streaks are diagnostic only and never block new entries."""
+        if self.store.get_state("consecutive_loss_pause_day", ""):
             self.store.set_state("consecutive_loss_pause_day", "")
-            self.store.set_state("consecutive_losing_exits", "0")
-            return ""
-        if pause_day == today:
-            try:
-                streak = int(self.store.get_state("consecutive_losing_exits", "0") or 0)
-            except (TypeError, ValueError):
-                streak = 0
-            threshold = max(2, int(getattr(self.s, "max_consecutive_losses", 3)))
-            return (
-                f"Consecutive-loss pause active after {streak} losing exits; "
-                f"new entries blocked until the next UTC day (threshold {threshold})."
-            )
         return ""
 
     def _record_realized_exit_risk(self, realized_pnl: float) -> None:
-        """Update the persisted loss streak after each confirmed sell."""
-        # This also clears a pause that belonged to a previous UTC day.
-        # Once today's pause is latched, later exits must not rewrite its displayed count.
-        if self._loss_streak_pause_reason():
-            return
+        """Track losing exits for diagnostics without pausing the bot."""
         try:
             streak = int(self.store.get_state("consecutive_losing_exits", "0") or 0)
         except (TypeError, ValueError):
             streak = 0
         streak = streak + 1 if float(realized_pnl) <= 0 else 0
         self.store.set_state("consecutive_losing_exits", str(streak))
+        self.store.set_state("consecutive_loss_pause_day", "")
         threshold = max(2, int(getattr(self.s, "max_consecutive_losses", 3)))
         today = datetime.now(timezone.utc).date().isoformat()
-        pause_day = self.store.get_state("consecutive_loss_pause_day", "")
-        if streak >= threshold and pause_day != today:
-            self.store.set_state("consecutive_loss_pause_day", today)
-            logger.error(
-                "Consecutive-loss circuit breaker activated after %d exits with non-positive realized P&L; "
-                "new entries paused until the next UTC day",
-                streak,
+        if streak >= threshold and self.store.get_state("consecutive_loss_warning_day", "") != today:
+            self.store.set_state("consecutive_loss_warning_day", today)
+            logger.warning(
+                "Consecutive losing exits reached %d (threshold %d); recording warning only, "
+                "automatic entry pauses are disabled",
+                streak, threshold,
             )
 
     def _copy_block_reason(self) -> str:
-        """Explain durable safety gates that must be cleared before new copy entries."""
-        if self.store.get_state("halted", "0") == "1":
-            return "Overall loss halt active: " + self.store.get_state("halt_reason", "reconcile the account before resuming")
-        if self.store.get_state("manual_review_halt", "0") == "1":
-            return "Manual-review halt active: " + self.store.get_state(
-                "manual_review_reason", "reconcile wallet and transactions before resuming"
-            )
-        if self.store.get_state("experiment_expired", "0") == "1":
-            return "The seven-day experiment has expired."
-        if self.store.get_state("daily_paused", "0") == "1":
-            return "Daily loss pause is active until the UTC day resets."
-        streak_reason = self._loss_streak_pause_reason()
-        if streak_reason:
-            return streak_reason
+        """Legacy global halt flags are diagnostics only; they do not block entries."""
         return ""
 
     def _refresh_feed_subscriptions(self) -> None:
@@ -933,39 +916,35 @@ class PumpFunBot:
         logger.warning("Recorded live starting equity baseline %.4f USD", value)
 
     def _refresh_risk_state(self, equity: float):
+        """Report configured loss thresholds without globally halting entries or forcing liquidation."""
         self.store.reset_day_if_needed(equity)
-        if self.store.get_state("halted", "0") == "1":
-            return
         initial = float(self.store.get_state("initial_equity", str(self.s.starting_paper_cash_usd)))
         total_loss = initial - equity
+        today = datetime.now(timezone.utc).date().isoformat()
         if total_loss >= self.s.total_loss_limit_usd:
-            self.store.set_state("halted", "1")
-            self.store.set_state("liquidate_all_pending", "1")
-            self.store.set_state("halt_reason", f"Total loss limit reached: drawdown {total_loss:.2f} USD")
-            logger.critical("%s; new entries blocked and liquidation will be attempted", self.store.get_state("halt_reason"))
-            return
+            if self.store.get_state("total_loss_warning_day", "") != today:
+                self.store.set_state("total_loss_warning_day", today)
+                logger.warning(
+                    "Configured total-loss threshold reached (drawdown %.2f USD); "
+                    "automatic global halts and forced liquidation are disabled",
+                    total_loss,
+                )
         daily_loss = float(self.store.get_state("day_start_equity", str(equity))) - equity
-        if daily_loss >= self.s.daily_loss_limit_usd and self.store.get_state("daily_paused", "0") != "1":
-            self.store.set_state("daily_paused", "1")
-            logger.error("Daily drawdown limit reached (%.2f USD); entries paused until next UTC day", daily_loss)
+        if daily_loss >= self.s.daily_loss_limit_usd:
+            if self.store.get_state("daily_loss_warning_day", "") != today:
+                self.store.set_state("daily_loss_warning_day", today)
+                logger.warning(
+                    "Configured daily-loss threshold reached (%.2f USD); "
+                    "recording warning only, automatic entry pauses are disabled",
+                    daily_loss,
+                )
 
     def _can_enter(
         self, equity: float, *, strategy: str = "leader_copy",
         entry_cap_usd: float | None = None,
     ) -> tuple[bool, str]:
-        if self.store.get_state("experiment_expired", "0") == "1":
-            return False, "Seven-day experiment is over"
         if strategy != "token_discovery" and self.store.get_state("copy_paused", "0") == "1":
             return False, "Copying is paused from the dashboard"
-        if self.store.get_state("manual_review_halt", "0") == "1":
-            return False, "Manual review halt active: " + self.store.get_state("manual_review_reason", "")
-        if self.store.get_state("halted", "0") == "1":
-            return False, "Overall loss halt active: " + self.store.get_state("halt_reason")
-        if self.store.get_state("daily_paused", "0") == "1":
-            return False, "Daily loss pause active"
-        streak_reason = self._loss_streak_pause_reason()
-        if streak_reason:
-            return False, streak_reason
         if self.store.daily_entries() >= self.s.max_entries_per_day:
             return False, "Daily entry cap reached"
         if len(self.store.list_positions()) >= self.s.max_open_positions:
@@ -1102,12 +1081,9 @@ class PumpFunBot:
             f"signature {exc.signature}; reconcile wallet/transaction before resuming",
             append_reason=True,
         )
-        self.auto_copy_enabled = False
-        self.store.set_state("auto_copy_enabled", "0")
-        self.store.set_state("copy_paused", "1")
-
-        # Consume the triggering leader event so clearing the halt later cannot
-        # replay the same stale signal. poll_wallet also advances its cursor.
+        # Do not pause unrelated mints or disable the whole bot. The unresolved
+        # trade record above continues to block duplicate submissions for this mint.
+        # Consume the triggering leader event so it cannot be replayed as a stale signal.
         if source_wallet and source_signature:
             self.store.mark_signature_seen(
                 self._dedupe_key(source_wallet, source_signature), source_wallet
@@ -2169,7 +2145,7 @@ class PumpFunBot:
 
     def status(self):
         equity = self.equity()
-        logger.warning("MODE=%s wallet=%s equity=%.4f USD initial=%.4f halted=%s reason=%s",
+        logger.warning("MODE=%s wallet=%s equity=%.4f USD initial=%.4f automatic_global_halts=disabled legacy_halt_state=%s reason=%s",
                        self.s.mode, self.wallet_address or "(paper)", equity,
                        float(self.store.get_state("initial_equity", "10")),
                        self.store.get_state("halted", "0"), self.store.get_state("halt_reason", ""))
@@ -2205,12 +2181,8 @@ class PumpFunBot:
                 logger.error("RPC fallback monitor failed for %s: %s", wallet[:8], exc)
                 if self.s.mode == "live":
                     self._activate_manual_review_halt(
-                        f"RPC wallet monitoring error for {wallet}; reconcile transactions before resuming"
+                        f"RPC wallet monitoring error for {wallet}; polling will retry without a global halt"
                     )
-                    self.auto_copy_enabled = False
-                    self.store.set_state("auto_copy_enabled", "0")
-                    self.store.set_state("copy_paused", "1")
-                    self._refresh_feed_subscriptions()
 
     def run(self, once=False):
         logger.warning("Pump.fun bot mode=%s; automatic leaderboard discovery=%s",
@@ -2281,56 +2253,34 @@ class PumpFunBot:
                             expired = False
                     if expired and self.store.get_state("experiment_expired", "0") != "1":
                         self.store.set_state("experiment_expired", "1")
-                        self.auto_copy_enabled = False
-                        self.store.set_state("auto_copy_enabled", "0")
-                        self.store.set_state("copy_paused", "1")
-                        self._refresh_feed_subscriptions()
-                        logger.warning("Seven-day experiment expired; new entries disabled.")
-                    if expired:
-                        for pos in self.store.list_positions():
-                            self.store.set_state(f"exit_pending:{pos['mint']}", "experiment expiry liquidation")
+                        logger.warning(
+                            "Configured experiment duration elapsed; automatic entry halt and "
+                            "experiment-expiry liquidation are disabled."
+                        )
 
                     if now >= next_position_check:
                         self.manage_positions()
                         equity = self.equity()
                         self.last_equity_usd = equity
                         self._refresh_risk_state(equity)
-                        if self.store.get_state("halted", "0") == "1":
-                            self.auto_copy_enabled = False
-                            self.store.set_state("auto_copy_enabled", "0")
-                            self.store.set_state("copy_paused", "1")
-                            self._refresh_feed_subscriptions()
-                            for pos in self.store.list_positions():
-                                self.store.set_state(f"exit_pending:{pos['mint']}", "total loss limit liquidation")
-                            self.manage_positions()
                         self._refresh_feed_subscriptions()
                         self._publish_dashboard_state(equity)
                         open_count = len(self.store.list_positions())
                         logger.info("Heartbeat equity=%.4f positions=%d auto_copy=%s active_wallets=%d",
                                     equity, open_count, self.auto_copy_enabled, len(self.active_wallets))
-                        if expired and open_count == 0:
-                            logger.warning("Seven-day experiment finished; no tracked positions remain.")
-                            break
                         next_position_check = now + 1.5
 
                     self._publish_dashboard_state(self.last_equity_usd)
                 except KeyboardInterrupt:
                     logger.warning("Stopped by user.")
                     break
-                except Exception:
-                    logger.exception("Loop error; inspect logs before re-arming after any ambiguous transaction")
+                except Exception as exc:
+                    logger.exception("Loop error; this cycle failed; next cycle will retry")
                     if self.s.mode == "live":
                         self._activate_manual_review_halt(
-                            "Runtime exception; reconcile wallet and transactions before resuming"
+                            f"Runtime exception: {exc}; logged for diagnosis without a global entry halt"
                         )
-                        self.auto_copy_enabled = False
-                        self.store.set_state("auto_copy_enabled", "0")
-                        self.store.set_state("copy_paused", "1")
-                        try:
-                            self._refresh_feed_subscriptions()
-                        except Exception:
-                            logger.exception("Could not refresh subscriptions after entering manual-review halt")
-                    self.message = "Runtime error; inspect console. Live entries are halted pending reconciliation."
+                    self.message = "Runtime error logged; the main loop will retry and automatic global halts are disabled."
                     # The normal refresh at the bottom of the loop is skipped when
                     # manage_positions() or another step raises. Publish directly from
                     # the ledger so confirmed buys do not remain invisible in the UI.
