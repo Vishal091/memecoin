@@ -137,6 +137,26 @@ class PumpFunBot:
                 "equity_usd": None,
             }), default=str))
 
+    def _activate_manual_review_halt(self, reason: str, *, append_reason: bool = False) -> None:
+        """Latch a manual-review halt without losing the first actionable diagnosis."""
+        already_halted = self.store.get_state("manual_review_halt", "0") == "1"
+        existing = self.store.get_state("manual_review_reason", "").strip()
+        incoming = " ".join(str(reason or "").split()).strip()
+        if already_halted and existing:
+            if append_reason and incoming and incoming not in existing:
+                combined = f"{existing}; additionally: {incoming}"
+            else:
+                combined = existing
+                if incoming and incoming not in existing:
+                    logger.warning(
+                        "Preserving existing manual-review reason while recording another issue: %s",
+                        incoming[:240],
+                    )
+        else:
+            combined = incoming
+        self.store.set_state("manual_review_halt", "1")
+        self.store.set_state("manual_review_reason", combined)
+
     def _copy_block_reason(self) -> str:
         """Explain durable safety gates that must be cleared before new copy entries."""
         if self.store.get_state("halted", "0") == "1":
@@ -829,11 +849,10 @@ class PumpFunBot:
             f"unresolved_trade:{exc.mint}",
             json.dumps(record, sort_keys=True, separators=(",", ":")),
         )
-        self.store.set_state("manual_review_halt", "1")
-        self.store.set_state(
-            "manual_review_reason",
+        self._activate_manual_review_halt(
             f"{exc.action.upper()} outcome unresolved for mint {exc.mint}; "
             f"signature {exc.signature}; reconcile wallet/transaction before resuming",
+            append_reason=True,
         )
         self.auto_copy_enabled = False
         self.store.set_state("auto_copy_enabled", "0")
@@ -1288,10 +1307,8 @@ class PumpFunBot:
             except Exception as exc:
                 logger.error("RPC fallback monitor failed for %s: %s", wallet[:8], exc)
                 if self.s.mode == "live":
-                    self.store.set_state("manual_review_halt", "1")
-                    self.store.set_state(
-                        "manual_review_reason",
-                        f"RPC wallet monitoring error for {wallet}; reconcile transactions before resuming",
+                    self._activate_manual_review_halt(
+                        f"RPC wallet monitoring error for {wallet}; reconcile transactions before resuming"
                     )
                     self.auto_copy_enabled = False
                     self.store.set_state("auto_copy_enabled", "0")
@@ -1404,10 +1421,8 @@ class PumpFunBot:
                 except Exception:
                     logger.exception("Loop error; inspect logs before re-arming after any ambiguous transaction")
                     if self.s.mode == "live":
-                        self.store.set_state("manual_review_halt", "1")
-                        self.store.set_state(
-                            "manual_review_reason",
-                            "Runtime exception; reconcile wallet and transactions before resuming",
+                        self._activate_manual_review_halt(
+                            "Runtime exception; reconcile wallet and transactions before resuming"
                         )
                         self.auto_copy_enabled = False
                         self.store.set_state("auto_copy_enabled", "0")
