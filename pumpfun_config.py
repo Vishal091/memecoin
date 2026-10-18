@@ -79,6 +79,7 @@ class PumpFunSettings:
     token_discovery_min_score: int
     token_discovery_min_unique_buyers: int
     token_discovery_shadow_window_seconds: int
+    token_discovery_max_token_age_hours: int
     database_path: Path
     log_level: str
 
@@ -99,7 +100,7 @@ class PumpFunSettings:
             dashboard_port=max(1024, min(65535, _int("DASHBOARD_PORT", 8765))),
             auto_copy_on_start=os.getenv("AUTO_COPY_ON_START", "true").strip().lower() in {"1", "true", "yes", "on"},
             stream_token_prices=os.getenv("PUMPPORTAL_STREAM_TOKEN_PRICES", "false").strip().lower() in {"1", "true", "yes", "on"},
-            allow_unindexed_pump_curve=os.getenv("ALLOW_UNINDEXED_PUMP_CURVE", "true").strip().lower() in {"1", "true", "yes", "on"},
+            allow_unindexed_pump_curve=os.getenv("ALLOW_UNINDEXED_PUMP_CURVE", "false").strip().lower() in {"1", "true", "yes", "on"},
             default_leaderboard_window=os.getenv("DEFAULT_LEADERBOARD_WINDOW", "day").strip().lower(),
             rpc_url=os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip(),
             solana_logs_ws_enabled=os.getenv("SOLANA_LOGS_WS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
@@ -112,8 +113,8 @@ class PumpFunSettings:
             total_loss_limit_usd=_float("TOTAL_LOSS_LIMIT_USD", 3.0),
             min_sol_reserve=_float("MIN_SOL_RESERVE", 0.008),
             starting_paper_cash_usd=_float("STARTING_PAPER_CASH_USD", 10.0),
-            min_liquidity_usd=_float("MIN_LIQUIDITY_USD", 1000.0),
-            min_pair_age_seconds=_int("MIN_PAIR_AGE_SECONDS", 10),
+            min_liquidity_usd=max(5000.0, _float("MIN_LIQUIDITY_USD", 5000.0)),
+            min_pair_age_seconds=max(90, _int("MIN_PAIR_AGE_SECONDS", 90)),
             slippage_bps=_int("SLIPPAGE_BPS", 300),
             max_marked_loss_pct=_float("MAX_MARKED_LOSS_PCT", 0.25),
             # Loss exits are held for at least two minutes; local configuration may only increase this.
@@ -137,10 +138,13 @@ class PumpFunSettings:
             token_discovery_watch_seconds=max(30, min(600, _int("TOKEN_DISCOVERY_WATCH_SECONDS", 180))),
             token_discovery_max_launches_per_minute=max(1, min(60, _int("TOKEN_DISCOVERY_MAX_LAUNCHES_PER_MINUTE", 12))),
             # This live-trial floor cannot be lowered below $1,000 by local config.
-            token_discovery_min_liquidity_usd=max(1000.0, _float("TOKEN_DISCOVERY_MIN_LIQUIDITY_USD", 1000.0)),
-            token_discovery_min_score=max(0, min(100, _int("TOKEN_DISCOVERY_MIN_SCORE", 75))),
-            token_discovery_min_unique_buyers=max(2, min(100, _int("TOKEN_DISCOVERY_MIN_UNIQUE_BUYERS", 5))),
+            # Conservative discovery floors cannot be lowered by local config.
+            token_discovery_min_liquidity_usd=max(5000.0, _float("TOKEN_DISCOVERY_MIN_LIQUIDITY_USD", 5000.0)),
+            token_discovery_min_score=max(80, min(100, _int("TOKEN_DISCOVERY_MIN_SCORE", 80))),
+            token_discovery_min_unique_buyers=max(8, min(100, _int("TOKEN_DISCOVERY_MIN_UNIQUE_BUYERS", 8))),
             token_discovery_shadow_window_seconds=max(60, min(3600, _int("TOKEN_DISCOVERY_SHADOW_WINDOW_SECONDS", 900))),
+            # The scanner only queues launches observed inside this rolling age limit; never allow >24h.
+            token_discovery_max_token_age_hours=max(1, min(24, _int("TOKEN_DISCOVERY_MAX_TOKEN_AGE_HOURS", 24))),
             database_path=Path(os.getenv("DATABASE_PATH", "memecoin-pumpfun.db")),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )
