@@ -529,14 +529,49 @@ class PumpFunBot:
                 if not position:
                     self.message = "No tracked open position exists for that mint."
                     continue
-                self.store.set_state(f"exit_pending:{mint}", "manual exit requested from dashboard")
-                self.message = f"Manual exit queued for {mint}; attempting on the next bot cycle."
+                # A human full-exit request overrides a deferred partial leader sell.
+                # Clear its amount/source metadata so we liquidate the remaining
+                # tracked balance, not just the earlier partial-sell quantity.
+                reason = "manual exit requested from dashboard"
+                self.store.set_state(f"exit_pending:{mint}", reason)
+                self.store.set_state(f"exit_pending_amount_raw:{mint}", "")
+                self.store.set_state(f"exit_pending_source_wallet:{mint}", "")
+                self.store.set_state(f"exit_pending_source_signature:{mint}", "")
+                # A previous pre-submission builder failure must not suppress the
+                # fresh, explicit manual attempt. If it fails again, sell() will
+                # install a new cooldown, preventing a tight retry loop.
+                self.store.set_state(f"native_build_retry_after:{mint}", "")
+                unresolved = self.store.get_state(f"unresolved_trade:{mint}", "")
+                if unresolved:
+                    self.message = (
+                        f"Manual full exit queued for {mint}, but submission is blocked until "
+                        "the earlier transaction outcome is reconciled."
+                    )
+                else:
+                    self.message = (
+                        f"Manual full exit queued for {mint}; attempting on the next bot cycle."
+                    )
                 logger.warning("%s", self.message)
             elif action == "exit_all":
                 positions = self.store.list_positions()
+                unresolved_count = 0
                 for position in positions:
-                    self.store.set_state(f"exit_pending:{position['mint']}", "manual exit all requested from dashboard")
+                    mint = str(position["mint"])
+                    self.store.set_state(
+                        f"exit_pending:{mint}", "manual exit all requested from dashboard"
+                    )
+                    self.store.set_state(f"exit_pending_amount_raw:{mint}", "")
+                    self.store.set_state(f"exit_pending_source_wallet:{mint}", "")
+                    self.store.set_state(f"exit_pending_source_signature:{mint}", "")
+                    self.store.set_state(f"native_build_retry_after:{mint}", "")
+                    if self.store.get_state(f"unresolved_trade:{mint}", ""):
+                        unresolved_count += 1
                 self.message = f"Manual exit-all queued for {len(positions)} tracked position(s)."
+                if unresolved_count:
+                    self.message += (
+                        f" {unresolved_count} position(s) cannot submit a new sell until "
+                        "their earlier transaction outcome(s) are reconciled."
+                    )
                 logger.warning("%s", self.message)
 
     def _event_price_usd(self, event: dict) -> float | None:
@@ -1326,24 +1361,46 @@ class PumpFunBot:
 
     def sell(self, mint: str, amount_raw: int, reason: str,
              source_wallet: str | None = None, source_signature: str | None = None) -> bool:
-        if self.store.get_state(f"unresolved_trade:{mint}", ""):
-            logger.debug(
-                "Skipping sell retry for %s because an earlier transaction outcome remains unresolved",
-                mint[:8],
-            )
-            return False
-        position = self.store.get_position(mint)
-        if not position:
-            return False
-        if self._native_build_retry_deferred(mint):
-            logger.debug("Sell builder for mint=%s is in pre-submission cooldown", mint[:8])
-            return False
-        # Position management wraps a persisted exit reason for dispatch. Unwrap
-        # repeated wrappers before storing/logging it again so failed retries do not
-        # accumulate "pending exit: pending exit: ..." indefinitely.
+        # Unwrap first so dashboard-originated manual exits remain identifiable
+        # even when position management dispatches them as "pending exit: ...".
         was_pending_exit = reason.startswith("pending exit:")
         while reason.startswith("pending exit:"):
             reason = reason[len("pending exit:"):].strip()
+        manual_exit = reason.lower().startswith("manual exit")
+
+        if self.store.get_state(f"unresolved_trade:{mint}", ""):
+            if manual_exit:
+                self.message = (
+                    f"Manual exit for {mint[:8]} is queued but blocked: an earlier transaction "
+                    "outcome is unresolved. Reconcile it before another sell; no transaction submitted."
+                )
+                logger.warning("%s", self.message)
+            else:
+                logger.debug(
+                    "Skipping sell retry for %s because an earlier transaction outcome remains unresolved",
+                    mint[:8],
+                )
+            return False
+        position = self.store.get_position(mint)
+        if not position:
+            if manual_exit:
+                self.message = f"Manual exit for {mint[:8]} stopped: no tracked open position remains."
+            return False
+        if self._native_build_retry_deferred(mint):
+            if manual_exit:
+                try:
+                    retry_at = float(self.store.get_state(f"native_build_retry_after:{mint}", "0") or 0)
+                except (TypeError, ValueError):
+                    retry_at = time.time()
+                remaining = max(0, int(retry_at - time.time()))
+                last_failure = str(self.store.get_state(f"native_build_failure:{mint}", "") or "")
+                detail = f" Last builder error: {last_failure[:180]}" if last_failure else ""
+                self.message = (
+                    f"Manual exit for {mint[:8]} remains pending; retry cooldown {remaining}s, "
+                    f"no transaction submitted.{detail}"
+                )
+            logger.debug("Sell builder for mint=%s is in pre-submission cooldown", mint[:8])
+            return False
         full_exit = (was_pending_exit or reason in {"marked loss stop", "trailing stop"} or
                      reason.startswith("followed wallet ") or reason.startswith("experiment expiry") or
                      reason.startswith("total loss limit"))
@@ -1371,7 +1428,23 @@ class PumpFunBot:
         decimals = int(position["decimals"])
         market = self.market.token_market(mint)
         mark_price = float(market["price_usd"]) if market else float(position["last_price_usd"])
+        if mark_price <= 0 and manual_exit:
+            # A manual live exit does not need a live quote to submit a sell: the
+            # confirmed SOL proceeds determine realized P&L. Use the best stored
+            # price only for bookkeeping if the market-data quote is unavailable.
+            try:
+                mark_price = max(
+                    0.0,
+                    float(position.get("last_price_usd") or position.get("entry_price_usd") or 0.0),
+                )
+            except (TypeError, ValueError):
+                mark_price = 0.0
         if mark_price <= 0:
+            if manual_exit:
+                self.message = (
+                    f"Manual exit for {mint[:8]} not submitted: no usable stored or current price "
+                    "is available to value this sale."
+                )
             return False
 
         minimum_hold = max(
@@ -1420,6 +1493,11 @@ class PumpFunBot:
             available = self.executor.token_balance_raw(self.wallet_address, mint)
             requested_raw = min(requested_raw, available)
             if requested_raw <= 0:
+                if manual_exit:
+                    self.message = (
+                        f"Manual exit for {mint[:8]} could not submit: wallet token balance is zero "
+                        "or unavailable; tracked position retained for reconciliation."
+                    )
                 logger.error("No live token balance for %s; retaining position for manual reconciliation", mint)
                 return False
             units_requested = raw_to_units(requested_raw, decimals)
@@ -1447,11 +1525,17 @@ class PumpFunBot:
                 )
                 return False
             except TransactionBuildFailed as exc:
-                delay = self._defer_native_build_retry(mint, str(exc))
+                detail = " ".join(str(exc).split())[:220]
+                delay = self._defer_native_build_retry(mint, detail)
+                if manual_exit:
+                    self.message = (
+                        f"Manual exit for {mint[:8]} was not submitted: builder failed before signing; "
+                        f"retry deferred {delay}s. {detail}"
+                    )
                 logger.error(
                     "Could not build sell for %s; no transaction was signed or submitted. "
                     "Tracked position and pending exit are retained; retry deferred %ds: %s",
-                    mint[:8], delay, " ".join(str(exc).split())[:220],
+                    mint[:8], delay, detail,
                 )
                 return False
             tx_sig = result["signature"]
