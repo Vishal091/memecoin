@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from market_data import MarketData, WSOL_MINT
 from pumpfun_bot import PumpFunBot, native_build_retry_delay_seconds
-from native_pump import TransactionBuildFailed
+from native_pump import TransactionBuildFailed, TransactionOutcomeUncertain
 from solana_rpc import SolanaRPC
 from storage import Store
 
@@ -316,6 +316,119 @@ class StorageTests(unittest.TestCase):
             store.reset_day_if_needed(10)
             self.assertEqual(store.get_state("daily_paused"), "0")
             store.close()
+
+
+
+class TransactionOutcomeHandlingTests(unittest.TestCase):
+    class FakeStore:
+        def __init__(self):
+            self.state = {
+                "auto_copy_enabled": "1",
+                "copy_paused": "0",
+                "manual_review_halt": "0",
+            }
+            self.positions = []
+            self.seen = []
+
+        def get_state(self, key, default=""):
+            return self.state.get(key, default)
+
+        def set_state(self, key, value):
+            self.state[key] = str(value)
+
+        def list_positions(self):
+            return list(self.positions)
+
+        def mark_signature_seen(self, signature, wallet):
+            self.seen.append((signature, wallet))
+
+        def get_position(self, mint):
+            return next((p for p in self.positions if p.get("mint") == mint), None)
+
+    def _bot(self):
+        bot = object.__new__(PumpFunBot)
+        bot.store = self.FakeStore()
+        bot.s = SimpleNamespace(
+            watch_wallets=(),
+            top_traders_count=10,
+            stream_token_prices=False,
+        )
+        bot.auto_copy_enabled = True
+        bot.active_wallets = {"leader-wallet"}
+        bot.leaderboards = {}
+        bot.selected_window = "day"
+        bot.feed = None
+        bot.logs_feed = None
+        return bot
+
+    def test_uncertain_buy_halts_copy_records_signature_and_consumes_source_signal(self):
+        import json
+        bot = self._bot()
+        exc = TransactionOutcomeUncertain(
+            "submitted-signature", "buy", "test-mint", "confirmation timeout"
+        )
+
+        bot._handle_uncertain_trade(
+            exc,
+            source_wallet="leader-wallet",
+            source_signature="leader-signature",
+        )
+
+        self.assertEqual(bot.store.get_state("manual_review_halt"), "1")
+        self.assertEqual(bot.store.get_state("auto_copy_enabled"), "0")
+        self.assertEqual(bot.store.get_state("copy_paused"), "1")
+        self.assertIn("submitted-signature", bot.store.get_state("manual_review_reason"))
+        record = json.loads(bot.store.get_state("unresolved_trade:test-mint"))
+        self.assertEqual(record["signature"], "submitted-signature")
+        self.assertEqual(record["action"], "buy")
+        self.assertEqual(
+            bot.store.seen,
+            [("leader-wallet|leader-signature", "leader-wallet")],
+        )
+        self.assertEqual(bot.active_wallets, set())
+
+    def test_buy_will_not_retry_mint_with_unresolved_outcome(self):
+        bot = self._bot()
+        bot.store.set_state(
+            "unresolved_trade:test-mint", '{"signature":"submitted-signature"}'
+        )
+        self.assertIsNone(bot.buy({"mint": "test-mint"}))
+
+    def test_sell_will_not_retry_mint_with_unresolved_outcome(self):
+        bot = self._bot()
+        bot.store.set_state(
+            "unresolved_trade:test-mint", '{"signature":"submitted-signature"}'
+        )
+        self.assertFalse(bot.sell("test-mint", 1000, "pending exit: test"))
+
+
+class NativeSendConfirmationTests(unittest.TestCase):
+    def test_lost_send_response_raises_uncertain_outcome_with_local_signature(self):
+        from native_pump import NativePumpExecutor
+
+        signature = "test-deterministic-signature"
+
+        class FakeTransaction:
+            signatures = [signature]
+
+            def __bytes__(self):
+                return b"test-signed-transaction"
+
+        class FakeRPC:
+            def call(self, method, params):
+                if method == "sendTransaction":
+                    raise TimeoutError("network timed out")
+                raise AssertionError("status polling should not begin")
+
+        executor = object.__new__(NativePumpExecutor)
+        executor.rpc = FakeRPC()
+
+        with self.assertRaises(TransactionOutcomeUncertain) as raised:
+            executor._send_confirm(FakeTransaction(), action="buy", mint="test-mint")
+
+        self.assertEqual(raised.exception.signature, signature)
+        self.assertEqual(raised.exception.action, "buy")
+        self.assertEqual(raised.exception.mint, "test-mint")
 
 
 if __name__ == "__main__":
