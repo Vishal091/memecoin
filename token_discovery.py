@@ -89,10 +89,13 @@ class TokenDiscoveryShadow:
         self.max_watched = max(1, int(getattr(settings, "token_discovery_max_watched_tokens", 5)))
         self.watch_seconds = max(30, int(getattr(settings, "token_discovery_watch_seconds", 180)))
         self.max_scans_per_minute = max(1, int(getattr(settings, "token_discovery_max_launches_per_minute", 12)))
-        self.min_liquidity_usd = float(getattr(settings, "token_discovery_min_liquidity_usd", 1000.0))
-        self.min_score = max(0, min(100, int(getattr(settings, "token_discovery_min_score", 75))))
-        self.min_unique_buyers = max(2, int(getattr(settings, "token_discovery_min_unique_buyers", 5)))
+        self.min_liquidity_usd = max(5000.0, float(getattr(settings, "token_discovery_min_liquidity_usd", 5000.0)))
+        self.min_score = max(80, min(100, int(getattr(settings, "token_discovery_min_score", 80))))
+        self.min_unique_buyers = max(8, int(getattr(settings, "token_discovery_min_unique_buyers", 8)))
         self.shadow_window_seconds = max(60, int(getattr(settings, "token_discovery_shadow_window_seconds", 900)))
+        self.max_token_age_hours = max(1, min(24, int(getattr(settings, "token_discovery_max_token_age_hours", 24))))
+        self.max_token_age_seconds = self.max_token_age_hours * 3600
+        self.max_queue_size = 100
         self._recent_scans: deque[float] = deque()
         self._last_chain_check: dict[str, float] = {}
         self._last_skip_log_at = 0.0
@@ -104,6 +107,10 @@ class TokenDiscoveryShadow:
             "liquidity_rejected": 0,
             "capacity_skips": 0,
             "rate_limit_skips": 0,
+            "queued_launches": 0,
+            "queue_processed": 0,
+            "queue_expired": 0,
+            "queue_dropped": 0,
             "shadow_entries": 0,
             "last_launch_at": 0.0,
             "last_would_buy_at": 0.0,
@@ -203,7 +210,30 @@ class TokenDiscoveryShadow:
         return candidates[:limit]
 
     def dashboard_snapshot(self) -> dict:
-        rows = self.candidates(200)
+        rows = self.candidates(300)
+        now = time.time()
+        queued = sum(1 for c in rows if c.get("status") == "queued")
+        safety_passed = sum(1 for c in rows if c.get("security_passed") is True)
+        qualified = sum(1 for c in rows if c.get("would_buy"))
+        attempted_states = {
+            "submitting", "opened", "closed", "failed", "blocked",
+            "retryable", "uncertain", "needs_reconciliation", "skipped_stale",
+        }
+        live_attempted = sum(1 for c in rows if c.get("live_entry_status") in attempted_states)
+        live_confirmed = sum(
+            1 for c in rows
+            if c.get("live_entry_status") in {"opened", "closed"}
+            or c.get("live_entry_confirmed") is True
+        )
+        live_failed = sum(
+            1 for c in rows
+            if c.get("live_entry_status") in {"failed", "blocked", "skipped_stale"}
+        )
+        unfilled_peak_20 = sum(
+            1 for c in rows
+            if float(c.get("max_return_pct") or 0) >= 20.0
+            and c.get("live_entry_status") not in {"opened", "closed"}
+        )
         return {
             "enabled": self.enabled,
             "live_enabled": self.live_enabled,
@@ -215,15 +245,30 @@ class TokenDiscoveryShadow:
             "liquidity_rejected": self.stats["liquidity_rejected"],
             "capacity_skips": self.stats["capacity_skips"],
             "rate_limit_skips": self.stats["rate_limit_skips"],
+            "queued_launches": self.stats["queued_launches"],
+            "queue_processed": self.stats["queue_processed"],
+            "queue_expired": self.stats["queue_expired"],
+            "queue_dropped": self.stats["queue_dropped"],
+            "queue_count": queued,
+            "queue_limit": self.max_queue_size,
+            "max_token_age_hours": self.max_token_age_hours,
+            "tracked_candidates": len(rows),
+            "safety_passed_count": safety_passed,
+            "qualified_count": qualified,
+            "live_attempted_count": live_attempted,
+            "live_confirmed_count": live_confirmed,
+            "live_failed_count": live_failed,
+            "unfilled_peak_20_count": unfilled_peak_20,
             "shadow_entries": sum(1 for c in rows if c.get("shadow_entry_price_usd")),
             "active_watch_count": sum(
                 1 for c in rows
-                if c.get("subscribed") and float(c.get("subscription_expires_at", 0)) > time.time()
+                if c.get("subscribed") and float(c.get("subscription_expires_at", 0)) > now
             ),
-            "candidates": rows[:25],
+            "candidates": rows[:50],
             "max_watched_tokens": self.max_watched,
             "min_liquidity_usd": self.min_liquidity_usd,
             "min_score": self.min_score,
+            "min_unique_buyers": self.min_unique_buyers,
         }
 
     def _update_feed_subscriptions(self) -> None:
@@ -276,7 +321,7 @@ class TokenDiscoveryShadow:
             "name": str(event.get("name") or "")[:80],
             "symbol": str(event.get("symbol") or "")[:24],
             "creator": str(event.get("traderPublicKey") or event.get("creator") or "")[:64],
-            "created_at": time.time(),
+            "created_at": float(event.get("_bot_observed_created_at") or time.time()),
             "status": status,
             "reason": reason,
             "security_passed": False,
@@ -290,48 +335,52 @@ class TokenDiscoveryShadow:
             "subscribed": False,
         })
 
-    def on_new_token_event(self, event: dict) -> None:
-        if not self.enabled:
-            return
-        mint = str(event.get("mint") or "").strip()
-        if not mint:
-            return
-        self.stats["launch_events"] += 1
-        self.stats["last_launch_at"] = time.time()
-        if self._load(mint):
-            return
-        try:
-            Pubkey.from_string(mint)
-        except Exception:
-            self.stats["safety_rejected"] += 1
-            self._record_skipped(mint, event, "rejected", "Invalid mint address")
-            return
+    def _queue_launch_event(self, mint: str, event: dict, reason: str, now: float) -> bool:
+        queued = [c for c in self.candidates(1000) if c.get("status") == "queued"]
+        if len(queued) >= self.max_queue_size:
+            self.stats["queue_dropped"] += 1
+            logger.warning(
+                "Opportunity queue full (%d); dropping unscanned launch %s",
+                self.max_queue_size, mint[:8],
+            )
+            return False
+        creator = str(event.get("traderPublicKey") or event.get("creator") or "")[:64]
+        # PumpPortal's new-token stream is a launch-event stream. Store when this
+        # bot observed that event so persisted queue entries can be age-limited across restarts.
+        observed_at = float(event.get("_bot_observed_created_at") or now)
+        safe_event = {
+            "mint": mint,
+            "name": str(event.get("name") or "")[:80],
+            "symbol": str(event.get("symbol") or "")[:24],
+            "traderPublicKey": creator,
+            "creator": creator,
+            "_bot_observed_created_at": observed_at,
+        }
+        self._save({
+            "mint": mint,
+            "name": safe_event["name"],
+            "symbol": safe_event["symbol"],
+            "creator": creator,
+            "created_at": observed_at,
+            "queued_at": now,
+            "queue_expires_at": observed_at + self.max_token_age_seconds,
+            "queued_event": safe_event,
+            "status": "queued",
+            "reason": "Waiting for scan/watch capacity; " + reason,
+            "security_passed": False,
+            "score": 0,
+            "score_components": {},
+            "unique_buyers": 0,
+            "buy_trades": 0,
+            "sell_trades": 0,
+            "buy_volume_sol": 0.0,
+            "sell_volume_sol": 0.0,
+            "subscribed": False,
+        })
+        self.stats["queued_launches"] += 1
+        return True
 
-        now = time.time()
-        while self._recent_scans and now - self._recent_scans[0] >= 60:
-            self._recent_scans.popleft()
-        if len(self._recent_scans) >= self.max_scans_per_minute:
-            # New-token events can arrive many times per second. Count but do not
-            # persist each skipped mint; otherwise a busy launch stream can flood
-            # SQLite and evict the candidates whose shadow outcomes we are measuring.
-            self.stats["rate_limit_skips"] += 1
-            if now - self._last_skip_log_at >= 15:
-                logger.info(
-                    "SHADOW discovery scan cap reached (%d/min); skipping new launches without RPC calls",
-                    self.max_scans_per_minute,
-                )
-                self._last_skip_log_at = now
-            return
-        if self._active_watch_count(now) >= self.max_watched:
-            self.stats["capacity_skips"] += 1
-            if now - self._last_skip_log_at >= 15:
-                logger.info(
-                    "SHADOW discovery watch cap reached (%d tokens); skipping launches without token-trade subscriptions",
-                    self.max_watched,
-                )
-                self._last_skip_log_at = now
-            return
-
+    def _scan_and_register(self, mint: str, event: dict, now: float) -> None:
         self._recent_scans.append(now)
         self.stats["safety_scans"] += 1
         try:
@@ -387,6 +436,95 @@ class TokenDiscoveryShadow:
             int(c["subscription_expires_at"]),
         )
 
+    def on_new_token_event(self, event: dict) -> None:
+        if not self.enabled:
+            return
+        mint = str(event.get("mint") or "").strip()
+        if not mint:
+            return
+        self.stats["launch_events"] += 1
+        self.stats["last_launch_at"] = time.time()
+        if self._load(mint):
+            return
+        try:
+            Pubkey.from_string(mint)
+        except Exception:
+            self.stats["safety_rejected"] += 1
+            self._record_skipped(mint, event, "rejected", "Invalid mint address")
+            return
+
+        now = time.time()
+        event = dict(event)
+        event["_bot_observed_created_at"] = now
+        while self._recent_scans and now - self._recent_scans[0] >= 60:
+            self._recent_scans.popleft()
+        if len(self._recent_scans) >= self.max_scans_per_minute:
+            self.stats["rate_limit_skips"] += 1
+            self._queue_launch_event(mint, event, "scan rate limit reached", now)
+            if now - self._last_skip_log_at >= 15:
+                logger.info(
+                    "Launch queue received events while safety-scan cap is reached (%d/min)",
+                    self.max_scans_per_minute,
+                )
+                self._last_skip_log_at = now
+            return
+        if self._active_watch_count(now) >= self.max_watched:
+            self.stats["capacity_skips"] += 1
+            self._queue_launch_event(mint, event, "all token-watch slots are occupied", now)
+            if now - self._last_skip_log_at >= 15:
+                logger.info(
+                    "Launch queue received events while all %d token-watch slots are occupied",
+                    self.max_watched,
+                )
+                self._last_skip_log_at = now
+            return
+
+        self._scan_and_register(mint, event, now)
+
+    def _process_queued_launches(self, now: float) -> None:
+        rows = [c for c in self.candidates(1000) if c.get("status") == "queued"]
+        if not rows:
+            return
+        for candidate in rows:
+            try:
+                created_at = float(candidate.get("created_at") or candidate.get("queued_at") or now)
+            except (TypeError, ValueError):
+                created_at = now
+            if now - created_at > self.max_token_age_seconds:
+                candidate["status"] = "expired"
+                candidate["reason"] = (
+                    f"Launch event observed more than {self.max_token_age_hours} hours ago; "
+                    "removed from the opportunity queue"
+                )
+                candidate["queued_event"] = {}
+                candidate["subscribed"] = False
+                self.stats["queue_expired"] += 1
+                self._save(candidate)
+
+        rows = [c for c in self.candidates(1000) if c.get("status") == "queued"]
+        if not rows or self._active_watch_count(now) >= self.max_watched:
+            return
+        while self._recent_scans and now - self._recent_scans[0] >= 60:
+            self._recent_scans.popleft()
+        if len(self._recent_scans) >= self.max_scans_per_minute:
+            return
+
+        # Favor the freshest queued launches; stale ones expire and are visibly counted.
+        candidate = max(
+            rows,
+            key=lambda c: float(c.get("created_at") or c.get("queued_at") or 0),
+        )
+        event = candidate.get("queued_event") or {}
+        mint = str(candidate.get("mint") or "")
+        if not mint or not isinstance(event, dict):
+            candidate["status"] = "rejected"
+            candidate["reason"] = "Queued launch metadata is missing; cannot safely scan"
+            self.stats["safety_rejected"] += 1
+            self._save(candidate)
+            return
+        self.stats["queue_processed"] += 1
+        self._scan_and_register(mint, event, now)
+
     def _new_candidate(self, mint: str, event: dict, inspected: dict | None = None) -> dict:
         inspected = inspected or {}
         price = float(inspected.get("price_usd") or 0)
@@ -399,7 +537,7 @@ class TokenDiscoveryShadow:
             "name": str(event.get("name") or "")[:80],
             "symbol": str(event.get("symbol") or "")[:24],
             "creator": str(event.get("traderPublicKey") or event.get("creator") or "")[:64],
-            "created_at": time.time(),
+            "created_at": float(event.get("_bot_observed_created_at") or time.time()),
             "status": "pending",
             "reason": "",
             "security_passed": bool(inspected.get("safe", False)),
@@ -888,6 +1026,7 @@ class TokenDiscoveryShadow:
         if changed or now - self._last_subscription_refresh >= 30:
             self._update_feed_subscriptions()
             self._last_subscription_refresh = now
+        self._process_queued_launches(now)
         self._trim_candidates()
 
     def _trim_candidates(self) -> None:
