@@ -226,7 +226,9 @@ class PumpFunBot:
     def _record_realized_exit_risk(self, realized_pnl: float) -> None:
         """Update the persisted loss streak after each confirmed sell."""
         # This also clears a pause that belonged to a previous UTC day.
-        self._loss_streak_pause_reason()
+        # Once today's pause is latched, later exits must not rewrite its displayed count.
+        if self._loss_streak_pause_reason():
+            return
         try:
             streak = int(self.store.get_state("consecutive_losing_exits", "0") or 0)
         except (TypeError, ValueError):
