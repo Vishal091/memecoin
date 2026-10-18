@@ -1241,6 +1241,177 @@ class PumpFunBot:
             logger.warning("Live transaction confirmed: https://solscan.io/tx/%s", tx_sig)
         return True
 
+    def _set_discovery_live_status(self, candidate: dict, status: str, reason: str) -> None:
+        candidate["live_entry_status"] = status
+        candidate["live_entry_reason"] = " ".join(str(reason or "").split())[:500]
+        self.token_discovery._save(candidate)
+
+    def _process_discovery_live_entries(self) -> None:
+        """Turn only fresh, newly-qualified shadow entries into small opt-in live buys."""
+        if (
+            self.s.mode != "live"
+            or not self.s.token_discovery_enabled
+            or not self.s.token_discovery_live_enabled
+        ):
+            return
+
+        now = time.time()
+        hard_cap = min(0.50, float(self.s.token_discovery_max_entry_usd))
+        for candidate in self.token_discovery.candidates(300):
+            if candidate.get("status") != "shadow_open" or not candidate.get("would_buy"):
+                continue
+            # Candidate attempts are one-shot and persisted before any send to avoid
+            # duplicate buys across loops or restarts after an ambiguous outcome.
+            if candidate.get("live_entry_status"):
+                continue
+
+            mint = str(candidate.get("mint") or "")
+            entry_at = float(candidate.get("shadow_entry_at") or 0)
+            if (
+                not mint
+                or entry_at < self.run_started_at
+                or now < entry_at
+                or now - entry_at > 30
+            ):
+                self._set_discovery_live_status(
+                    candidate, "skipped_stale",
+                    "Shadow entry is not fresh in this bot run; no catch-up live buy",
+                )
+                continue
+
+            positions = self.store.list_positions()
+            if any(p.get("strategy", "leader_copy") == "token_discovery" for p in positions):
+                self._set_discovery_live_status(
+                    candidate, "blocked",
+                    "One live discovery position is already open",
+                )
+                continue
+            if self.store.get_position(mint):
+                self._set_discovery_live_status(
+                    candidate, "blocked",
+                    "A tracked position already exists for this mint",
+                )
+                continue
+
+            # Recompute metrics and repeat every on-chain launch gate immediately
+            # before spending, rather than trusting the earlier shadow snapshot.
+            candidate = self.token_discovery._apply_score(candidate)
+            if not candidate.get("would_buy"):
+                self._set_discovery_live_status(
+                    candidate, "blocked",
+                    "Entry gates no longer pass: " + "; ".join(candidate.get("gate_reasons") or []),
+                )
+                continue
+
+            candidate["live_entry_status"] = "checking"
+            candidate["live_entry_reason"] = "Repeating on-chain safety checks before live entry"
+            self.token_discovery._save(candidate)
+            try:
+                inspected = self.token_discovery._inspect_new_token(
+                    mint, creator=str(candidate.get("creator") or "")
+                )
+            except Exception as exc:
+                self._set_discovery_live_status(
+                    candidate, "blocked",
+                    f"Fresh on-chain safety recheck failed ({type(exc).__name__}); no order submitted",
+                )
+                logger.warning("Discovery live entry blocked mint=%s: on-chain recheck failed: %s",
+                               mint[:8], type(exc).__name__)
+                continue
+
+            if not inspected.get("safe"):
+                candidate["security_passed"] = False
+                self._set_discovery_live_status(
+                    candidate, "blocked",
+                    "Fresh on-chain safety recheck rejected token: " + str(inspected.get("reason") or "unknown reason"),
+                )
+                logger.info("Discovery live entry rejected %s: %s",
+                            mint[:8], inspected.get("reason") or "safety recheck failed")
+                continue
+
+            liquidity = float(inspected.get("liquidity_usd") or 0)
+            price = float(inspected.get("price_usd") or 0)
+            decimals = int(inspected.get("decimals") or 0)
+            candidate.update({
+                "security_passed": True,
+                "security_checks": inspected.get("checks", []),
+                "top5_holder_supply_pct": float(inspected.get("top5_holder_supply_pct") or 0),
+                "creator_supply_pct": float(inspected.get("creator_supply_pct") or 0),
+                "real_liquidity_usd": liquidity,
+                "price_usd": price,
+            })
+            if decimals != 6 or liquidity < self.s.token_discovery_min_liquidity_usd or price <= 0:
+                self._set_discovery_live_status(
+                    candidate, "blocked",
+                    f"Fresh entry requirements failed (decimals={decimals}, real curve liquidity=${liquidity:.0f}, price valid={price > 0})",
+                )
+                continue
+
+            candidate = self.token_discovery._apply_score(candidate)
+            if not candidate.get("would_buy"):
+                self._set_discovery_live_status(
+                    candidate, "blocked",
+                    "Entry gates failed after fresh on-chain recheck: " + "; ".join(candidate.get("gate_reasons") or []),
+                )
+                continue
+
+            equity = self.equity()
+            self._refresh_risk_state(equity)
+            allowed, gate_reason = self._can_enter(
+                equity, strategy="token_discovery", entry_cap_usd=hard_cap
+            )
+            if not allowed:
+                self._set_discovery_live_status(
+                    candidate, "blocked",
+                    "Portfolio risk gate blocked discovery entry: " + gate_reason,
+                )
+                continue
+
+            # Persist a one-shot marker before handing off to the executor. If the
+            # process crashes after submission, this candidate is never replayed.
+            candidate["live_entry_status"] = "submitting"
+            candidate["live_entry_reason"] = f"Submitting at most ${hard_cap:.2f}; awaiting confirmed result"
+            self.token_discovery._save(candidate)
+            signal = {
+                "mint": mint,
+                "wallet": "",
+                "signature": f"token-discovery-{mint}-{int(entry_at * 1000)}",
+                "side": "buy",
+                "amount_ui": 0.0,
+                "decimals": decimals,
+                "observed_price_usd": price,
+                "curve_liquidity_usd": liquidity,
+                "venue": "pump",
+                "source": "token_discovery",
+                "curve_state_verified": True,
+                "fresh_security_verified": True,
+            }
+            self.buy(signal, strategy="token_discovery", entry_cap_usd=hard_cap)
+
+            opened = self.store.get_position(mint)
+            if opened and opened.get("strategy", "leader_copy") == "token_discovery":
+                self._set_discovery_live_status(
+                    candidate, "opened",
+                    f"Live buy confirmed and tracked; entry cap was ${hard_cap:.2f}",
+                )
+                logger.warning(
+                    "Live discovery BUY confirmed mint=%s strategy_cap=$%.2f; position manager will handle exits",
+                    mint[:8], hard_cap,
+                )
+            elif self.store.get_state(f"unresolved_trade:{mint}", ""):
+                self._set_discovery_live_status(
+                    candidate, "uncertain",
+                    "Transaction outcome unresolved; manual reconciliation required and this candidate will not retry",
+                )
+            else:
+                self._set_discovery_live_status(
+                    candidate, "failed",
+                    "No live position was confirmed; inspect bot logs. This candidate will not auto-retry",
+                )
+            self.token_discovery._update_feed_subscriptions()
+            # At most one discovery candidate may initiate execution per loop.
+            return
+
     def manage_positions(self):
         for original in self.store.list_positions():
             mint = original["mint"]
