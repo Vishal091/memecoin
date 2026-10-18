@@ -5,16 +5,17 @@ import time
 import unittest
 from types import SimpleNamespace
 
-from native_pump import TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID
+from native_pump import TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, WRAPPED_SOL_MINT
 from pump_curve import BONDING_CURVE_DISCRIMINATOR, bonding_curve_address
 from pumpportal import PUMP_PROGRAM_ID
+from solders.pubkey import Pubkey
 from token_discovery import TokenDiscoveryShadow, score_candidate_metrics
 
 
 MINT = "So11111111111111111111111111111111111111112"
 
 
-def curve_account_data(real_sol=5_000_000_000, complete=False):
+def curve_account_data(real_sol=5_000_000_000, complete=False, quote_mint=WRAPPED_SOL_MINT):
     raw = (
         BONDING_CURVE_DISCRIMINATOR
         + struct.pack(
@@ -27,6 +28,10 @@ def curve_account_data(real_sol=5_000_000_000, complete=False):
         )
         + bytes([1 if complete else 0])
     )
+    if quote_mint is not None:
+        raw += bytes(Pubkey.from_string("11111111111111111111111111111111"))
+        raw += bytes([0, 0])
+        raw += bytes(Pubkey.from_string(quote_mint))
     return [base64.b64encode(raw).decode("ascii"), "base64"]
 
 
@@ -176,6 +181,21 @@ class TokenDiscoveryScoringTests(unittest.TestCase):
         self.assertIn("Mint authority remains active", result["reason"])
         self.assertEqual(len(rpc.calls), 1, "Do not inspect or subscribe to the curve after a failed mint gate")
 
+    def test_missing_quote_mint_is_a_hard_reject(self):
+        rpc = FakeRPC(curve_data=curve_account_data(quote_mint=None))
+        scanner = TokenDiscoveryShadow(settings(), rpc, FakeMarket(), FakeStore())
+        result = scanner._inspect_new_token(MINT)
+        self.assertFalse(result["safe"])
+        self.assertIn("Quote mint is missing or unsupported", result["reason"])
+
+    def test_non_sol_quote_mint_is_a_hard_reject(self):
+        usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        rpc = FakeRPC(curve_data=curve_account_data(quote_mint=usdc_mint))
+        scanner = TokenDiscoveryShadow(settings(), rpc, FakeMarket(), FakeStore())
+        result = scanner._inspect_new_token(MINT)
+        self.assertFalse(result["safe"])
+        self.assertIn("Quote mint is missing or unsupported", result["reason"])
+
     def test_high_non_curve_holder_concentration_is_a_hard_reject(self):
         rpc = FakeRPC(
             holder_owner="Insider111111111111111111111111111111111111",
@@ -209,6 +229,26 @@ class TokenDiscoveryScoringTests(unittest.TestCase):
 
 
 class TokenDiscoveryShadowTests(unittest.TestCase):
+    def test_low_real_curve_liquidity_is_rejected_without_using_watch_slot(self):
+        store = FakeStore()
+        feed = FakeFeed()
+        # 1 SOL real curve reserve => approximately $300 two-sided value at $150/SOL.
+        rpc = FakeRPC(curve_data=curve_account_data(real_sol=1_000_000_000))
+        scanner = TokenDiscoveryShadow(settings(), rpc, FakeMarket(), store, feed)
+
+        scanner.on_new_token_event({
+            "mint": MINT, "name": "TooThin", "symbol": "THIN",
+            "traderPublicKey": "Creator111111111111111111111111111111111111",
+            "txType": "create",
+        })
+
+        candidate = json.loads(store.get_state("token_discovery_candidate:" + MINT))
+        self.assertEqual(candidate["status"], "rejected")
+        self.assertFalse(candidate["subscribed"])
+        self.assertIn("below required $1000", candidate["reason"])
+        self.assertEqual(scanner.stats["liquidity_rejected"], 1)
+        self.assertEqual(feed.discovery_tokens, ())
+
     def test_new_token_is_verified_and_only_subscribed_for_shadow_observation(self):
         store = FakeStore()
         feed = FakeFeed()
