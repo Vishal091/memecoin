@@ -110,8 +110,9 @@ class Store:
         """List namespaced state values; callers must still validate decoded JSON."""
         bounded_limit = max(1, min(10000, int(limit)))
         rows = self.db.execute(
-            "SELECT key,value FROM state WHERE key LIKE ? ORDER BY rowid DESC LIMIT ?",
-            (str(prefix) + "%", bounded_limit),
+            "SELECT key,value FROM state "
+            "WHERE substr(key,1,length(?))=? ORDER BY rowid DESC LIMIT ?",
+            (str(prefix), str(prefix), bounded_limit),
         ).fetchall()
         return [(str(row["key"]), str(row["value"])) for row in rows]
 
