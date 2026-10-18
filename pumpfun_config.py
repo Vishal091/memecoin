@@ -59,6 +59,7 @@ class PumpFunSettings:
     min_pair_age_seconds: int
     slippage_bps: int
     max_marked_loss_pct: float
+    emergency_loss_bypass_pct: float
     min_hold_before_loss_exit_seconds: int
     trailing_stop_pct: float
     take_profit_1_pct: float
@@ -120,6 +121,8 @@ class PumpFunSettings:
             min_pair_age_seconds=max(90, _int("MIN_PAIR_AGE_SECONDS", 90)),
             slippage_bps=_int("SLIPPAGE_BPS", 300),
             max_marked_loss_pct=_float("MAX_MARKED_LOSS_PCT", 0.25),
+            # Extreme price collapses can bypass the grace period; keep the threshold between 40% and 90%.
+            emergency_loss_bypass_pct=max(0.40, min(0.90, _float("EMERGENCY_LOSS_BYPASS_PCT", 0.50))),
             # Loss exits are held for at least two minutes; local configuration may only increase this.
             min_hold_before_loss_exit_seconds=max(120, _int("MIN_HOLD_BEFORE_LOSS_EXIT_SECONDS", 120)),
             trailing_stop_pct=_float("TRAILING_STOP_PCT", 0.20),
