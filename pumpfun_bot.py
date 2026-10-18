@@ -1139,10 +1139,16 @@ class PumpFunBot:
         curve_liquidity = float(signal.get("curve_liquidity_usd") or 0)
         pair_liquidity = float(market.get("liquidity_usd") or 0) if market else 0.0
         actual_liquidity = max(curve_liquidity, pair_liquidity)
-        if strategy == "token_discovery" and curve_liquidity < self.s.token_discovery_min_liquidity_usd:
+        discovery_liquidity_floor = max(
+            5000.0, float(getattr(self.s, "token_discovery_min_liquidity_usd", 5000.0))
+        )
+        portfolio_liquidity_floor = max(
+            5000.0, float(getattr(self.s, "min_liquidity_usd", 5000.0))
+        )
+        if strategy == "token_discovery" and curve_liquidity < discovery_liquidity_floor:
             logger.info(
                 "Reject discovery buy %s: fresh real curve liquidity %.0f USD below %.0f USD",
-                mint[:8], curve_liquidity, self.s.token_discovery_min_liquidity_usd,
+                mint[:8], curve_liquidity, discovery_liquidity_floor,
             )
             return
         curve_state_verified = bool(signal.get("curve_state_verified"))
@@ -1167,9 +1173,9 @@ class PumpFunBot:
                 mint[:8],
             )
             return
-        if actual_liquidity < self.s.min_liquidity_usd:
+        if actual_liquidity < portfolio_liquidity_floor:
             logger.info("Reject Pump.fun buy %s: verified/observed liquidity %.0f USD below %.0f USD",
-                        mint, actual_liquidity, self.s.min_liquidity_usd)
+                        mint, actual_liquidity, portfolio_liquidity_floor)
             return
         if market and int(market.get("pair_age_seconds") or 0) < self.s.min_pair_age_seconds and not unindexed_pump_entry:
             logger.info("Reject Pump.fun buy %s: pair age below filter", mint)
@@ -1698,10 +1704,13 @@ class PumpFunBot:
                 )
                 continue
 
-            if liquidity < self.s.token_discovery_min_liquidity_usd or price <= 0:
+            discovery_liquidity_floor = max(
+                5000.0, float(getattr(self.s, "token_discovery_min_liquidity_usd", 5000.0))
+            )
+            if liquidity < discovery_liquidity_floor or price <= 0:
                 self._schedule_discovery_live_preflight_retry(
                     candidate,
-                    f"Fresh entry requirements failed (decimals={decimals}, real curve liquidity=${liquidity:.0f}, minimum=${self.s.token_discovery_min_liquidity_usd:.0f}, price valid={price > 0})",
+                    f"Fresh entry requirements failed (decimals={decimals}, real curve liquidity=${liquidity:.0f}, minimum=${discovery_liquidity_floor:.0f}, price valid={price > 0})",
                 )
                 continue
 
