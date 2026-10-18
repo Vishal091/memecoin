@@ -137,7 +137,7 @@ def score_trending_candidate(c: dict) -> int:
         + 15 * pressure
         + max(0, min(10, 5 + max(-20, min(20, chg5)) * 0.25))
         + max(0, min(15, 7.5 + max(-30, min(30, chg1)) * 0.25))
-        + max(0, min(10, 5 + max(-40, min(40, chg6)) * 0.125)
+        + max(0, min(10, 5 + max(-40, min(40, chg6)) * 0.125))
     )
     score -= min(18, max(0, chg1 - 60) * 0.18)
     if chg5 > 20:
@@ -163,7 +163,7 @@ def evaluate_rugcheck_report(report: Any) -> tuple[str, list[str]]:
     top = report.get("topHoldersPct")
     lp = report.get("lpLockedPct")
     if top is not None and _num(top, 100.0) > 35:
-        flags.append(f"Top holders concentration {_num(top):.1f}% exceeds 35%")
+        return "REJECTED", [f"Top holders concentration {_num(top):.1f}% exceeds 35%"]
     if lp is not None and _num(lp, -1) < 80:
         flags.append(f"LP lock/burn coverage is only {_num(lp):.1f}% (review threshold 80%)")
     elif lp is None and report.get("lpLocked") is False:
@@ -374,9 +374,10 @@ class TrendingTokenScanner:
     def scan_once(self) -> None:
         payload = self._get_json(f"{GECKO}/networks/solana/trending_pools?page=1", gecko=True)
         raw = parse_gecko_trending(payload)
+        raw.sort(key=lambda x: (score_trending_candidate(x), _num(x.get("liquidity_usd"))), reverse=True)
         self._dexscreener_enrich(raw)
         raw.sort(key=lambda x: (score_trending_candidate(x), _num(x.get("liquidity_usd"))), reverse=True)
-        selected = raw[:self.max_candidates * 3]
+        selected = raw[:self.max_candidates]
         checked: list[dict] = []
         for candidate in selected:
             if self._stop.is_set():
