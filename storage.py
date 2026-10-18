@@ -68,7 +68,10 @@ class Store:
                 tp1_done INTEGER NOT NULL DEFAULT 0, tp2_done INTEGER NOT NULL DEFAULT 0,
                 opened_at TEXT NOT NULL, last_price_usd REAL NOT NULL,
                 invested_usd REAL NOT NULL, source_wallet TEXT, source_signature TEXT,
-                strategy TEXT NOT NULL DEFAULT 'leader_copy'
+                strategy TEXT NOT NULL DEFAULT 'leader_copy',
+                entry_market_cap_usd REAL NOT NULL DEFAULT 0,
+                total_supply_tokens REAL NOT NULL DEFAULT 0,
+                entry_market_cap_source TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
@@ -96,6 +99,12 @@ class Store:
                 self.db.execute("ALTER TABLE positions ADD COLUMN source_signature TEXT")
             if "strategy" not in pos_columns:
                 self.db.execute("ALTER TABLE positions ADD COLUMN strategy TEXT NOT NULL DEFAULT 'leader_copy'")
+            if "entry_market_cap_usd" not in pos_columns:
+                self.db.execute("ALTER TABLE positions ADD COLUMN entry_market_cap_usd REAL NOT NULL DEFAULT 0")
+            if "total_supply_tokens" not in pos_columns:
+                self.db.execute("ALTER TABLE positions ADD COLUMN total_supply_tokens REAL NOT NULL DEFAULT 0")
+            if "entry_market_cap_source" not in pos_columns:
+                self.db.execute("ALTER TABLE positions ADD COLUMN entry_market_cap_source TEXT NOT NULL DEFAULT ''")
             trade_columns = {row[1] for row in self.db.execute("PRAGMA table_info(trades)").fetchall()}
             if "strategy" not in trade_columns:
                 self.db.execute("ALTER TABLE trades ADD COLUMN strategy TEXT NOT NULL DEFAULT 'leader_copy'")
@@ -164,13 +173,22 @@ class Store:
     def upsert_position(self, p: dict) -> None:
         columns = ("mint", "decimals", "amount_raw", "entry_price_usd", "initial_amount_raw",
                    "peak_price_usd", "tp1_done", "tp2_done", "opened_at", "last_price_usd", "invested_usd",
-                   "source_wallet", "source_signature", "strategy")
+                   "source_wallet", "source_signature", "strategy", "entry_market_cap_usd",
+                   "total_supply_tokens", "entry_market_cap_source")
         with self.db:
             self.db.execute(
                 "INSERT INTO positions (" + ",".join(columns) + ") VALUES (" + ",".join("?" for _ in columns) + ") "
                 "ON CONFLICT(mint) DO UPDATE SET " +
                 ",".join(f"{c}=excluded.{c}" for c in columns if c != "mint"),
-                tuple(p.get(c, "leader_copy") if c == "strategy" else p.get(c) for c in columns))
+                tuple(
+                    p.get(c, {
+                        "strategy": "leader_copy",
+                        "entry_market_cap_usd": 0.0,
+                        "total_supply_tokens": 0.0,
+                        "entry_market_cap_source": "",
+                    }.get(c))
+                    for c in columns
+                ))
 
     def delete_position(self, mint: str) -> None:
         with self.db:

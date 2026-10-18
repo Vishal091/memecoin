@@ -105,6 +105,7 @@ class PumpFunBot:
         self.price_cache_at = {}
         self.market_price_cache = {}
         self.market_price_cache_at = {}
+        self._market_cap_supply_retry_at = {}
         self.state_lock = threading.RLock()
         self.commands = queue.Queue()
         self.trade_events = queue.Queue()
@@ -236,21 +237,82 @@ class PumpFunBot:
             self.message = self.last_leaderboard_error
             return False
 
+    def _hydrate_position_market_cap(self, position: dict) -> dict:
+        """Backfill total supply/entry-cap metadata for positions from earlier DB schema."""
+        mint = str(position.get("mint") or "")
+        try:
+            supply_tokens = float(position.get("total_supply_tokens") or 0)
+        except (TypeError, ValueError):
+            supply_tokens = 0.0
+        if not mint or supply_tokens > 0:
+            return position
+
+        now = time.time()
+        retry_map = getattr(self, "_market_cap_supply_retry_at", None)
+        if retry_map is None:
+            retry_map = {}
+            self._market_cap_supply_retry_at = retry_map
+        if now < float(retry_map.get(mint, 0)):
+            return position
+        retry_map[mint] = now + 60
+        try:
+            result = self.rpc.call(
+                "getTokenSupply", [mint, {"commitment": "confirmed"}]
+            ) or {}
+            value = result.get("value") or {}
+            raw_supply = int(value.get("amount") or 0)
+            decimals = int(value.get("decimals") or 0)
+            if raw_supply <= 0 or decimals < 0 or decimals > 18:
+                return position
+            supply_tokens = raw_supply / (10 ** decimals)
+            if supply_tokens <= 0:
+                return position
+            position["total_supply_tokens"] = supply_tokens
+            if float(position.get("entry_market_cap_usd") or 0) <= 0:
+                entry_price = float(position.get("entry_price_usd") or 0)
+                if entry_price > 0:
+                    position["entry_market_cap_usd"] = entry_price * supply_tokens
+                    position["entry_market_cap_source"] = (
+                        "Estimated historical entry price × current total supply (FDV-style)"
+                    )
+            self.store.upsert_position(position)
+            logger.info("Backfilled market-cap supply metadata for position %s", mint[:8])
+        except Exception as exc:
+            logger.debug("Market-cap supply lookup unavailable for %s: %s", mint[:8], type(exc).__name__)
+        return position
+
     def _publish_dashboard_state(self, equity: float | None = None) -> None:
         if equity is not None:
             self.last_equity_usd = equity
         positions = []
         for p in self.store.list_positions():
+            p = self._hydrate_position_market_cap(p)
             entry = float(p["entry_price_usd"])
             mark = self._mark_price(p["mint"], float(p["last_price_usd"]))
             if mark <= 0:
                 mark = float(p["last_price_usd"])
             move = ((mark / entry) - 1.0) * 100.0 if entry > 0 else 0.0
+            cap_snapshot = self.token_discovery.market_cap_snapshot(p["mint"])
+            supply_tokens = float(p.get("total_supply_tokens") or 0)
+            entry_mc = float(p.get("entry_market_cap_usd") or 0)
+            entry_mc_source = str(p.get("entry_market_cap_source") or "")
+            if entry_mc <= 0:
+                entry_mc = float(cap_snapshot.get("entry_market_cap_usd") or 0)
+                entry_mc_source = str(cap_snapshot.get("entry_market_cap_source") or entry_mc_source)
+            current_mc = float(cap_snapshot.get("current_market_cap_usd") or 0)
+            current_mc_source = str(cap_snapshot.get("current_market_cap_source") or "")
+            if current_mc <= 0 and mark > 0 and supply_tokens > 0:
+                current_mc = mark * supply_tokens
+                current_mc_source = "Estimated: current mark price × total supply (FDV-style)"
             positions.append({
                 "mint": p["mint"], "amount_raw": p["amount_raw"], "decimals": p["decimals"],
                 "entry_price_usd": entry, "last_price_usd": mark, "move_pct": move,
                 "source_wallet": p.get("source_wallet", ""),
                 "strategy": p.get("strategy", "leader_copy"),
+                "entry_market_cap_usd": entry_mc or None,
+                "entry_market_cap_source": entry_mc_source,
+                "current_market_cap_usd": current_mc or None,
+                "current_market_cap_source": current_mc_source,
             })
         trades = self.store.recent_trades(15)
         leaders = {}
@@ -807,6 +869,24 @@ class PumpFunBot:
                 return False, "SOL balance insufficient for entry plus fee reserve"
         return True, "allowed"
 
+    def _read_total_supply_tokens(self, mint: str) -> float:
+        try:
+            result = self.rpc.call(
+                "getTokenSupply", [mint, {"commitment": "confirmed"}]
+            ) or {}
+            value = result.get("value") or {}
+            raw_supply = int(value.get("amount") or 0)
+            decimals = int(value.get("decimals") or 0)
+            if raw_supply <= 0 or decimals < 0 or decimals > 18:
+                return 0.0
+            return raw_supply / (10 ** decimals)
+        except Exception as exc:
+            # Market-cap metadata is optional; failure must never suppress or delay
+            # the existing execution/risk result beyond this one best-effort lookup.
+            logger.debug("Could not read token supply for market-cap estimate %s: %s",
+                         str(mint)[:8], type(exc).__name__)
+            return 0.0
+
     def _native_build_retry_deferred(self, mint: str) -> bool:
         if self.s.mode != "live":
             return False
@@ -1031,6 +1111,9 @@ class PumpFunBot:
             return
 
         decimals = int(signal.get("decimals") or 6)
+        total_supply_tokens = float(signal.get("total_supply_tokens") or 0)
+        if total_supply_tokens <= 0:
+            total_supply_tokens = self._read_total_supply_tokens(mint)
         timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         venue = str(signal.get("venue", "pump"))
         if venue not in {"pump", "pump-amm"}:
@@ -1094,6 +1177,12 @@ class PumpFunBot:
             "opened_at": timestamp, "last_price_usd": observed_price,
             "invested_usd": cost_basis, "source_wallet": source_wallet,
             "source_signature": source_signature, "strategy": strategy,
+            "total_supply_tokens": total_supply_tokens,
+            "entry_market_cap_usd": effective_price * total_supply_tokens if total_supply_tokens > 0 else 0.0,
+            "entry_market_cap_source": (
+                "Estimated: executed average token price × total supply (FDV-style)"
+                if total_supply_tokens > 0 else ""
+            ),
         }
         self.store.upsert_position(position)
         self.store.set_state(f"pool:{mint}", used_pool)
@@ -1346,6 +1435,8 @@ class PumpFunBot:
             liquidity = float(inspected.get("liquidity_usd") or 0)
             price = float(inspected.get("price_usd") or 0)
             decimals = int(inspected.get("decimals") or 0)
+            total_supply_tokens = float(inspected.get("total_supply_tokens") or candidate.get("total_supply_tokens") or 0)
+            live_entry_market_cap = price * total_supply_tokens if price > 0 and total_supply_tokens > 0 else 0.0
             candidate.update({
                 "security_passed": True,
                 "security_checks": inspected.get("checks", []),
@@ -1353,7 +1444,13 @@ class PumpFunBot:
                 "creator_supply_pct": float(inspected.get("creator_supply_pct") or 0),
                 "real_liquidity_usd": liquidity,
                 "price_usd": price,
+                "total_supply_tokens": total_supply_tokens,
             })
+            if live_entry_market_cap > 0:
+                candidate["market_cap_usd"] = live_entry_market_cap
+                candidate["market_cap_source"] = "Estimated from fresh on-chain curve price × total supply (FDV-style)"
+                candidate["live_entry_candidate_market_cap_usd"] = live_entry_market_cap
+                candidate["live_entry_candidate_market_cap_source"] = "Estimated at live-entry preflight: price × total supply (FDV-style)"
             if decimals != 6 or liquidity < self.s.token_discovery_min_liquidity_usd or price <= 0:
                 self._set_discovery_live_status(
                     candidate, "blocked",
@@ -1399,6 +1496,7 @@ class PumpFunBot:
                 "source": "token_discovery",
                 "curve_state_verified": True,
                 "fresh_security_verified": True,
+                "total_supply_tokens": total_supply_tokens,
             }
             try:
                 self.buy(signal, strategy="token_discovery", entry_cap_usd=hard_cap)
@@ -1417,6 +1515,11 @@ class PumpFunBot:
 
             opened = self.store.get_position(mint)
             if opened and opened.get("strategy", "leader_copy") == "token_discovery":
+                if float(candidate.get("live_entry_candidate_market_cap_usd") or 0) > 0:
+                    candidate["live_entry_market_cap_usd"] = candidate["live_entry_candidate_market_cap_usd"]
+                    candidate["live_entry_market_cap_source"] = candidate.get("live_entry_candidate_market_cap_source") or ""
+                    candidate["entry_market_cap_usd"] = candidate["live_entry_market_cap_usd"]
+                    candidate["entry_market_cap_source"] = candidate["live_entry_market_cap_source"]
                 self._set_discovery_live_status(
                     candidate, "opened",
                     f"Live buy confirmed and tracked; entry cap was ${hard_cap:.2f}",

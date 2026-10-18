@@ -68,15 +68,17 @@ TOKEN_DISCOVERY_MAX_ENTRY_USD=0.50
 TOKEN_DISCOVERY_MAX_WATCHED_TOKENS=5
 TOKEN_DISCOVERY_WATCH_SECONDS=180
 TOKEN_DISCOVERY_MAX_LAUNCHES_PER_MINUTE=12
-TOKEN_DISCOVERY_MIN_LIQUIDITY_USD=1000
+TOKEN_DISCOVERY_MIN_LIQUIDITY_USD=2500
 TOKEN_DISCOVERY_MIN_SCORE=75
 TOKEN_DISCOVERY_MIN_UNIQUE_BUYERS=5
 TOKEN_DISCOVERY_SHADOW_WINDOW_SECONDS=900
 ```
 
-Restart the bot. The dashboard displays candidate status, verified real bonding-curve liquidity, holder concentration, unique buyers, buy/sell SOL flow, score, hypothetical returns, and any live-entry result. It uses the same PumpPortal WebSocket as account-trade copying and subscribes to a capped number of token streams; those token-trade messages are metered. New token events that cannot be checked on chain are rejected.
+Restart the bot. The dashboard displays candidate status, verified real bonding-curve liquidity (minimum $2,500), entry/current market-cap estimates, holder concentration, unique buyers, buy/sell SOL flow, score, hypothetical returns, and any live-entry result. It uses the same PumpPortal WebSocket as account-trade copying and subscribes to a capped number of token streams; those token-trade messages are metered. New token events that cannot be checked on chain are rejected.
 
 Live execution is deliberately a second opt-in. When you're ready to accept real-money risk, use a dedicated wallet and add `TOKEN_DISCOVERY_LIVE_ENABLED=true` to the local `.env` while keeping `TOKEN_DISCOVERY_ENABLED=true`, `BOT_MODE=live`, and the required live confirmation setting. Each buy is capped in code at $0.50 even if `TOKEN_DISCOVERY_MAX_ENTRY_USD` is set higher; at most one position tagged `token_discovery` can be open. Old shadow entries from previous bot runs are marked stale and are not bought. Live entries repeat the mint authority, freeze authority, Token-2022 extension, holder concentration, quote-mint and canonical curve checks immediately before execution, then must pass the existing global exposure/drawdown gates. Existing position management is responsible for exits, but neither a stop nor any liquidity check guarantees a successful sale.
+
+The minimum liquidity setting is enforced at no less than $2,500. Entry/current market-cap numbers are estimates when derived from token price × total supply; the dashboard labels their source and they should not be treated as guaranteed realizable value.
 
 This initial version only enters ungraduated SOL-quoted Pump bonding curves. It does not enter migrated PumpSwap pools whose reserves have not been independently verified. Token screens and score thresholds are hypotheses, not claims of profitability. Keep `TOKEN_DISCOVERY_LIVE_ENABLED=false` until you specifically choose to begin this live trial.
 
