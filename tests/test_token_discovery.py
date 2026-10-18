@@ -99,6 +99,17 @@ class FakeRPC:
                     "tokenAmount": {"amount": self.holder_amount, "decimals": 6},
                 }}}
             } for _ in params[0]]}
+        if method == "getTokenAccountsByOwner":
+            owner = params[0]
+            if owner == self.holder_owner:
+                return {"value": [{
+                    "account": {"data": {"parsed": {"info": {
+                        "mint": MINT,
+                        "owner": owner,
+                        "tokenAmount": {"amount": self.holder_amount, "decimals": 6},
+                    }}}}
+                }]}
+            return {"value": []}
         if method == "getAccountInfo" and address == bonding_curve_address(MINT):
             return {
                 "value": {
