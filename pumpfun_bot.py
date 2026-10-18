@@ -2123,6 +2123,32 @@ class PumpFunBot:
             if self.store.signature_seen(dedupe_key):
                 cursor_candidate = signature
                 continue
+            # Never replay an old leader trade after an RPC outage. A stale
+            # signature is marked consumed and advances the cursor, but no buy/sell
+            # is generated from it. Unknown timestamps are skipped rather than guessed fresh.
+            try:
+                max_signal_age = max(
+                    5,
+                    min(300, int(__import__("os").getenv("MAX_COPY_SIGNAL_AGE_SECONDS", "30"))),
+                )
+            except (TypeError, ValueError):
+                max_signal_age = 30
+            block_time = row.get("blockTime")
+            try:
+                signal_age = time.time() - float(block_time) if block_time is not None else float("inf")
+            except (TypeError, ValueError, OverflowError):
+                signal_age = float("inf")
+            if signal_age < 0 or signal_age > max_signal_age:
+                logger.info(
+                    "Skipping stale/undated watched-wallet signature %s (age=%s); "
+                    "marking consumed without copying",
+                    signature[:12],
+                    "unknown" if signal_age == float("inf") else f"{signal_age:.1f}s",
+                )
+                self.store.mark_signature_seen(dedupe_key, wallet)
+                cursor_candidate = signature
+                handled += 1
+                continue
             try:
                 signals = self.detect_pump_signal(wallet, signature)
             except SolanaRPCRateLimited:
