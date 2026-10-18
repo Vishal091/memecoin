@@ -1,3 +1,4 @@
+import queue
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -590,6 +591,59 @@ class NativeBuildFailureHandlingTests(unittest.TestCase):
             "marked loss stop",
         )
         self.assertEqual(bot.store.get_position("test-mint"), position)
+
+    def test_manual_exit_clears_builder_cooldown_and_overrides_deferred_partial_sell(self):
+        position = {
+            "mint": "test-mint", "amount_raw": "1000", "decimals": 6,
+            "invested_usd": 1.0, "last_price_usd": 1.0,
+        }
+        bot = object.__new__(PumpFunBot)
+        bot.store = self.FakeStore(position)
+        bot.commands = queue.Queue()
+        bot.commands.put({"action": "manual_exit", "mint": "test-mint"})
+        bot.message = ""
+        bot.store.set_state("native_build_retry_after:test-mint", "9999999999")
+        bot.store.set_state("native_build_failure:test-mint", "old build failure")
+        bot.store.set_state("exit_pending_amount_raw:test-mint", "300")
+        bot.store.set_state("exit_pending_source_wallet:test-mint", "leader-wallet")
+        bot.store.set_state("exit_pending_source_signature:test-mint", "leader-signature")
+
+        bot._process_dashboard_commands()
+
+        self.assertEqual(
+            bot.store.get_state("exit_pending:test-mint"),
+            "manual exit requested from dashboard",
+        )
+        self.assertEqual(bot.store.get_state("exit_pending_amount_raw:test-mint"), "")
+        self.assertEqual(bot.store.get_state("exit_pending_source_wallet:test-mint"), "")
+        self.assertEqual(bot.store.get_state("exit_pending_source_signature:test-mint"), "")
+        self.assertEqual(bot.store.get_state("native_build_retry_after:test-mint"), "")
+        self.assertIn("Manual full exit queued", bot.message)
+
+    def test_manual_exit_stays_queued_but_surfaces_unresolved_transaction_block(self):
+        position = {
+            "mint": "test-mint", "amount_raw": "1000", "decimals": 6,
+            "invested_usd": 1.0, "last_price_usd": 1.0,
+        }
+        bot = object.__new__(PumpFunBot)
+        bot.store = self.FakeStore(position)
+        bot.commands = queue.Queue()
+        bot.commands.put({"action": "manual_exit", "mint": "test-mint"})
+        bot.message = ""
+        bot.store.set_state("unresolved_trade:test-mint", "signature-status-unknown")
+        bot.store.set_state("native_build_retry_after:test-mint", "9999999999")
+        bot.store.set_state("exit_pending_amount_raw:test-mint", "300")
+
+        bot._process_dashboard_commands()
+
+        self.assertEqual(
+            bot.store.get_state("exit_pending:test-mint"),
+            "manual exit requested from dashboard",
+        )
+        self.assertEqual(bot.store.get_state("exit_pending_amount_raw:test-mint"), "")
+        self.assertEqual(bot.store.get_state("native_build_retry_after:test-mint"), "")
+        self.assertIn("blocked until", bot.message)
+        self.assertIn("reconciled", bot.message)
 
     def test_unsupported_quote_build_is_deferred_for_six_hours(self):
         self.assertEqual(
