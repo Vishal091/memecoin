@@ -167,6 +167,8 @@ class TrendingScannerConfigTests(unittest.TestCase):
     def test_scanner_is_opt_in_and_thresholds_cannot_be_lowered(self):
         env = {
             "BOT_MODE": "paper",
+            "TOKEN_DISCOVERY_ENABLED": "false",
+            "TOKEN_DISCOVERY_LIVE_ENABLED": "false",
             "TRENDING_DISCOVERY_ENABLED": "true",
             "TRENDING_DISCOVERY_POLL_SECONDS": "5",
             "TRENDING_DISCOVERY_MAX_CANDIDATES": "40",
@@ -184,6 +186,8 @@ class TrendingScannerConfigTests(unittest.TestCase):
     def test_scanner_defaults_off(self):
         with patch.dict(os.environ, {
             "BOT_MODE": "paper",
+            "TOKEN_DISCOVERY_ENABLED": "false",
+            "TOKEN_DISCOVERY_LIVE_ENABLED": "false",
             "TRENDING_DISCOVERY_ENABLED": "false",
         }, clear=False):
             settings = PumpFunSettings.load()
