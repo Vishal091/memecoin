@@ -23,6 +23,15 @@ class TransactionBuildFailed(RuntimeError):
     """The unsigned transaction builder failed before any signing or submission."""
 
 
+class TransactionSimulationFailed(TransactionBuildFailed):
+    """A transaction simulation failed before signing or submission."""
+
+    def __init__(self, detail: str, *, retryable: bool = False):
+        self.detail = str(detail)
+        self.retryable = bool(retryable)
+        super().__init__(self.detail)
+
+
 class TransactionFailedOnChain(RuntimeError):
     """A submitted transaction has a confirmed on-chain error and did not execute."""
 
@@ -409,7 +418,13 @@ class NativePumpExecutor:
         logs = value.get("logs") or []
         if value.get("err") is not None:
             excerpt = " | ".join(str(line) for line in logs[-8:])[:1000]
-            raise RuntimeError(f"Native transaction simulation failed: {value.get('err')}; {excerpt}")
+            detail = f"Native transaction simulation failed: {value.get('err')}; {excerpt}"
+            normalized = (str(value.get("err")) + " " + excerpt).lower()
+            retryable_slippage = (
+                "6042" in normalized
+                or "buyslippagebelowmintokensout" in normalized
+            )
+            raise TransactionSimulationFailed(detail, retryable=retryable_slippage)
         if any(PUMPPORTAL_ROUTER_ID in str(line) for line in logs):
             raise RuntimeError("Simulation invoked the PumpPortal router; refusing to sign")
         if not any(f"Program {expected_program} invoke" in str(line) for line in logs):
@@ -627,25 +642,38 @@ class NativePumpExecutor:
             "slippageBps": int(slippage_bps),
             "priorityFeeSol": self.priority_fee_sol,
         }
-        unsigned, built = self._build_unsigned(payload)
-        route = str(built.get("pool") or "")
-        expected_program = EXPECTED_ROUTE_PROGRAM.get(route)
-        if expected_program is None or built.get("expectedProgram") != expected_program:
-            raise RuntimeError("Native SDK reported an unsupported or inconsistent execution route")
+        # A buy may race the curve between preflight and simulation. If simulation
+        # reports Pump's explicit min-tokens-out/slippage error, rebuild once against
+        # fresh curve state and simulate that unsigned transaction again. This is
+        # safe to retry because neither attempt has been signed or submitted.
+        for simulation_attempt in range(2):
+            unsigned, built = self._build_unsigned(payload)
+            route = str(built.get("pool") or "")
+            expected_program = EXPECTED_ROUTE_PROGRAM.get(route)
+            if expected_program is None or built.get("expectedProgram") != expected_program:
+                raise RuntimeError("Native SDK reported an unsupported or inconsistent execution route")
 
-        validate_native_transaction(
-            unsigned,
-            wallet=owner,
-            mint=mint,
-            action=action,
-            route=route,
-            amount_lamports=amount_lamports,
-            amount_raw=amount_raw_value,
-            priority_fee_limit_lamports=self.priority_fee_lamports,
-        )
-        # Simulate before signing. This is a non-committing RPC call; any route,
-        # account, liquidity, or instruction failure aborts before private-key use.
-        self._simulate(unsigned, expected_program)
+            validate_native_transaction(
+                unsigned,
+                wallet=owner,
+                mint=mint,
+                action=action,
+                route=route,
+                amount_lamports=amount_lamports,
+                amount_raw=amount_raw_value,
+                priority_fee_limit_lamports=self.priority_fee_lamports,
+            )
+            # Simulate before signing. Simulation failures never reach signing or sendTransaction.
+            try:
+                self._simulate(unsigned, expected_program)
+                break
+            except TransactionSimulationFailed as exc:
+                if action != "buy" or not exc.retryable or simulation_attempt > 0:
+                    raise
+                logger.warning(
+                    "Pre-submit buy slippage simulation rejected mint=%s; rebuilding once with fresh curve state",
+                    mint[:8],
+                )
 
         signed = VersionedTransaction(unsigned.message, [keypair])
         signature = self._send_confirm(
