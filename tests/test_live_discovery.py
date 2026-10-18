@@ -169,6 +169,18 @@ class LiveDiscoveryBuyTests(unittest.TestCase):
         self.assertEqual(bot.executor.calls, [])
         self.assertEqual(bot.store.positions, [])
 
+    def test_live_entry_enforces_hard_liquidity_floor_even_if_settings_are_lowered(self):
+        bot = self.make_bot()
+        bot.s.token_discovery_min_liquidity_usd = 1000.0
+        bot.s.min_liquidity_usd = 1000.0
+        signal = self.signal()
+        signal["curve_liquidity_usd"] = 4999.0
+
+        bot.buy(signal, strategy="token_discovery", entry_cap_usd=0.50)
+
+        self.assertEqual(bot.executor.calls, [])
+        self.assertEqual(bot.store.positions, [])
+
     def test_buy_refuses_when_one_discovery_position_is_already_open(self):
         existing = {
             "mint": "already-open", "strategy": "token_discovery",
