@@ -136,8 +136,24 @@ def main() -> int:
         ).fetchall())
         if state.get("manual_review_halt") != "1":
             raise SystemExit("ABORT: manual-review halt is not active")
-        if args.signature not in state.get("manual_review_reason", ""):
-            raise SystemExit("ABORT: manual-review reason does not reference this signature")
+
+        # The reason can be overwritten by a later generic loop exception in older
+        # bot versions. The structured unresolved record above is authoritative for
+        # the exact signature; accept only known generic replacement reasons, never
+        # an unrelated transaction-specific reason.
+        current_reason = state.get("manual_review_reason", "").strip()
+        allowed_generic_reasons = {
+            "Runtime exception; reconcile wallet and transactions before resuming",
+            (
+                f"RPC wallet monitoring error for {record['source_wallet']}; "
+                "reconcile transactions before resuming"
+            ),
+        }
+        if args.signature not in current_reason and current_reason not in allowed_generic_reasons:
+            raise SystemExit(
+                "ABORT: manual-review reason is neither this signature nor a known "
+                "generic replacement reason; inspect it before reconciling."
+            )
 
         positions = con.execute(
             "SELECT amount_raw FROM positions WHERE mint=?", (args.mint,)
