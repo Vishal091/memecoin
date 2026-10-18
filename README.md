@@ -13,8 +13,8 @@ A local Windows/Python experiment for watching Pump.fun's trader leaderboard and
 - Provides a local dashboard: period selector, top-10 copy button, stop-copy button, position-by-position manual exit, manual exit all, recent trades, and estimated P&L.
 - Tracks positions in a local SQLite ledger; staged take-profits, trailing exits, downside stops, daily pause, total-loss halt, and the seven-day experiment limit are included.
 
-- Optional independent token discovery runs alongside leader copying in **shadow-only mode**: it subscribes to PumpPortal new-token events, samples a capped number of candidates, verifies the mint account and canonical Pump bonding curve, checks mint/freeze authorities and recognized Token-2022 extensions, then scores observed buyer diversity, buy activity, net SOL flow, volume and real bonding-curve reserves. It records hypothetical entries and forward marks separately; it never calls the live buy/sell path.
-- The shadow discovery panel reports rejects and hypothetical returns beside the existing leader-copy positions/trades. It is a measurement tool, not a rug-pull guarantee.
+- Optional independent token discovery runs alongside leader copying in **shadow-only mode by default**. A separate local opt-in can route a fresh passing candidate through the existing live executor, after repeating all on-chain safety checks and global risk gates. Live discovery buys are hard-capped at $0.50 each and at one open discovery position; a screen is not a rug-pull guarantee.
+- The discovery panel reports rejects and hypothetical returns beside the existing leader-copy positions/trades, and labels any live discovery entry separately. It is not a rug-pull guarantee.
 
 ## Important external dependencies
 
@@ -55,12 +55,16 @@ Run a connectivity/configuration check and start the bot:
 
 The console should print a local dashboard URL, normally `http://127.0.0.1:8765`. Open it in your browser. Choose Day, Week, Month, or Overall composite and click **Copy this Top 10**. Use **Stop copying** to prevent new copy entries; existing positions remain managed. Each open position has a **Manual exit** button, and **Manual exit all** submits exits for all tracked positions.
 
-### Side-by-side independent token discovery (shadow only)
+### Independent token discovery (shadow by default; live execution separately opt-in)
 
 The scanner is an add-on; it does not replace or change leader-copy entry/exit behavior. To test both in the same run, add these lines to your **local** `.env` (the sample is `.env.pumpfun.example`):
 
 ```text
 TOKEN_DISCOVERY_ENABLED=true
+# Leave false until you explicitly decide to submit real-money discovery trades.
+TOKEN_DISCOVERY_LIVE_ENABLED=false
+# Hard code ceiling: $0.50 per discovery buy; only lower values are honored.
+TOKEN_DISCOVERY_MAX_ENTRY_USD=0.50
 TOKEN_DISCOVERY_MAX_WATCHED_TOKENS=5
 TOKEN_DISCOVERY_WATCH_SECONDS=180
 TOKEN_DISCOVERY_MAX_LAUNCHES_PER_MINUTE=12
@@ -70,11 +74,11 @@ TOKEN_DISCOVERY_MIN_UNIQUE_BUYERS=5
 TOKEN_DISCOVERY_SHADOW_WINDOW_SECONDS=900
 ```
 
-Restart the bot. The dashboard adds **Independent token discovery — SHADOW ONLY**. It will display candidate status, verified real bonding-curve liquidity, unique buyers, observed buy/sell SOL flow, score, and hypothetical entry returns. It uses the same PumpPortal WebSocket as account-trade copying and subscribes to at most five candidate token streams by default; those token-trade messages are metered. New token events that cannot be checked on chain are rejected, and no strategy signal from this scanner is connected to the live trade executor.
+Restart the bot. The dashboard displays candidate status, verified real bonding-curve liquidity, holder concentration, unique buyers, buy/sell SOL flow, score, hypothetical returns, and any live-entry result. It uses the same PumpPortal WebSocket as account-trade copying and subscribes to a capped number of token streams; those token-trade messages are metered. New token events that cannot be checked on chain are rejected.
 
-A candidate can be rejected even when its score looks attractive. This first version covers ungraduated, SOL-quoted Pump bonding curves; migrated PumpSwap pool reserves are not independently verified for a shadow entry. Mint/freeze authority and extension checks reduce specific risks but cannot guarantee that a token is safe or sellable.
+Live execution is deliberately a second opt-in. When you're ready to accept real-money risk, use a dedicated wallet and add `TOKEN_DISCOVERY_LIVE_ENABLED=true` to the local `.env` while keeping `TOKEN_DISCOVERY_ENABLED=true`, `BOT_MODE=live`, and the required live confirmation setting. Each buy is capped in code at $0.50 even if `TOKEN_DISCOVERY_MAX_ENTRY_USD` is set higher; at most one position tagged `token_discovery` can be open. Old shadow entries from previous bot runs are marked stale and are not bought. Live entries repeat the mint authority, freeze authority, Token-2022 extension, holder concentration, quote-mint and canonical curve checks immediately before execution, then must pass the existing global exposure/drawdown gates. Existing position management is responsible for exits, but neither a stop nor any liquidity check guarantees a successful sale.
 
-For a first comparison, leave this feature in shadow mode for a meaningful sample and compare candidate returns at 1, 5 and 15 minutes with actual leader-copy trade outcomes. The scores/thresholds are hypotheses to measure, not claims of profitability. `TOKEN_DISCOVERY_ENABLED=false` remains the default, and the discovery engine has no live-trading switch.
+This initial version only enters ungraduated SOL-quoted Pump bonding curves. It does not enter migrated PumpSwap pools whose reserves have not been independently verified. Token screens and score thresholds are hypotheses, not claims of profitability. Keep `TOKEN_DISCOVERY_LIVE_ENABLED=false` until you specifically choose to begin this live trial.
 
 The first RPC fallback sync records each watch wallet's latest signature instead of replaying its historical trades. The WebSocket path follows new events after its subscription is active.
 
