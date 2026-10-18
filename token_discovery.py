@@ -94,6 +94,7 @@ class TokenDiscoveryShadow:
         self._recent_scans: deque[float] = deque()
         self._last_chain_check: dict[str, float] = {}
         self._last_skip_log_at = 0.0
+        self._last_subscription_refresh = 0.0
         self.stats = {
             "launch_events": 0,
             "safety_scans": 0,
@@ -170,14 +171,36 @@ class TokenDiscoveryShadow:
         if not self.feed:
             return
         now = time.time()
+        rows = self.candidates(500)
+        live_position_mints = set()
+        if hasattr(self.store, "list_positions"):
+            live_position_mints = {
+                str(p.get("mint") or "")
+                for p in self.store.list_positions()
+                if p.get("strategy", "leader_copy") == "token_discovery"
+            }
         tokens = []
-        for c in self.candidates(500):
+        # Keep a live discovery position on the trade stream after its original
+        # observation window; price updates are important for automatic exits.
+        for c in rows:
+            mint = str(c.get("mint") or "")
+            if mint in live_position_mints:
+                expiry = float(c.get("subscription_expires_at", 0) or 0)
+                if expiry < now + 60:
+                    c["subscribed"] = True
+                    c["subscription_expires_at"] = now + max(self.watch_seconds, 120)
+                    self._save(c)
+                tokens.append(mint)
+        for c in rows:
+            mint = str(c.get("mint") or "")
+            if mint in live_position_mints or mint in tokens:
+                continue
             if (
                 c.get("subscribed")
                 and float(c.get("subscription_expires_at", 0)) > now
                 and c.get("status") in {"watching", "shadow_open"}
             ):
-                tokens.append(str(c.get("mint", "")))
+                tokens.append(mint)
         self.feed.set_discovery_subscriptions(self.enabled, tokens[:self.max_watched])
 
     def _active_watch_count(self, now: float) -> int:
@@ -738,8 +761,11 @@ class TokenDiscoveryShadow:
                         c["reason"] = f"Shadow mark unavailable ({type(exc).__name__}); retaining last mark"
                 self._save(c)
                 changed = True
-        if changed:
+        # Refresh subscriptions periodically so a live held token remains streamed
+        # and completed shadow-only candidates are eventually unsubscribed.
+        if changed or now - self._last_subscription_refresh >= 30:
             self._update_feed_subscriptions()
+            self._last_subscription_refresh = now
         self._trim_candidates()
 
     def _trim_candidates(self) -> None:
