@@ -908,13 +908,6 @@ class PumpFunBot:
                     source_signature=str(signal.get("signature") or ""),
                 )
                 return
-            except TransactionOutcomeUncertain as exc:
-                self._handle_uncertain_trade(
-                    exc,
-                    source_wallet=source_wallet,
-                    source_signature=source_signature,
-                )
-                return False
             except TransactionBuildFailed as exc:
                 delay = self._defer_native_build_retry(mint, str(exc))
                 logger.warning(
@@ -1006,6 +999,13 @@ class PumpFunBot:
                     slippage_bps=self.s.slippage_bps, preferred_pool=preferred,
                     amount_raw=requested_raw,
                 )
+            except TransactionOutcomeUncertain as exc:
+                self._handle_uncertain_trade(
+                    exc,
+                    source_wallet=source_wallet,
+                    source_signature=source_signature,
+                )
+                return False
             except TransactionBuildFailed as exc:
                 delay = self._defer_native_build_retry(mint, str(exc))
                 logger.error(
