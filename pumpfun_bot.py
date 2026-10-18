@@ -1209,7 +1209,7 @@ class PumpFunBot:
             effective_price = spend / raw_to_units(raw_out, decimals)
 
         # Start the hold timer only after the buy has succeeded and its fill is known.
-        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        timestamp = datetime.now(timezone.utc).isoformat()
         position = {
             "mint": mint, "decimals": decimals, "amount_raw": str(raw_out),
             "entry_price_usd": effective_price, "initial_amount_raw": str(raw_out),
