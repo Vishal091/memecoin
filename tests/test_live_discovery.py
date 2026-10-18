@@ -270,6 +270,19 @@ class LiveDiscoveryCandidateGatesTests(unittest.TestCase):
         self.assertEqual(bot.buy_calls, [])
         self.assertEqual(scanner.candidate["live_entry_status"], "skipped_stale")
 
+    def test_interrupted_prior_submission_needs_reconciliation_and_is_not_replayed(self):
+        c = self.candidate(time.time() - 60)
+        c["live_entry_status"] = "submitting"
+        scanner = self.FakeDiscovery(c)
+        bot = self.make_bot(c, scanner)
+        bot.run_started_at = time.time() - 1
+
+        bot._process_discovery_live_entries()
+
+        self.assertEqual(bot.buy_calls, [])
+        self.assertEqual(scanner.candidate["live_entry_status"], "needs_reconciliation")
+        self.assertIn("No automatic retry", scanner.candidate["live_entry_reason"])
+
     def test_rechecks_on_chain_then_sends_only_capped_entry(self):
         c = self.candidate(time.time() - 1)
         scanner = self.FakeDiscovery(c, {
