@@ -128,7 +128,9 @@ class TokenDiscoveryShadow:
     def candidates(self, limit: int = 25) -> list[dict]:
         if not hasattr(self.store, "list_state_prefix"):
             return []
-        rows = self.store.list_state_prefix(STATE_PREFIX, limit=max(limit, 200))
+        # Candidate history is pruned to 300 records, so read the bounded ledger
+        # before sorting by last_updated_at (SQLite row order is creation order).
+        rows = self.store.list_state_prefix(STATE_PREFIX, limit=10000)
         candidates = []
         for _key, raw in rows:
             try:
@@ -406,9 +408,26 @@ class TokenDiscoveryShadow:
         if not isinstance(curve, PumpCurveSnapshot):
             raise RuntimeError("curve data unavailable")
         if curve.complete:
+            # A shadow entry may graduate during its observation window. Continue
+            # measuring its mark using indexed market data, but never claim that
+            # Dexscreener's liquidity field is an on-chain reserve verification.
+            if c.get("status") == "shadow_open":
+                try:
+                    market = self.market.token_market(mint)
+                except Exception:
+                    market = None
+                if market and float(market.get("price_usd") or 0) > 0:
+                    c["price_usd"] = float(market["price_usd"])
+                    c["shadow_mark_source"] = "indexed market price; migrated pool reserves not independently verified"
+                    c["reason"] = "Graduated; shadow performance marked from indexed market price only"
+                    c["last_chain_check"] = time.time()
+                    self._last_chain_check[mint] = c["last_chain_check"]
+                    return c
             c["status"] = "graduated_unverified"
-            c["reason"] = "Bonding curve completed; migrated PumpSwap reserves are not verified by this shadow version"
+            c["reason"] = "Bonding curve completed before shadow entry; migrated PumpSwap reserves are not verified by this version"
             c["subscribed"] = False
+            c["last_chain_check"] = time.time()
+            self._last_chain_check[mint] = c["last_chain_check"]
             return c
         sol_price = float(self.market.sol_price_usd())
         c["real_liquidity_usd"] = curve.liquidity_usd(sol_price)
@@ -473,6 +492,15 @@ class TokenDiscoveryShadow:
             c["last_trade_signature"] = signature
         c["last_trade_at"] = time.time()
         c["observed_trades"] = int(c.get("observed_trades", 0)) + 1
+        try:
+            token_amount = abs(float(event.get("tokenAmount") or event.get("token_amount") or 0))
+            if token_amount > 0:
+                observed_price = (sol_amount / token_amount) * float(self.market.sol_price_usd())
+                if observed_price > 0:
+                    c["price_usd"] = observed_price
+                    c["shadow_mark_source"] = "PumpPortal trade estimate"
+        except (TypeError, ValueError, RuntimeError):
+            pass
         if side == "buy":
             c["buy_trades"] = int(c.get("buy_trades", 0)) + 1
             c["buy_volume_sol"] = round(float(c.get("buy_volume_sol", 0)) + sol_amount, 9)
