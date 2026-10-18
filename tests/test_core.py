@@ -924,6 +924,75 @@ class StorageTests(unittest.TestCase):
 
 
 
+class ConfirmedExitLedgerReconciliationTests(unittest.TestCase):
+    def test_reconciliation_atomically_removes_position_without_inventing_pnl(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = Store(Path(temp) / "reconcile.db", 10, mode="live")
+            position = {
+                "mint": "test-mint",
+                "decimals": 6,
+                "amount_raw": "110517218",
+                "entry_price_usd": 0.0104,
+                "initial_amount_raw": "110517218",
+                "peak_price_usd": 0.0104,
+                "tp1_done": 0,
+                "tp2_done": 0,
+                "opened_at": "2026-10-18T10:19:16+00:00",
+                "last_price_usd": 0.0076,
+                "invested_usd": 1.15,
+                "source_wallet": "leader-wallet",
+                "source_signature": "leader-signal",
+                "strategy": "leader_copy",
+            }
+            store.upsert_position(position)
+            store.set_state("exit_pending:test-mint", "manual exit requested from dashboard")
+            store.set_state("exit_blocked_balance_zero:test-mint", "zero balance")
+            ok = store.reconcile_confirmed_full_exit(
+                position,
+                mode="live",
+                tx_signature="confirmed-full-sale-signature",
+                ts="2026-10-18T13:58:14+00:00",
+                reason="Verified full PumpSwap sale; USD proceeds/P&L not reconstructed.",
+            )
+
+            self.assertTrue(ok)
+            self.assertIsNone(store.get_position("test-mint"))
+            trades = store.recent_trades(5)
+            self.assertEqual(len(trades), 1)
+            self.assertEqual(trades[0]["action"], "RECONCILED_EXIT")
+            self.assertEqual(trades[0]["tx_signature"], "confirmed-full-sale-signature")
+            self.assertEqual(trades[0]["value_usd"], 0.0)
+            self.assertEqual(trades[0]["pnl_usd"], 0.0)
+            self.assertEqual(store.get_state("exit_pending:test-mint"), "")
+            self.assertEqual(store.get_state("exit_blocked_balance_zero:test-mint"), "")
+            self.assertEqual(
+                store.get_state("exit_reconciled:test-mint"),
+                "confirmed-full-sale-signature",
+            )
+            store.close()
+
+    def test_reconciliation_refuses_to_delete_changed_position_amount(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = Store(Path(temp) / "reconcile.db", 10, mode="live")
+            position = {
+                "mint": "test-mint", "decimals": 6, "amount_raw": "1000",
+                "entry_price_usd": 1.0, "initial_amount_raw": "1000",
+                "peak_price_usd": 1.0, "tp1_done": 0, "tp2_done": 0,
+                "opened_at": "2026-10-18T10:19:16+00:00",
+                "last_price_usd": 1.0, "invested_usd": 1.0,
+                "source_wallet": "", "source_signature": "",
+            }
+            store.upsert_position(position)
+            changed = dict(position, amount_raw="900")
+            self.assertFalse(store.reconcile_confirmed_full_exit(
+                changed, mode="live", tx_signature="sale-signature",
+                ts="2026-10-18T13:58:14+00:00", reason="Test"
+            ))
+            self.assertEqual(store.get_position("test-mint")["amount_raw"], "1000")
+            self.assertEqual(store.recent_trades(5), [])
+            store.close()
+
+
 class TransactionOutcomeHandlingTests(unittest.TestCase):
     class FakeStore:
         def __init__(self):
