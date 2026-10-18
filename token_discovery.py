@@ -684,10 +684,15 @@ class TokenDiscoveryShadow:
             c["reason"] = "SHADOW ENTRY only; no wallet transaction was submitted"
             self.stats["shadow_entries"] += 1
             self.stats["last_would_buy_at"] = now
+            live_mode_note = (
+                "live-entry preflight enabled; order still requires fresh checks"
+                if self.live_enabled and str(getattr(self.settings, "mode", "")).lower() == "live"
+                else "NO LIVE ORDER (shadow-only mode)"
+            )
             logger.warning(
-                "SHADOW WOULD-BUY mint=%s score=%d buyers=%d real_curve_liquidity=$%.0f buy_sol=%.3f sell_sol=%.3f; NO LIVE ORDER",
+                "SHADOW WOULD-BUY mint=%s score=%d buyers=%d real_curve_liquidity=$%.0f buy_sol=%.3f sell_sol=%.3f; %s",
                 str(c["mint"])[:8], c["score"], c["unique_buyers"], c["real_liquidity_usd"],
-                c["buy_volume_sol"], c["sell_volume_sol"],
+                c["buy_volume_sol"], c["sell_volume_sol"], live_mode_note,
             )
         return c
 
