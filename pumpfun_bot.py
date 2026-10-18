@@ -1098,20 +1098,27 @@ class PumpFunBot:
         # Keep the legacy PumpPortal exception only for account-trade events.
         # RPC notifications may bypass a young/unindexed pair-age filter only
         # when an on-chain curve snapshot independently confirms sufficient liquidity.
-        allow_unindexed_account_trade = (
-            self.s.allow_unindexed_pump_curve and is_realtime_signal
-            and venue in {"pump", "pump-amm"}
-        )
+        # Do not allow a websocket signal to bypass the minimum liquidity floor.
+        # Discovery can use the canonical on-chain curve only after its fresh
+        # security/liquidity checks; regular leader-copy entries need indexed market data.
         allow_verified_curve_age_bypass = (
-            self.s.allow_unindexed_pump_curve and curve_state_verified
+            strategy == "token_discovery"
+            and self.s.allow_unindexed_pump_curve
+            and curve_state_verified
             and curve_liquidity >= self.s.min_liquidity_usd
             and venue == "pump"
         )
         unindexed_pump_entry = (
-            (allow_unindexed_account_trade or allow_verified_curve_age_bypass)
+            allow_verified_curve_age_bypass
             and (market is None or int(market.get("pair_age_seconds") or 0) < self.s.min_pair_age_seconds)
         )
-        if actual_liquidity < self.s.min_liquidity_usd and not allow_unindexed_account_trade:
+        if strategy == "leader_copy" and market is None:
+            logger.info(
+                "Reject copied buy %s: indexed market pair unavailable; cannot verify liquidity and pair age",
+                mint[:8],
+            )
+            return
+        if actual_liquidity < self.s.min_liquidity_usd:
             logger.info("Reject Pump.fun buy %s: verified/observed liquidity %.0f USD below %.0f USD",
                         mint, actual_liquidity, self.s.min_liquidity_usd)
             return
@@ -1526,6 +1533,20 @@ class PumpFunBot:
             # Only transient preflight failures are retryable. All submitted,
             # uncertain, failed, and non-transient blocked attempts remain one-shot.
             if live_status and not retrying:
+                continue
+
+            max_age_hours = max(
+                1, min(24, int(getattr(self.s, "token_discovery_max_token_age_hours", 24)))
+            )
+            try:
+                observed_launch_at = float(candidate.get("created_at") or entry_at)
+            except (TypeError, ValueError):
+                observed_launch_at = entry_at
+            if observed_launch_at > now or now - observed_launch_at > max_age_hours * 3600:
+                self._set_discovery_live_status(
+                    candidate, "skipped_stale",
+                    f"Launch event is outside the maximum {max_age_hours}-hour age window; no live buy",
+                )
                 continue
 
             if (
