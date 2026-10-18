@@ -365,6 +365,32 @@ class TransactionOutcomeHandlingTests(unittest.TestCase):
         bot.logs_feed = None
         return bot
 
+    def test_followup_runtime_issue_does_not_overwrite_existing_manual_review_reason(self):
+        bot = self._bot()
+        reason = "SELL outcome unresolved for mint test-mint; signature important-signature"
+        bot.store.set_state("manual_review_halt", "1")
+        bot.store.set_state("manual_review_reason", reason)
+
+        bot._activate_manual_review_halt(
+            "Runtime exception; reconcile wallet and transactions before resuming"
+        )
+
+        self.assertEqual(bot.store.get_state("manual_review_halt"), "1")
+        self.assertEqual(bot.store.get_state("manual_review_reason"), reason)
+
+    def test_new_uncertain_trade_appends_signature_to_existing_manual_review_reason(self):
+        bot = self._bot()
+        bot.store.set_state("manual_review_halt", "1")
+        bot.store.set_state("manual_review_reason", "RPC wallet monitoring error")
+        bot._activate_manual_review_halt(
+            "SELL outcome unresolved for mint test-mint; signature important-signature",
+            append_reason=True,
+        )
+
+        reason = bot.store.get_state("manual_review_reason")
+        self.assertIn("RPC wallet monitoring error", reason)
+        self.assertIn("important-signature", reason)
+
     def test_uncertain_buy_halts_copy_records_signature_and_consumes_source_signal(self):
         import json
         bot = self._bot()
