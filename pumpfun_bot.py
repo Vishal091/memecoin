@@ -1053,9 +1053,15 @@ class PumpFunBot:
         if self._native_build_retry_deferred(mint):
             logger.debug("Sell builder for mint=%s is in pre-submission cooldown", mint[:8])
             return False
-        full_exit = (reason in {"marked loss stop", "trailing stop"} or
+        # Position management wraps a persisted exit reason for dispatch. Unwrap
+        # repeated wrappers before storing/logging it again so failed retries do not
+        # accumulate "pending exit: pending exit: ..." indefinitely.
+        was_pending_exit = reason.startswith("pending exit:")
+        while reason.startswith("pending exit:"):
+            reason = reason[len("pending exit:"):].strip()
+        full_exit = (was_pending_exit or reason in {"marked loss stop", "trailing stop"} or
                      reason.startswith("followed wallet ") or reason.startswith("experiment expiry") or
-                     reason.startswith("total loss limit") or reason.startswith("pending exit:"))
+                     reason.startswith("total loss limit"))
         pending_key = f"exit_pending:{mint}"
         if full_exit:
             self.store.set_state(pending_key, reason)
