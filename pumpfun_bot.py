@@ -394,6 +394,9 @@ class PumpFunBot:
                 "entry_market_cap_source": entry_mc_source,
                 "current_market_cap_usd": current_mc or None,
                 "current_market_cap_source": current_mc_source,
+                "exit_blocked_reason": self.store.get_state(
+                    f"exit_blocked_balance_zero:{p['mint']}", ""
+                ),
             })
         trades = self.store.recent_trades(15)
         leaders = {}
@@ -533,6 +536,9 @@ class PumpFunBot:
                 # Clear its amount/source metadata so we liquidate the remaining
                 # tracked balance, not just the earlier partial-sell quantity.
                 reason = "manual exit requested from dashboard"
+                # A deliberate retry clears the previous zero-balance block and
+                # submits a fresh read, but never overrides unresolved transactions.
+                self.store.set_state(f"exit_blocked_balance_zero:{mint}", "")
                 self.store.set_state(f"exit_pending:{mint}", reason)
                 self.store.set_state(f"exit_pending_amount_raw:{mint}", "")
                 self.store.set_state(f"exit_pending_source_wallet:{mint}", "")
@@ -557,6 +563,7 @@ class PumpFunBot:
                 unresolved_count = 0
                 for position in positions:
                     mint = str(position["mint"])
+                    self.store.set_state(f"exit_blocked_balance_zero:{mint}", "")
                     self.store.set_state(
                         f"exit_pending:{mint}", "manual exit all requested from dashboard"
                     )
@@ -1494,12 +1501,28 @@ class PumpFunBot:
             available = self.executor.token_balance_raw(self.wallet_address, mint)
             requested_raw = min(requested_raw, available)
             if requested_raw <= 0:
+                detail = (
+                    "Configured wallet reports zero token balance after mint and token-program "
+                    "queries; verify the wallet and on-chain holdings before retrying."
+                )
+                self.store.set_state(f"exit_blocked_balance_zero:{mint}", detail)
+                # Stop the 1.5-second retry loop. Keep the ledger position visible,
+                # but clear the pending attempt until a human requests a fresh retry.
+                self.store.set_state(f"exit_pending:{mint}", "")
+                self.store.set_state(f"exit_pending_amount_raw:{mint}", "")
+                self.store.set_state(f"exit_pending_source_wallet:{mint}", "")
+                self.store.set_state(f"exit_pending_source_signature:{mint}", "")
                 if manual_exit:
                     self.message = (
-                        f"Manual exit for {mint[:8]} could not submit: wallet token balance is zero "
-                        "or unavailable; tracked position retained for reconciliation."
+                        f"Manual exit for {mint[:8]} paused: zero token balance was reported by "
+                        "the configured wallet RPC. Verify on-chain holdings; click Manual exit "
+                        "again only after confirming the balance or correcting the RPC/wallet."
                     )
-                logger.error("No live token balance for %s; retaining position for manual reconciliation", mint)
+                logger.error(
+                    "Sell paused for %s: token balance is zero after fallback lookup; "
+                    "position retained and automatic retry suppressed pending reconciliation",
+                    mint,
+                )
                 return False
             units_requested = raw_to_units(requested_raw, decimals)
             preferred = self.store.get_state(f"pool:{mint}", "pump")
@@ -1585,6 +1608,7 @@ class PumpFunBot:
         else:
             self.price_cache[mint] = mark_price
             self.price_cache_at[mint] = time.time()
+        self.store.set_state(f"exit_blocked_balance_zero:{mint}", "")
         self.store.set_state(pending_key, "")
         self.store.set_state(pending_amount_key, "")
         self.store.set_state(pending_wallet_key, "")
@@ -1920,6 +1944,10 @@ class PumpFunBot:
             mint = original["mint"]
             position = self.store.get_position(mint)
             if not position:
+                continue
+            if self.store.get_state(f"exit_blocked_balance_zero:{mint}", ""):
+                # An exit can't be executed while the configured wallet reports
+                # no tokens. Wait for an explicit manual retry after reconciliation.
                 continue
             pending = self.store.get_state(f"exit_pending:{mint}", "")
             if pending:
