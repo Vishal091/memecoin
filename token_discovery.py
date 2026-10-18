@@ -1172,8 +1172,9 @@ class TokenDiscoveryShadow:
         if not self.enabled:
             return
         now = time.time()
-        self._start_recent_launch_backfill(now)
+        # Drain a completed page before deciding whether another backfill request is due.
         self._drain_recent_launch_backfill(now)
+        self._start_recent_launch_backfill(now)
         changed = False
         rows = self.candidates(500)
         # Only a bounded number of active tokens are polled. Candidates from the free
