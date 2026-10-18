@@ -81,18 +81,17 @@ class LossStreakCircuitBreakerTests(unittest.TestCase):
         bot.s = SimpleNamespace(max_consecutive_losses=3)
         return bot
 
-    def test_three_losing_exits_pause_new_entries_until_next_utc_day(self):
+    def test_three_losing_exits_warn_but_do_not_pause_new_entries(self):
         bot = self._bot()
-        with self.assertLogs("pumpfun", level="ERROR") as logs:
+        with self.assertLogs("pumpfun", level="WARNING") as logs:
             bot._record_realized_exit_risk(-0.10)
             bot._record_realized_exit_risk(-0.05)
             bot._record_realized_exit_risk(-0.02)
 
-        today = datetime.now(timezone.utc).date().isoformat()
         self.assertEqual(bot.store.get_state("consecutive_losing_exits"), "3")
-        self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), today)
-        self.assertIn("Consecutive-loss circuit breaker activated", "\n".join(logs.output))
-        self.assertIn("Consecutive-loss pause active", bot._copy_block_reason())
+        self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), "")
+        self.assertIn("recording warning only", "\n".join(logs.output))
+        self.assertEqual(bot._copy_block_reason(), "")
 
     def test_positive_realized_exit_resets_the_loss_streak(self):
         bot = self._bot()
@@ -102,17 +101,15 @@ class LossStreakCircuitBreakerTests(unittest.TestCase):
         self.assertEqual(bot.store.get_state("consecutive_losing_exits"), "0")
         self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), "")
 
-    def test_profitable_exit_does_not_release_a_daily_pause_once_latched(self):
+    def test_profitable_exit_resets_loss_streak_without_any_pause(self):
         bot = self._bot()
-        with self.assertLogs("pumpfun", level="ERROR"):
-            bot._record_realized_exit_risk(-0.10)
-            bot._record_realized_exit_risk(-0.05)
-            bot._record_realized_exit_risk(-0.02)
-        pause_day = bot.store.get_state("consecutive_loss_pause_day")
+        bot._record_realized_exit_risk(-0.10)
+        bot._record_realized_exit_risk(-0.05)
+        bot._record_realized_exit_risk(-0.02)
         bot._record_realized_exit_risk(0.50)
-        self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), pause_day)
-        self.assertEqual(bot.store.get_state("consecutive_losing_exits"), "3")
-        self.assertIn("Consecutive-loss pause active", bot._loss_streak_pause_reason())
+        self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), "")
+        self.assertEqual(bot.store.get_state("consecutive_losing_exits"), "0")
+        self.assertEqual(bot._loss_streak_pause_reason(), "")
 
     def test_stale_pause_is_cleared_on_a_later_utc_day(self):
         bot = self._bot({
@@ -741,30 +738,24 @@ class CopySafetyGateTests(unittest.TestCase):
         bot.logs_feed = None
         return bot
 
-    def test_overall_loss_halt_has_clear_copy_block_reason(self):
+    def test_legacy_overall_loss_flag_does_not_block_copy_entries(self):
         bot = self._bot({"halted": "1", "halt_reason": "Total loss limit reached"})
-        self.assertEqual(
-            bot._copy_block_reason(),
-            "Overall loss halt active: Total loss limit reached",
-        )
+        self.assertEqual(bot._copy_block_reason(), "")
 
-    def test_manual_review_halt_has_clear_copy_block_reason(self):
+    def test_legacy_manual_review_flag_does_not_block_copy_entries(self):
         bot = self._bot({
             "manual_review_halt": "1",
             "manual_review_reason": "Reconcile wallet before resuming",
         })
-        self.assertEqual(
-            bot._copy_block_reason(),
-            "Manual-review halt active: Reconcile wallet before resuming",
-        )
+        self.assertEqual(bot._copy_block_reason(), "")
 
-    def test_blocked_copy_does_not_subscribe_to_new_leaders(self):
+    def test_rpc_manual_review_flag_does_not_block_new_leader_subscriptions(self):
         bot = self._bot({
             "manual_review_halt": "1",
-            "manual_review_reason": "Reconcile wallet before resuming",
+            "manual_review_reason": "RPC wallet monitoring error",
         })
         bot._refresh_feed_subscriptions()
-        self.assertEqual(bot.active_wallets, set())
+        self.assertEqual(bot.active_wallets, {"leader-wallet"})
 
     def test_held_position_leader_remains_monitored_when_copy_is_blocked(self):
         position = {"mint": "open-mint", "source_wallet": "held-leader"}
@@ -1046,7 +1037,7 @@ class TransactionOutcomeHandlingTests(unittest.TestCase):
             "Runtime exception; reconcile wallet and transactions before resuming"
         )
 
-        self.assertEqual(bot.store.get_state("manual_review_halt"), "1")
+        self.assertEqual(bot.store.get_state("manual_review_halt"), "0")
         self.assertEqual(bot.store.get_state("manual_review_reason"), reason)
 
     def test_new_uncertain_trade_appends_signature_to_existing_manual_review_reason(self):
@@ -1061,6 +1052,7 @@ class TransactionOutcomeHandlingTests(unittest.TestCase):
         reason = bot.store.get_state("manual_review_reason")
         self.assertIn("RPC wallet monitoring error", reason)
         self.assertIn("important-signature", reason)
+        self.assertEqual(bot.store.get_state("manual_review_halt"), "0")
 
     def test_uncertain_buy_halts_copy_records_signature_and_consumes_source_signal(self):
         import json
@@ -1075,9 +1067,9 @@ class TransactionOutcomeHandlingTests(unittest.TestCase):
             source_signature="leader-signature",
         )
 
-        self.assertEqual(bot.store.get_state("manual_review_halt"), "1")
-        self.assertEqual(bot.store.get_state("auto_copy_enabled"), "0")
-        self.assertEqual(bot.store.get_state("copy_paused"), "1")
+        self.assertEqual(bot.store.get_state("manual_review_halt"), "0")
+        self.assertEqual(bot.store.get_state("auto_copy_enabled"), "1")
+        self.assertEqual(bot.store.get_state("copy_paused"), "0")
         self.assertIn("submitted-signature", bot.store.get_state("manual_review_reason"))
         record = json.loads(bot.store.get_state("unresolved_trade:test-mint"))
         self.assertEqual(record["signature"], "submitted-signature")
