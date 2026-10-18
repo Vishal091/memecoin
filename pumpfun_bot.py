@@ -1731,7 +1731,7 @@ class PumpFunBot:
 
         now = time.time()
         hard_cap = min(0.50, float(self.s.token_discovery_max_entry_usd))
-        for candidate in self.token_discovery.candidates(300):
+        for candidate in self.token_discovery.candidates(10000):
             if candidate.get("status") != "shadow_open" or not candidate.get("would_buy"):
                 continue
             live_status = str(candidate.get("live_entry_status") or "")
