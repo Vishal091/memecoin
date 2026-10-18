@@ -280,6 +280,49 @@ class LiveDiscoveryCandidateGatesTests(unittest.TestCase):
         self.assertEqual(bot.buy_calls, [])
         self.assertEqual(scanner.candidate["live_entry_status"], "skipped_stale")
 
+    def test_transient_low_liquidity_retries_while_original_entry_is_fresh(self):
+        c = self.candidate(time.time() - 1)
+        c["real_liquidity_usd"] = 3000.0
+        scanner = self.FakeDiscovery(c, {
+            "safe": True, "liquidity_usd": 2176.0, "price_usd": 0.00011,
+            "decimals": 6, "checks": ["authorities absent"],
+            "top5_holder_supply_pct": 20.0, "creator_supply_pct": 10.0,
+        })
+        bot = self.make_bot(c, scanner)
+        bot.s.token_discovery_min_liquidity_usd = 2500.0
+
+        bot._process_discovery_live_entries()
+
+        self.assertEqual(bot.buy_calls, [])
+        self.assertEqual(scanner.candidate["live_entry_status"], "retryable")
+        self.assertIn("no transaction submitted", scanner.candidate["live_entry_reason"])
+        self.assertEqual(scanner.candidate["live_entry_retry_count"], 1)
+
+        scanner.candidate["live_entry_retry_at"] = time.time() - 1
+        scanner.inspected = {
+            "safe": True, "liquidity_usd": 3100.0, "price_usd": 0.00011,
+            "decimals": 6, "checks": ["authorities absent"],
+            "top5_holder_supply_pct": 20.0, "creator_supply_pct": 10.0,
+        }
+        bot._process_discovery_live_entries()
+
+        self.assertEqual(len(bot.buy_calls), 1)
+        self.assertEqual(scanner.candidate["live_entry_status"], "opened")
+
+    def test_transient_preflight_retry_never_buys_after_freshness_window_expires(self):
+        c = self.candidate(time.time() - 60)
+        c["live_entry_status"] = "retryable"
+        c["live_entry_retry_at"] = time.time() - 1
+        scanner = self.FakeDiscovery(c)
+        bot = self.make_bot(c, scanner)
+        bot.run_started_at = time.time() - 1
+
+        bot._process_discovery_live_entries()
+
+        self.assertEqual(bot.buy_calls, [])
+        self.assertEqual(scanner.candidate["live_entry_status"], "skipped_stale")
+        self.assertIn("no catch-up", scanner.candidate["live_entry_reason"])
+
     def test_interrupted_prior_submission_needs_reconciliation_and_is_not_replayed(self):
         c = self.candidate(time.time() - 60)
         c["live_entry_status"] = "submitting"
