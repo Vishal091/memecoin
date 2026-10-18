@@ -22,8 +22,8 @@ A local Windows/Python experiment for watching Pump.fun's trader leaderboard and
 2. **PumpPortal trade feed:** the account-trade stream needs a PumpPortal API key. The stream is metered; PumpPortal's published data-feed conditions have included a linked wallet minimum and fees per events. Check the [current PumpPortal documentation and fees](https://pumpportal.fun/) before enabling it, especially with a $10 bankroll.
 3. **Trading fees:** PumpPortal's Local Transaction API charges a per-trade fee in addition to Solana network and Pump protocol/creator fees. Entry and exit both cost money. Verify the current [PumpPortal fee schedule](https://pumpportal.fun/fees/).
 4. **Independent discovery usage:** PumpPortal documents new-token subscription as free, but token-specific trade streams are metered. The shadow scanner caps active token-trade subscriptions (default five) and launch safety scans (default 12/minute). Review the current [PumpPortal data-feed terms](https://pumpportal.fun/data-api/real-time/) and [fee schedule](https://pumpportal.fun/fees/) before enabling it.
-4. **Not truly instantaneous:** WebSocket notification and RPC confirmation still add latency. Your copy entry price can be materially worse than the leaderboard trader's price. A stopped token can be unsellable; manual exit and automatic stop buttons only attempt a sale.
-5. **No guaranteed top traders:** leaderboard ranking shows the platform's selected metric/period, not independent proof of risk-adjusted future returns. Rankings can change and a winner over one window can lose money in the next.
+5. **Not truly instantaneous:** WebSocket notification and RPC confirmation still add latency. Your copy entry price can be materially worse than the leaderboard trader's price. A stopped token can be unsellable; manual exit and automatic stop buttons only attempt a sale.
+6. **No guaranteed top traders:** leaderboard ranking shows the platform's selected metric/period, not independent proof of risk-adjusted future returns. Rankings can change and a winner over one window can lose money in the next.
 
 ## Quick start (PowerShell)
 
