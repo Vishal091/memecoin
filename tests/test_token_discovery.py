@@ -274,6 +274,39 @@ class TokenDiscoveryShadowTests(unittest.TestCase):
         self.assertEqual(scanner.stats["shadow_entries"], 1)
         self.assertNotIn("trades", store.state)
 
+    def test_tick_can_create_shadow_entry_after_real_curve_liquidity_recovers(self):
+        store = FakeStore()
+        feed = FakeFeed()
+        scanner = TokenDiscoveryShadow(settings(), FakeRPC(), FakeMarket(), store, feed)
+        old = time.time() - 20
+        candidate = {
+            "mint": MINT, "name": "ShadowTest", "symbol": "SHT",
+            "status": "watching", "reason": "waiting for liquidity",
+            "security_passed": True, "subscribed": True,
+            "subscription_expires_at": time.time() + 180,
+            "last_chain_check": old, "created_at": old,
+            "real_liquidity_usd": 500, "price_usd": 0.0001,
+            "score": 0, "score_components": {},
+            "buy_trades": 5, "sell_trades": 0,
+            "unique_buyers": 5,
+            "buyer_wallets": [f"Buyer{i}" for i in range(5)],
+            "buy_volume_sol": 1.5, "sell_volume_sol": 0.0,
+            "last_trade_signature": "recent-trade", "last_trade_at": old,
+            "shadow_entry_price_usd": 0.0, "shadow_entry_at": 0.0,
+            "current_return_pct": 0.0, "max_return_pct": 0.0,
+            "min_return_pct": 0.0, "return_1m_pct": None,
+            "return_5m_pct": None, "return_15m_pct": None,
+        }
+        store.set_state("token_discovery_candidate:" + MINT, json.dumps(candidate))
+
+        scanner.tick()
+
+        observed = json.loads(store.get_state("token_discovery_candidate:" + MINT))
+        self.assertEqual(observed["status"], "shadow_open")
+        self.assertTrue(observed["would_buy"])
+        self.assertGreater(observed["real_liquidity_usd"], 1000)
+        self.assertGreater(observed["shadow_entry_price_usd"], 0)
+
     def test_disabled_discovery_ignores_new_tokens(self):
         store = FakeStore()
         feed = FakeFeed()
