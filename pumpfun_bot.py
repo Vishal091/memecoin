@@ -1401,7 +1401,8 @@ class PumpFunBot:
                 )
             logger.debug("Sell builder for mint=%s is in pre-submission cooldown", mint[:8])
             return False
-        full_exit = (was_pending_exit or reason in {"marked loss stop", "trailing stop"} or
+        full_exit = (was_pending_exit or manual_exit or
+                     reason in {"marked loss stop", "trailing stop"} or
                      reason.startswith("followed wallet ") or reason.startswith("experiment expiry") or
                      reason.startswith("total loss limit"))
         pending_key = f"exit_pending:{mint}"
