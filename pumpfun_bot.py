@@ -246,11 +246,16 @@ class PumpFunBot:
             if mark <= 0:
                 mark = float(p["last_price_usd"])
             move = ((mark / entry) - 1.0) * 100.0 if entry > 0 else 0.0
+            cap_snapshot = self.token_discovery.market_cap_snapshot(p["mint"])
             positions.append({
                 "mint": p["mint"], "amount_raw": p["amount_raw"], "decimals": p["decimals"],
                 "entry_price_usd": entry, "last_price_usd": mark, "move_pct": move,
                 "source_wallet": p.get("source_wallet", ""),
                 "strategy": p.get("strategy", "leader_copy"),
+                "entry_market_cap_usd": cap_snapshot["entry_market_cap_usd"],
+                "entry_market_cap_source": cap_snapshot["entry_market_cap_source"],
+                "current_market_cap_usd": cap_snapshot["current_market_cap_usd"],
+                "current_market_cap_source": cap_snapshot["current_market_cap_source"],
             })
         trades = self.store.recent_trades(15)
         leaders = {}
@@ -1346,6 +1351,8 @@ class PumpFunBot:
             liquidity = float(inspected.get("liquidity_usd") or 0)
             price = float(inspected.get("price_usd") or 0)
             decimals = int(inspected.get("decimals") or 0)
+            total_supply_tokens = float(inspected.get("total_supply_tokens") or candidate.get("total_supply_tokens") or 0)
+            live_entry_market_cap = price * total_supply_tokens if price > 0 and total_supply_tokens > 0 else 0.0
             candidate.update({
                 "security_passed": True,
                 "security_checks": inspected.get("checks", []),
@@ -1353,7 +1360,15 @@ class PumpFunBot:
                 "creator_supply_pct": float(inspected.get("creator_supply_pct") or 0),
                 "real_liquidity_usd": liquidity,
                 "price_usd": price,
+                "total_supply_tokens": total_supply_tokens,
             })
+            if live_entry_market_cap > 0:
+                candidate["market_cap_usd"] = live_entry_market_cap
+                candidate["market_cap_source"] = "Estimated from fresh on-chain curve price × total supply (FDV-style)"
+                candidate["entry_market_cap_usd"] = live_entry_market_cap
+                candidate["entry_market_cap_source"] = "Estimated at fresh live-entry preflight: price × total supply (FDV-style)"
+                candidate["live_entry_market_cap_usd"] = live_entry_market_cap
+                candidate["live_entry_market_cap_source"] = "Estimated at fresh live-entry preflight: price × total supply (FDV-style)"
             if decimals != 6 or liquidity < self.s.token_discovery_min_liquidity_usd or price <= 0:
                 self._set_discovery_live_status(
                     candidate, "blocked",
