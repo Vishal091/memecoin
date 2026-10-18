@@ -84,6 +84,22 @@ The minimum discovery liquidity is enforced at no less than $5,000, the score fl
 
 This initial version only enters ungraduated SOL-quoted Pump bonding curves. It does not enter migrated PumpSwap pools whose reserves have not been independently verified. Token screens and score thresholds are hypotheses, not claims of profitability. Keep `TOKEN_DISCOVERY_LIVE_ENABLED=false` until you specifically choose to begin this live trial.
 
+### Trending Solana-token research (analysis-only)
+
+The bot now has a separate trending-pool research pipeline so discovery is not restricted to brand-new launches. Configure this independently from new-token discovery in the local `.env`:
+
+```text
+TRENDING_DISCOVERY_ENABLED=true
+TRENDING_DISCOVERY_POLL_SECONDS=60
+TRENDING_DISCOVERY_MAX_CANDIDATES=8
+TRENDING_MIN_LIQUIDITY_USD=15000
+TRENDING_MIN_VOLUME_1H_USD=10000
+```
+
+Each scan pulls Solana trending pools from GeckoTerminal, cross-checks available liquidity and trading data against DEX Screener, reads mint controls directly from Solana RPC, and requests a RugCheck report. The dashboard shows momentum ranking, liquidity, volume, short-term price changes, on-chain mint status, RugCheck level, holder concentration, LP lock coverage, missing data, and rejection/review reasons. Minimums are enforced in code at $15,000 reported liquidity and $10,000 1-hour volume; values in `.env` cannot lower those floors.
+
+This pipeline is **analysis-only**. A `SCREENED` result means only that the configured checks passed with the data returned at that scan time; it is not a guarantee against rugs, hidden insider wallets, manipulated volume, or failed exits. If either market source is missing, the data conflicts, the mint cannot be parsed, or RugCheck is unavailable/incomplete, the candidate stays REVIEW/UNKNOWN rather than being treated as safe. The current native executor only supports Pump.fun/PumpSwap routes, so the trending scanner does not automatically buy trending tokens on other DEXes. Adding live entries requires a compatible swap route, transaction simulation, and separate test coverage.
+
 The first RPC fallback sync records each watch wallet's latest signature instead of replaying its historical trades. The WebSocket path follows new events after its subscription is active.
 
 ## About the leaderboard API settings
