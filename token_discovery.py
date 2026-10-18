@@ -130,6 +130,50 @@ class TokenDiscoveryShadow:
             json.dumps(candidate, sort_keys=True, separators=(",", ":")),
         )
 
+    def _market_cap_from_event(self, event: dict) -> tuple[float, str]:
+        """Read explicitly named USD market-cap fields or convert PumpPortal SOL market cap."""
+        for key in ("marketCapUsd", "market_cap_usd", "marketCapUSD"):
+            try:
+                value = float(event.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                return value, f"reported USD field: {key}"
+        for key in ("marketCapSol", "market_cap_sol"):
+            try:
+                value = float(event.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                try:
+                    return value * float(self.market.sol_price_usd()), f"PumpPortal {key} × SOL/USD"
+                except (TypeError, ValueError, RuntimeError):
+                    return 0.0, ""
+        return 0.0, ""
+
+    @staticmethod
+    def _estimated_market_cap(price_usd: float, total_supply_tokens: float) -> tuple[float, str]:
+        if price_usd > 0 and total_supply_tokens > 0:
+            return price_usd * total_supply_tokens, "Estimated: token price × total supply (FDV-style)"
+        return 0.0, ""
+
+    def market_cap_snapshot(self, mint: str) -> dict:
+        candidate = self._load(mint) or {}
+        entry_cap = float(candidate.get("entry_market_cap_usd") or 0)
+        live_entry_cap = float(candidate.get("live_entry_market_cap_usd") or 0)
+        # Prefer the actual live-order preflight estimate for an open live position.
+        if live_entry_cap > 0:
+            entry_cap = live_entry_cap
+        return {
+            "entry_market_cap_usd": entry_cap or None,
+            "entry_market_cap_source": (
+                candidate.get("live_entry_market_cap_source")
+                if live_entry_cap > 0 else candidate.get("entry_market_cap_source")
+            ) or "",
+            "current_market_cap_usd": float(candidate.get("market_cap_usd") or 0) or None,
+            "current_market_cap_source": candidate.get("market_cap_source") or "",
+        }
+
     def candidates(self, limit: int = 25) -> list[dict]:
         if not hasattr(self.store, "list_state_prefix"):
             return []
@@ -334,6 +378,11 @@ class TokenDiscoveryShadow:
 
     def _new_candidate(self, mint: str, event: dict, inspected: dict | None = None) -> dict:
         inspected = inspected or {}
+        price = float(inspected.get("price_usd") or 0)
+        total_supply_tokens = float(inspected.get("total_supply_tokens") or 0)
+        market_cap, market_cap_source = self._market_cap_from_event(event)
+        if market_cap <= 0:
+            market_cap, market_cap_source = self._estimated_market_cap(price, total_supply_tokens)
         return {
             "mint": mint,
             "name": str(event.get("name") or "")[:80],
@@ -347,7 +396,14 @@ class TokenDiscoveryShadow:
             "top5_holder_supply_pct": float(inspected.get("top5_holder_supply_pct") or 0),
             "creator_supply_pct": float(inspected.get("creator_supply_pct") or 0),
             "real_liquidity_usd": float(inspected.get("liquidity_usd") or 0),
-            "price_usd": float(inspected.get("price_usd") or 0),
+            "price_usd": price,
+            "total_supply_tokens": total_supply_tokens,
+            "market_cap_usd": market_cap or None,
+            "market_cap_source": market_cap_source,
+            "entry_market_cap_usd": 0.0,
+            "entry_market_cap_source": "",
+            "live_entry_market_cap_usd": 0.0,
+            "live_entry_market_cap_source": "",
             "score": 0,
             "score_components": {},
             "buy_trades": 0,
@@ -528,6 +584,7 @@ class TokenDiscoveryShadow:
             "liquidity_usd": liquidity,
             "price_usd": price,
             "decimals": decimals,
+            "total_supply_tokens": supply / (10 ** decimals),
             "top5_holder_supply_pct": round(top5_pct, 3),
             "creator_supply_pct": round(creator_pct, 3),
         }
@@ -577,6 +634,12 @@ class TokenDiscoveryShadow:
         price = curve.price_usd(sol_price, decimals=6)
         if price and price > 0:
             c["price_usd"] = price
+            cap, source = self._estimated_market_cap(
+                float(price), float(c.get("total_supply_tokens") or 0)
+            )
+            if cap > 0:
+                c["market_cap_usd"] = cap
+                c["market_cap_source"] = "Estimated from latest on-chain curve price × total supply (FDV-style)"
         c["last_chain_check"] = time.time()
         self._last_chain_check[mint] = c["last_chain_check"]
         return c
@@ -587,6 +650,14 @@ class TokenDiscoveryShadow:
             c["status"] = "shadow_open"
             c["shadow_entry_price_usd"] = float(c["price_usd"])
             c["shadow_entry_at"] = now
+            if float(c.get("market_cap_usd") or 0) <= 0:
+                cap, source = self._estimated_market_cap(
+                    float(c["price_usd"]), float(c.get("total_supply_tokens") or 0)
+                )
+                c["market_cap_usd"] = cap or None
+                c["market_cap_source"] = source
+            c["entry_market_cap_usd"] = float(c.get("market_cap_usd") or 0) or None
+            c["entry_market_cap_source"] = c.get("market_cap_source") or ""
             c["peak_price_usd"] = float(c["price_usd"])
             c["reason"] = "SHADOW ENTRY only; no wallet transaction was submitted"
             self.stats["shadow_entries"] += 1
@@ -661,6 +732,17 @@ class TokenDiscoveryShadow:
                     c["shadow_mark_source"] = "PumpPortal trade estimate"
         except (TypeError, ValueError, RuntimeError):
             pass
+        reported_cap, cap_source = self._market_cap_from_event(event)
+        if reported_cap > 0:
+            c["market_cap_usd"] = reported_cap
+            c["market_cap_source"] = cap_source
+        else:
+            estimated_cap, estimated_source = self._estimated_market_cap(
+                float(c.get("price_usd") or 0), float(c.get("total_supply_tokens") or 0)
+            )
+            if estimated_cap > 0:
+                c["market_cap_usd"] = estimated_cap
+                c["market_cap_source"] = estimated_source
         if side == "buy":
             c["buy_trades"] = int(c.get("buy_trades", 0)) + 1
             c["buy_volume_sol"] = round(float(c.get("buy_volume_sol", 0)) + sol_amount, 9)
