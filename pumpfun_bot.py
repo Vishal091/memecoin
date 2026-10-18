@@ -1193,15 +1193,11 @@ class PumpFunBot:
                 # Discovery slippage failures are known pre-submit events. Let the
                 # discovery controller redo fresh checks while the candidate remains
                 # inside its short freshness window; do not turn them into a global halt.
-                if (
-                    strategy == "token_discovery"
-                    and isinstance(exc, TransactionSimulationFailed)
-                    and exc.retryable
-                ):
+                if strategy == "token_discovery" and isinstance(exc, TransactionSimulationFailed):
                     logger.warning(
-                        "Discovery buy simulation still reports slippage for %s after one fresh rebuild; "
-                        "no transaction was signed or submitted",
-                        mint[:8],
+                        "Discovery buy simulation failed for %s before signing/submission; "
+                        "delegating to fresh-entry recovery (retryable_slippage=%s)",
+                        mint[:8], exc.retryable,
                     )
                     raise
                 delay = self._defer_native_build_retry(mint, str(exc))
