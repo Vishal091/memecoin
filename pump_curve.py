@@ -28,6 +28,8 @@ class PumpCurveSnapshot:
     real_sol_reserves: int
     token_total_supply: int
     complete: bool
+    # None means the legacy account layout ended before quoteMint was appended.
+    quote_mint: str | None = None
 
     def price_usd(self, sol_price_usd: float, decimals: int = 6) -> float | None:
         if self.complete or sol_price_usd <= 0 or self.virtual_token_reserves <= 0 or self.virtual_sol_reserves <= 0:
@@ -74,6 +76,12 @@ def parse_bonding_curve_data(data: Any) -> PumpCurveSnapshot | None:
             return None
         if v_token <= 0 or v_sol <= 0 or total_supply <= 0:
             return None
+        # Current Pump bonding-curve accounts append creator (32 bytes),
+        # mayhem/cashback booleans, then quoteMint after the legacy 49-byte layout.
+        # Legacy accounts remain valid and default to the SOL quote path.
+        quote_mint = None
+        if len(raw) >= 115:
+            quote_mint = str(Pubkey.from_bytes(raw[83:115]))
         return PumpCurveSnapshot(
             virtual_token_reserves=v_token,
             virtual_sol_reserves=v_sol,
@@ -81,6 +89,7 @@ def parse_bonding_curve_data(data: Any) -> PumpCurveSnapshot | None:
             real_sol_reserves=r_sol,
             token_total_supply=total_supply,
             complete=bool(complete_byte),
+            quote_mint=quote_mint,
         )
     except (ValueError, TypeError, struct.error):
         return None

@@ -28,6 +28,8 @@ class PumpPortalAccountFeed(threading.Thread):
         self._lock = threading.Lock()
         self._desired_wallets: tuple[str, ...] = ()
         self._desired_tokens: tuple[str, ...] = ()
+        self._discovery_enabled = False
+        self._discovery_tokens: tuple[str, ...] = ()
         self._stop_event = threading.Event()
         self.connected = threading.Event()
         self.last_error = ""
@@ -52,6 +54,17 @@ class PumpPortalAccountFeed(threading.Thread):
     def get_subscriptions(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
         with self._lock:
             return self._desired_wallets, self._desired_tokens
+
+    def set_discovery_subscriptions(self, enabled: bool, tokens: Iterable[str] = ()) -> None:
+        """Enable the free new-token stream and cap metered token-trade subscriptions."""
+        token_list = tuple(dict.fromkeys(t for t in tokens if t))
+        with self._lock:
+            self._discovery_enabled = bool(enabled)
+            self._discovery_tokens = token_list
+
+    def get_discovery_subscriptions(self) -> tuple[bool, tuple[str, ...]]:
+        with self._lock:
+            return self._discovery_enabled, self._discovery_tokens
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -79,17 +92,23 @@ class PumpPortalAccountFeed(threading.Thread):
                     self.last_error = ""
                     logger.info("Connected to PumpPortal data feed")
                     desired_wallets, desired_tokens = self.get_subscriptions()
+                    discovery_enabled, discovery_tokens = self.get_discovery_subscriptions()
                     self._send_diff(ws, "subscribeAccountTrade", "unsubscribeAccountTrade",
                                     subscribed_wallets, set(desired_wallets))
+                    combined_tokens = set(desired_tokens) | set(discovery_tokens)
                     self._send_diff(ws, "subscribeTokenTrade", "unsubscribeTokenTrade",
-                                    subscribed_tokens, set(desired_tokens))
-                    subscribed_wallets, subscribed_tokens = set(desired_wallets), set(desired_tokens)
+                                    subscribed_tokens, combined_tokens)
+                    if discovery_enabled:
+                        ws.send(json.dumps({"method": "subscribeNewToken"}))
+                        logger.info("PumpPortal new-token stream subscribed (free; independent shadow scanner)")
+                    subscribed_wallets, subscribed_tokens = set(desired_wallets), combined_tokens
                     self.subscribed_wallet_count = len(subscribed_wallets)
                     self.subscription_updates += 1
                     logger.info("PumpPortal account-trade subscription requested for %d wallet(s)", self.subscribed_wallet_count)
                     while not self._stop_event.is_set():
                         desired_wallets, desired_tokens = self.get_subscriptions()
                         desired_wallets, desired_tokens = set(desired_wallets), set(desired_tokens)
+                        discovery_enabled, discovery_tokens = self.get_discovery_subscriptions()
                         if desired_wallets != subscribed_wallets:
                             self._send_diff(ws, "subscribeAccountTrade", "unsubscribeAccountTrade",
                                             subscribed_wallets, desired_wallets)
@@ -97,11 +116,12 @@ class PumpPortalAccountFeed(threading.Thread):
                             self.subscribed_wallet_count = len(subscribed_wallets)
                             self.subscription_updates += 1
                             logger.info("PumpPortal account-trade subscription updated for %d wallet(s)", len(subscribed_wallets))
-                        if desired_tokens != subscribed_tokens:
+                        combined_tokens = desired_tokens | set(discovery_tokens)
+                        if combined_tokens != subscribed_tokens:
                             self._send_diff(ws, "subscribeTokenTrade", "unsubscribeTokenTrade",
-                                            subscribed_tokens, desired_tokens)
-                            subscribed_tokens = desired_tokens
-                            logger.info("PumpPortal token-price subscriptions updated: %d mints", len(subscribed_tokens))
+                                            subscribed_tokens, combined_tokens)
+                            subscribed_tokens = combined_tokens
+                            logger.info("PumpPortal token-trade subscriptions updated: %d total mints", len(subscribed_tokens))
                         try:
                             raw = ws.recv(timeout=1)
                         except TimeoutError:
@@ -121,6 +141,14 @@ class PumpPortalAccountFeed(threading.Thread):
                                   or message.get("wallet") or message.get("trader"))
                         mint = message.get("mint")
                         tx_type = str(message.get("txType") or message.get("side") or "").lower()
+                        if mint and (
+                            tx_type in {"create", "newtoken", "new_token"}
+                            or ("bondingCurveKey" in message and tx_type not in {"buy", "sell"})
+                        ):
+                            event = dict(message)
+                            event["source"] = "token_discovery_new"
+                            self.output_queue.put(event)
+                            continue
                         if tx_type not in {"buy", "sell"} or not mint:
                             # PumpPortal can send subscription/error notices as JSON too.
                             # Keep a safe, short status line rather than logging whole payloads.
@@ -135,7 +163,9 @@ class PumpPortalAccountFeed(threading.Thread):
                                         logger.info("PumpPortal provider notice: %s", notice)
                             continue
                         self.trade_events_received += 1
-                        if trader and trader in subscribed_wallets:
+                        matched_account = bool(trader and trader in subscribed_wallets)
+                        matched_token = mint in subscribed_tokens
+                        if matched_account:
                             event = dict(message)
                             event["wallet"] = trader
                             event["side"] = tx_type
@@ -146,13 +176,15 @@ class PumpPortalAccountFeed(threading.Thread):
                             logger.info("PumpPortal account trade received: %s wallet=%s mint=%s",
                                         tx_type, str(trader)[:6], str(mint)[:8])
                             self.output_queue.put(event)
-                        elif mint in subscribed_tokens:
+                        if matched_token:
+                            # A single trade may feed both strategies: leader-copy consumes
+                            # the account event; the shadow strategy consumes this token event.
                             event = dict(message)
                             event["wallet"] = str(trader or "")
                             event["side"] = tx_type
                             event["source"] = "token_trade"
                             self.output_queue.put(event)
-                        else:
+                        if not matched_account and not matched_token:
                             self.last_notice = f"Trade event did not match active account/token subscriptions (side={tx_type})."
             except Exception as exc:
                 self.connected.clear()

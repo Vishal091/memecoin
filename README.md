@@ -13,13 +13,17 @@ A local Windows/Python experiment for watching Pump.fun's trader leaderboard and
 - Provides a local dashboard: period selector, top-10 copy button, stop-copy button, position-by-position manual exit, manual exit all, recent trades, and estimated P&L.
 - Tracks positions in a local SQLite ledger; staged take-profits, trailing exits, downside stops, daily pause, total-loss halt, and the seven-day experiment limit are included.
 
+- Optional independent token discovery runs alongside leader copying in **shadow-only mode**: it subscribes to PumpPortal new-token events, samples a capped number of candidates, verifies the mint account and canonical Pump bonding curve, checks mint/freeze authorities and recognized Token-2022 extensions, then scores observed buyer diversity, buy activity, net SOL flow, volume and real bonding-curve reserves. It records hypothetical entries and forward marks separately; it never calls the live buy/sell path.
+- The shadow discovery panel reports rejects and hypothetical returns beside the existing leader-copy positions/trades. It is a measurement tool, not a rug-pull guarantee.
+
 ## Important external dependencies
 
 1. **Pump.fun leaderboard access:** the frontend leaderboard endpoint is authenticated and not a stable public API contract. You supply your own Pump.fun bearer token locally. Endpoint or period query changes can break discovery. The program fails closed if the API returns no recognizable wallet addresses or appears to ignore the selected period.
 2. **PumpPortal trade feed:** the account-trade stream needs a PumpPortal API key. The stream is metered; PumpPortal's published data-feed conditions have included a linked wallet minimum and fees per events. Check the [current PumpPortal documentation and fees](https://pumpportal.fun/) before enabling it, especially with a $10 bankroll.
 3. **Trading fees:** PumpPortal's Local Transaction API charges a per-trade fee in addition to Solana network and Pump protocol/creator fees. Entry and exit both cost money. Verify the current [PumpPortal fee schedule](https://pumpportal.fun/fees/).
-4. **Not truly instantaneous:** WebSocket notification and RPC confirmation still add latency. Your copy entry price can be materially worse than the leaderboard trader's price. A stopped token can be unsellable; manual exit and automatic stop buttons only attempt a sale.
-5. **No guaranteed top traders:** leaderboard ranking shows the platform's selected metric/period, not independent proof of risk-adjusted future returns. Rankings can change and a winner over one window can lose money in the next.
+4. **Independent discovery usage:** PumpPortal documents new-token subscription as free, but token-specific trade streams are metered. The shadow scanner caps active token-trade subscriptions (default five) and launch safety scans (default 12/minute). Review the current [PumpPortal data-feed terms](https://pumpportal.fun/data-api/real-time/) and [fee schedule](https://pumpportal.fun/fees/) before enabling it.
+5. **Not truly instantaneous:** WebSocket notification and RPC confirmation still add latency. Your copy entry price can be materially worse than the leaderboard trader's price. A stopped token can be unsellable; manual exit and automatic stop buttons only attempt a sale.
+6. **No guaranteed top traders:** leaderboard ranking shows the platform's selected metric/period, not independent proof of risk-adjusted future returns. Rankings can change and a winner over one window can lose money in the next.
 
 ## Quick start (PowerShell)
 
@@ -50,6 +54,27 @@ Run a connectivity/configuration check and start the bot:
 ```
 
 The console should print a local dashboard URL, normally `http://127.0.0.1:8765`. Open it in your browser. Choose Day, Week, Month, or Overall composite and click **Copy this Top 10**. Use **Stop copying** to prevent new copy entries; existing positions remain managed. Each open position has a **Manual exit** button, and **Manual exit all** submits exits for all tracked positions.
+
+### Side-by-side independent token discovery (shadow only)
+
+The scanner is an add-on; it does not replace or change leader-copy entry/exit behavior. To test both in the same run, add these lines to your **local** `.env` (the sample is `.env.pumpfun.example`):
+
+```text
+TOKEN_DISCOVERY_ENABLED=true
+TOKEN_DISCOVERY_MAX_WATCHED_TOKENS=5
+TOKEN_DISCOVERY_WATCH_SECONDS=180
+TOKEN_DISCOVERY_MAX_LAUNCHES_PER_MINUTE=12
+TOKEN_DISCOVERY_MIN_LIQUIDITY_USD=1000
+TOKEN_DISCOVERY_MIN_SCORE=75
+TOKEN_DISCOVERY_MIN_UNIQUE_BUYERS=5
+TOKEN_DISCOVERY_SHADOW_WINDOW_SECONDS=900
+```
+
+Restart the bot. The dashboard adds **Independent token discovery — SHADOW ONLY**. It will display candidate status, verified real bonding-curve liquidity, unique buyers, observed buy/sell SOL flow, score, and hypothetical entry returns. It uses the same PumpPortal WebSocket as account-trade copying and subscribes to at most five candidate token streams by default; those token-trade messages are metered. New token events that cannot be checked on chain are rejected, and no strategy signal from this scanner is connected to the live trade executor.
+
+A candidate can be rejected even when its score looks attractive. This first version covers ungraduated, SOL-quoted Pump bonding curves; migrated PumpSwap pool reserves are not independently verified for a shadow entry. Mint/freeze authority and extension checks reduce specific risks but cannot guarantee that a token is safe or sellable.
+
+For a first comparison, leave this feature in shadow mode for a meaningful sample and compare candidate returns at 1, 5 and 15 minutes with actual leader-copy trade outcomes. The scores/thresholds are hypotheses to measure, not claims of profitability. `TOKEN_DISCOVERY_ENABLED=false` remains the default, and the discovery engine has no live-trading switch.
 
 The first RPC fallback sync records each watch wallet's latest signature instead of replaying its historical trades. The WebSocket path follows new events after its subscription is active.
 

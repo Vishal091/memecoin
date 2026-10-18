@@ -35,6 +35,7 @@ from native_pump import (
 from solana_rpc import SolanaRPC, SolanaRPCRateLimited, SolanaTransactionNotReady
 from pump_curve import fetch_pump_curve
 from storage import Store
+from token_discovery import TokenDiscoveryShadow
 
 logger = logging.getLogger("pumpfun")
 
@@ -106,6 +107,11 @@ class PumpFunBot:
         self.feed = (PumpPortalAccountFeed(self.s.pumpportal_api_key, self.trade_events,
                                            self.s.request_timeout_seconds)
                      if self.s.pumpportal_api_key else None)
+        self.token_discovery = TokenDiscoveryShadow(
+            self.s, self.rpc, self.market, self.store, self.feed
+        )
+        if self.feed:
+            self.feed.set_discovery_subscriptions(self.token_discovery.enabled, [])
         self.solana_log_events = queue.Queue()
         self.logs_feed = (
             SolanaLogsFeed(self.s.rpc_url, self.solana_log_events, self.s.request_timeout_seconds)
@@ -262,6 +268,7 @@ class PumpFunBot:
             "equity_usd": self.last_equity_usd,
             "positions": positions,
             "trades": trades,
+            "token_discovery": self.token_discovery.dashboard_snapshot(),
             "feed_connected": bool(self.feed and self.feed.connected.is_set()),
             "feed_error": self.feed.last_error if self.feed else "",
             "feed_stats": ({
@@ -456,13 +463,23 @@ class PumpFunBot:
             except queue.Empty:
                 break
             self.signal_stats["queued_events"] += 1
+            source = str(event.get("source") or "")
+            if source == "token_discovery_new":
+                self.token_discovery.on_new_token_event(event)
+                continue
+            if source == "token_trade":
+                mint = str(event.get("mint") or "")
+                price = self._event_price_usd(event)
+                if mint and price and price > 0:
+                    self.price_cache[mint] = price
+                    self.price_cache_at[mint] = time.time()
+                self.token_discovery.on_token_trade_event(event)
+                continue
             price = self._event_price_usd(event)
             mint = str(event.get("mint") or "")
             if mint and price and price > 0:
                 self.price_cache[mint] = price
                 self.price_cache_at[mint] = time.time()
-            if event.get("source") == "token_trade":
-                continue
             signal = self._signal_from_feed(event)
             if not signal:
                 self.signal_stats["unparsed_events"] += 1
@@ -1347,6 +1364,7 @@ class PumpFunBot:
                     self._process_dashboard_commands()
                     self._consume_feed_events()
                     self._consume_solana_log_events()
+                    self.token_discovery.tick()
                     now = time.time()
 
                     if self.leaderboard_client.ready and now - self.last_leaderboard_refresh >= self.s.leaderboard_refresh_seconds:
