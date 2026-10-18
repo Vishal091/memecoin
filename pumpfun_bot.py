@@ -1021,7 +1021,7 @@ class PumpFunBot:
         effective_entry_cap = self.s.max_entry_usd
         if strategy == "token_discovery":
             effective_entry_cap = min(
-                0.50, float(self.s.token_discovery_max_entry_usd),
+                self.s.max_entry_usd, 0.50, float(self.s.token_discovery_max_entry_usd),
                 float(entry_cap_usd if entry_cap_usd is not None else self.s.token_discovery_max_entry_usd),
             )
         spend = min(effective_entry_cap, self.s.max_total_exposure_usd - self._current_positions_value())
