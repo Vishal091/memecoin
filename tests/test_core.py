@@ -101,6 +101,18 @@ class LossStreakCircuitBreakerTests(unittest.TestCase):
         self.assertEqual(bot.store.get_state("consecutive_losing_exits"), "0")
         self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), "")
 
+    def test_profitable_exit_does_not_release_a_daily_pause_once_latched(self):
+        bot = self._bot()
+        with self.assertLogs("pumpfun", level="ERROR"):
+            bot._record_realized_exit_risk(-0.10)
+            bot._record_realized_exit_risk(-0.05)
+            bot._record_realized_exit_risk(-0.02)
+        pause_day = bot.store.get_state("consecutive_loss_pause_day")
+        bot._record_realized_exit_risk(0.50)
+        self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), pause_day)
+        self.assertEqual(bot.store.get_state("consecutive_losing_exits"), "3")
+        self.assertIn("Consecutive-loss pause active", bot._loss_streak_pause_reason())
+
     def test_stale_pause_is_cleared_on_a_later_utc_day(self):
         bot = self._bot({
             "consecutive_loss_pause_day": "2000-01-01",
