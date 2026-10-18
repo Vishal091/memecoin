@@ -5,7 +5,11 @@ from types import SimpleNamespace
 
 from market_data import MarketData, WSOL_MINT
 from pumpfun_bot import PumpFunBot, native_build_retry_delay_seconds
-from native_pump import TransactionBuildFailed, TransactionOutcomeUncertain
+from native_pump import (
+    TransactionBuildFailed,
+    TransactionExpiredNotLanded,
+    TransactionOutcomeUncertain,
+)
 from solana_rpc import SolanaRPC
 from storage import Store
 
@@ -387,6 +391,53 @@ class TransactionOutcomeHandlingTests(unittest.TestCase):
         )
         self.assertEqual(bot.active_wallets, set())
 
+    def test_verified_not_landed_sell_consumes_source_and_clears_only_its_pending_exit(self):
+        import json
+
+        bot = self._bot()
+        reason = "followed wallet leader-wallet partial/full sell on pump"
+        bot.store.set_state("exit_pending:test-mint", reason)
+        exc = TransactionExpiredNotLanded(
+            "expired-signature", "sell", "test-mint",
+            "blockhash expired; history absent; token balance unchanged",
+        )
+
+        bot._handle_expired_not_landed_trade(
+            exc,
+            source_wallet="leader-wallet",
+            source_signature="leader-sell-signature",
+            reason=reason,
+        )
+
+        self.assertEqual(bot.store.get_state("manual_review_halt"), "0")
+        self.assertEqual(bot.store.get_state("auto_copy_enabled"), "1")
+        self.assertEqual(bot.store.get_state("copy_paused"), "0")
+        self.assertEqual(bot.store.get_state("exit_pending:test-mint"), "")
+        self.assertEqual(
+            bot.store.seen,
+            [("leader-wallet|leader-sell-signature", "leader-wallet")],
+        )
+        record = json.loads(
+            bot.store.get_state("reconciled_not_landed_trade:test-mint:expired-signature")
+        )
+        self.assertEqual(record["resolution"],
+                         "blockhash_expired_status_history_absent_token_balance_unchanged")
+
+    def test_not_landed_sell_does_not_clear_unrelated_pending_exit(self):
+        bot = self._bot()
+        bot.store.set_state("exit_pending:test-mint", "trailing stop")
+        exc = TransactionExpiredNotLanded(
+            "expired-signature", "sell", "test-mint", "verified not landed"
+        )
+
+        bot._handle_expired_not_landed_trade(
+            exc, source_wallet="leader-wallet",
+            source_signature="leader-sell-signature",
+            reason="followed wallet leader-wallet partial/full sell on pump",
+        )
+
+        self.assertEqual(bot.store.get_state("exit_pending:test-mint"), "trailing stop")
+
     def test_buy_will_not_retry_mint_with_unresolved_outcome(self):
         bot = self._bot()
         bot.store.set_state(
@@ -424,11 +475,90 @@ class NativeSendConfirmationTests(unittest.TestCase):
         executor.rpc = FakeRPC()
 
         with self.assertRaises(TransactionOutcomeUncertain) as raised:
-            executor._send_confirm(FakeTransaction(), action="buy", mint="test-mint")
+            executor._send_confirm(
+                FakeTransaction(), action="buy", mint="test-mint",
+                owner="test-wallet", token_before_raw=0,
+            )
 
         self.assertEqual(raised.exception.signature, signature)
         self.assertEqual(raised.exception.action, "buy")
         self.assertEqual(raised.exception.mint, "test-mint")
+
+    def test_expired_transaction_is_reconciled_when_history_absent_and_balance_unchanged(self):
+        from native_pump import NativePumpExecutor
+        import time
+
+        signature = "test-expired-signature"
+
+        class FakeTransaction:
+            signatures = [signature]
+
+            def __bytes__(self):
+                return b"test-signed-transaction"
+
+        class FakeRPC:
+            def call(self, method, params):
+                if method == "sendTransaction":
+                    return signature
+                if method == "getSignatureStatuses":
+                    return {"value": [None]}
+                if method == "getBlockHeight":
+                    return 1000
+                raise AssertionError(f"unexpected RPC method: {method}")
+
+            def transaction(self, requested_signature):
+                self.assert_signature = requested_signature
+                return None
+
+        executor = object.__new__(NativePumpExecutor)
+        executor.rpc = FakeRPC()
+        executor.token_balance_raw = lambda owner, mint: 1234
+
+        started = time.monotonic()
+        with self.assertRaises(TransactionExpiredNotLanded) as raised:
+            executor._send_confirm(
+                FakeTransaction(), action="sell", mint="test-mint",
+                owner="test-wallet", token_before_raw=1234,
+                last_valid_block_height=10,
+            )
+        self.assertEqual(raised.exception.signature, signature)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_expired_transaction_with_changed_balance_remains_uncertain(self):
+        from native_pump import NativePumpExecutor
+
+        signature = "test-changed-balance-signature"
+
+        class FakeTransaction:
+            signatures = [signature]
+
+            def __bytes__(self):
+                return b"test-signed-transaction"
+
+        class FakeRPC:
+            def call(self, method, params):
+                if method == "sendTransaction":
+                    return signature
+                if method == "getSignatureStatuses":
+                    return {"value": [None]}
+                if method == "getBlockHeight":
+                    return 1000
+                raise AssertionError(f"unexpected RPC method: {method}")
+
+            def transaction(self, requested_signature):
+                return None
+
+        executor = object.__new__(NativePumpExecutor)
+        executor.rpc = FakeRPC()
+        executor.token_balance_raw = lambda owner, mint: 999
+
+        with self.assertRaises(TransactionOutcomeUncertain) as raised:
+            executor._send_confirm(
+                FakeTransaction(), action="sell", mint="test-mint",
+                owner="test-wallet", token_before_raw=1234,
+                last_valid_block_height=10,
+            )
+        self.assertIn("token balance changed", raised.exception.detail)
 
 
 if __name__ == "__main__":

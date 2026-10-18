@@ -205,7 +205,7 @@ async function build(input) {
     ComputeBudgetProgram.setComputeUnitPrice({ microLamports: microLamportsPerCu }),
     ...instructions,
   ];
-  const { blockhash } = await connection.getLatestBlockhash("confirmed");
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
   const message = new TransactionMessage({
     payerKey: wallet,
     recentBlockhash: blockhash,
@@ -228,6 +228,8 @@ async function build(input) {
     expectedProgram,
     requestedLamports: amountLamports.toString(),
     requestedTokenRaw: amountRaw.toString(),
+    recentBlockhash: blockhash,
+    lastValidBlockHeight,
     topLevelPrograms,
   };
 }
