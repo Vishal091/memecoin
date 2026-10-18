@@ -129,11 +129,12 @@ def settings(**overrides):
     values = {
         "token_discovery_enabled": True,
         "token_discovery_max_watched_tokens": 5,
-        "token_discovery_watch_seconds": 180,
+        "token_discovery_watch_seconds": 300,
         "token_discovery_max_launches_per_minute": 12,
-        "token_discovery_min_liquidity_usd": 1000.0,
-        "token_discovery_min_score": 75,
-        "token_discovery_min_unique_buyers": 5,
+        "token_discovery_min_liquidity_usd": 5000.0,
+        "token_discovery_min_score": 80,
+        "token_discovery_min_unique_buyers": 8,
+        "token_discovery_max_token_age_hours": 24,
         "token_discovery_shadow_window_seconds": 900,
     }
     values.update(overrides)
@@ -148,8 +149,8 @@ class TokenDiscoveryScoringTests(unittest.TestCase):
             sell_trades=1,
             buy_volume_sol=1.5,
             sell_volume_sol=0.1,
-            liquidity_usd=1500,
-            min_liquidity_usd=1000,
+            liquidity_usd=6500,
+            min_liquidity_usd=5000,
         )
         self.assertEqual(score, 100)
         self.assertEqual(sum(parts.values()), score)
@@ -163,7 +164,7 @@ class TokenDiscoveryScoringTests(unittest.TestCase):
             buy_volume_sol=2.0,
             sell_volume_sol=0,
             liquidity_usd=100,
-            min_liquidity_usd=1000,
+            min_liquidity_usd=5000,
         )
         self.assertEqual(parts["real_curve_liquidity"], 0)
         self.assertLess(score, 100)
@@ -289,14 +290,17 @@ class TokenDiscoveryShadowTests(unittest.TestCase):
         candidate = json.loads(store.get_state("token_discovery_candidate:" + MINT))
         self.assertEqual(candidate["status"], "rejected")
         self.assertFalse(candidate["subscribed"])
-        self.assertIn("below required $1000", candidate["reason"])
+        self.assertIn("below required $5000", candidate["reason"])
         self.assertEqual(scanner.stats["liquidity_rejected"], 1)
         self.assertEqual(feed.discovery_tokens, ())
 
     def test_new_token_is_verified_and_only_subscribed_for_shadow_observation(self):
         store = FakeStore()
         feed = FakeFeed()
-        scanner = TokenDiscoveryShadow(settings(), FakeRPC(), FakeMarket(), store, feed)
+        scanner = TokenDiscoveryShadow(
+            settings(), FakeRPC(curve_data=curve_account_data(real_sol=20_000_000_000)),
+            FakeMarket(), store, feed
+        )
 
         scanner.on_new_token_event({
             "mint": MINT, "name": "ShadowTest", "symbol": "SHT",
@@ -321,9 +325,9 @@ class TokenDiscoveryShadowTests(unittest.TestCase):
             "mint": MINT, "name": "ShadowTest", "symbol": "SHT",
             "status": "watching", "reason": "observing",
             "security_passed": True, "subscribed": True,
-            "subscription_expires_at": now + 180,
+            "subscription_expires_at": now + 300,
             "last_chain_check": now, "created_at": now,
-            "real_liquidity_usd": 1500, "price_usd": 0.0001,
+            "real_liquidity_usd": 6000, "price_usd": 0.0001,
             "total_supply_tokens": 1_000_000_000,
             "market_cap_usd": 100_000.0, "market_cap_source": "Estimated: test price × supply",
             "entry_market_cap_usd": 0.0, "entry_market_cap_source": "",
@@ -339,7 +343,7 @@ class TokenDiscoveryShadowTests(unittest.TestCase):
         }
         store.set_state("token_discovery_candidate:" + MINT, json.dumps(candidate))
 
-        for i in range(5):
+        for i in range(8):
             scanner.on_token_trade_event({
                 "source": "token_trade",
                 "mint": MINT,
@@ -354,9 +358,9 @@ class TokenDiscoveryShadowTests(unittest.TestCase):
         observed = json.loads(store.get_state("token_discovery_candidate:" + MINT))
         self.assertEqual(observed["status"], "shadow_open")
         self.assertTrue(observed["would_buy"])
-        self.assertGreaterEqual(observed["score"], 75)
-        self.assertEqual(observed["unique_buyers"], 5)
-        self.assertAlmostEqual(observed["buy_volume_sol"], 1.5)
+        self.assertGreaterEqual(observed["score"], 80)
+        self.assertEqual(observed["unique_buyers"], 8)
+        self.assertAlmostEqual(observed["buy_volume_sol"], 2.4)
         self.assertGreater(observed["shadow_entry_price_usd"], 0)
         self.assertEqual(observed["entry_market_cap_usd"], 3000.0)
         self.assertEqual(observed["market_cap_usd"], 3000.0)
@@ -368,20 +372,23 @@ class TokenDiscoveryShadowTests(unittest.TestCase):
     def test_tick_can_create_shadow_entry_after_real_curve_liquidity_recovers(self):
         store = FakeStore()
         feed = FakeFeed()
-        scanner = TokenDiscoveryShadow(settings(), FakeRPC(), FakeMarket(), store, feed)
+        scanner = TokenDiscoveryShadow(
+            settings(), FakeRPC(curve_data=curve_account_data(real_sol=20_000_000_000)),
+            FakeMarket(), store, feed
+        )
         old = time.time() - 20
         candidate = {
             "mint": MINT, "name": "ShadowTest", "symbol": "SHT",
             "status": "watching", "reason": "waiting for liquidity",
             "security_passed": True, "subscribed": True,
-            "subscription_expires_at": time.time() + 180,
+            "subscription_expires_at": time.time() + 300,
             "last_chain_check": old, "created_at": old,
             "real_liquidity_usd": 500, "price_usd": 0.0001,
             "score": 0, "score_components": {},
-            "buy_trades": 5, "sell_trades": 0,
-            "unique_buyers": 5,
-            "buyer_wallets": [f"Buyer{i}" for i in range(5)],
-            "buy_volume_sol": 1.5, "sell_volume_sol": 0.0,
+            "buy_trades": 8, "sell_trades": 0,
+            "unique_buyers": 8,
+            "buyer_wallets": [f"Buyer{i}" for i in range(8)],
+            "buy_volume_sol": 2.4, "sell_volume_sol": 0.0,
             "last_trade_signature": "recent-trade", "last_trade_at": old,
             "shadow_entry_price_usd": 0.0, "shadow_entry_at": 0.0,
             "current_return_pct": 0.0, "max_return_pct": 0.0,
@@ -395,7 +402,7 @@ class TokenDiscoveryShadowTests(unittest.TestCase):
         observed = json.loads(store.get_state("token_discovery_candidate:" + MINT))
         self.assertEqual(observed["status"], "shadow_open")
         self.assertTrue(observed["would_buy"])
-        self.assertGreater(observed["real_liquidity_usd"], 1000)
+        self.assertGreater(observed["real_liquidity_usd"], 5000)
         self.assertGreater(observed["shadow_entry_price_usd"], 0)
 
     def test_disabled_discovery_ignores_new_tokens(self):
