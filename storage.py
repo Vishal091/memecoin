@@ -106,6 +106,19 @@ class Store:
             self.db.execute("INSERT INTO state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                             (key, str(value)))
 
+    def list_state_prefix(self, prefix: str, limit: int = 1000) -> list[tuple[str, str]]:
+        """List namespaced state values; callers must still validate decoded JSON."""
+        bounded_limit = max(1, min(10000, int(limit)))
+        rows = self.db.execute(
+            "SELECT key,value FROM state WHERE key LIKE ? ORDER BY rowid DESC LIMIT ?",
+            (str(prefix) + "%", bounded_limit),
+        ).fetchall()
+        return [(str(row["key"]), str(row["value"])) for row in rows]
+
+    def delete_state(self, key: str) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM state WHERE key=?", (str(key),))
+
     def get_cursor(self, wallet: str) -> str | None:
         row = self.db.execute("SELECT signature FROM cursors WHERE wallet=?", (wallet,)).fetchone()
         return row["signature"] if row else None
