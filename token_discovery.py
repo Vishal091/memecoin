@@ -93,6 +93,7 @@ class TokenDiscoveryShadow:
         self.shadow_window_seconds = max(60, int(getattr(settings, "token_discovery_shadow_window_seconds", 900)))
         self._recent_scans: deque[float] = deque()
         self._last_chain_check: dict[str, float] = {}
+        self._last_skip_log_at = 0.0
         self.stats = {
             "launch_events": 0,
             "safety_scans": 0,
@@ -226,18 +227,25 @@ class TokenDiscoveryShadow:
         while self._recent_scans and now - self._recent_scans[0] >= 60:
             self._recent_scans.popleft()
         if len(self._recent_scans) >= self.max_scans_per_minute:
+            # New-token events can arrive many times per second. Count but do not
+            # persist each skipped mint; otherwise a busy launch stream can flood
+            # SQLite and evict the candidates whose shadow outcomes we are measuring.
             self.stats["rate_limit_skips"] += 1
-            self._record_skipped(
-                mint, event, "skipped_rate_limit",
-                f"Safety scan limit ({self.max_scans_per_minute}/minute) reached; fail closed",
-            )
+            if now - self._last_skip_log_at >= 15:
+                logger.info(
+                    "SHADOW discovery scan cap reached (%d/min); skipping new launches without RPC calls",
+                    self.max_scans_per_minute,
+                )
+                self._last_skip_log_at = now
             return
         if self._active_watch_count(now) >= self.max_watched:
             self.stats["capacity_skips"] += 1
-            self._record_skipped(
-                mint, event, "skipped_capacity",
-                f"Discovery already watching {self.max_watched} candidates; no token-trade subscription opened",
-            )
+            if now - self._last_skip_log_at >= 15:
+                logger.info(
+                    "SHADOW discovery watch cap reached (%d tokens); skipping launches without token-trade subscriptions",
+                    self.max_watched,
+                )
+                self._last_skip_log_at = now
             return
 
         self._recent_scans.append(now)
