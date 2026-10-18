@@ -63,7 +63,7 @@ The scanner is an add-on; it does not replace or change leader-copy entry/exit b
 TOKEN_DISCOVERY_ENABLED=true
 # Leave false until you explicitly decide to submit real-money discovery trades.
 TOKEN_DISCOVERY_LIVE_ENABLED=false
-# Hard code ceiling: $0.50 per discovery buy; only lower values are honored.
+# Hard code ceiling: $0.50 per discovery buy; permitted configuration range is $0.10–$0.50.
 TOKEN_DISCOVERY_MAX_ENTRY_USD=0.50
 TOKEN_DISCOVERY_MAX_WATCHED_TOKENS=5
 TOKEN_DISCOVERY_WATCH_SECONDS=180
