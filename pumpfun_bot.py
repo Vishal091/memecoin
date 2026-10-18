@@ -1501,26 +1501,83 @@ class PumpFunBot:
             available = self.executor.token_balance_raw(self.wallet_address, mint)
             requested_raw = min(requested_raw, available)
             if requested_raw <= 0:
+                # Before pausing, look for an on-chain full Pump/PumpSwap sale after
+                # this position opened. Only an exact quantity match, wallet signature,
+                # successful execution and zero post-balance can reconcile the ledger.
+                # This is read-only chain inspection; it never retries/submits a sale.
+                evidence = None
+                if available <= 0:
+                    finder = getattr(self.executor, "find_confirmed_full_sale", None)
+                    if callable(finder):
+                        try:
+                            evidence = finder(
+                                owner=self.wallet_address,
+                                mint=mint,
+                                expected_raw=int(position.get("amount_raw") or 0),
+                                opened_at=str(position.get("opened_at") or ""),
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Could not inspect prior full-sale history for %s: %s",
+                                mint[:8], " ".join(str(exc).split())[:220],
+                            )
+                if evidence:
+                    tx_signature = str(evidence.get("signature") or "")
+                    try:
+                        exited_at = datetime.fromtimestamp(
+                            int(evidence.get("block_time") or 0), timezone.utc
+                        ).isoformat(timespec="seconds")
+                    except (TypeError, ValueError, OverflowError, OSError):
+                        exited_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    reconcile_reason = (
+                        "Verified on-chain full Pump/PumpSwap sell; stale position reconciled "
+                        f"from confirmed signature {tx_signature}. Historical USD proceeds and "
+                        "realized P&L were not recorded and are intentionally left unestimated."
+                    )
+                    reconciled = self.store.reconcile_confirmed_full_exit(
+                        position,
+                        mode=self.s.mode,
+                        tx_signature=tx_signature,
+                        ts=exited_at,
+                        reason=reconcile_reason,
+                    )
+                    if reconciled:
+                        self.price_cache.pop(mint, None)
+                        self.price_cache_at.pop(mint, None)
+                        self.message = (
+                            f"Reconciled confirmed on-chain full exit for {mint[:8]}; no new sell "
+                            "was submitted. Historical USD proceeds/P&L are unavailable in the ledger."
+                        )
+                        logger.warning(
+                            "Reconciled stale position mint=%s from confirmed full-sale signature=%s; "
+                            "no transaction submitted and no historical P&L inferred",
+                            mint[:8], tx_signature,
+                        )
+                        try:
+                            self._refresh_feed_subscriptions()
+                        except Exception:
+                            logger.exception("Could not refresh subscriptions after exit reconciliation")
+                        return True
+
                 detail = (
-                    "Configured wallet reports zero token balance after mint and token-program "
-                    "queries; verify the wallet and on-chain holdings before retrying."
+                    "Configured wallet reports zero token balance; no matching full Pump/PumpSwap "
+                    "sale was verified after the position opened."
                 )
                 self.store.set_state(f"exit_blocked_balance_zero:{mint}", detail)
-                # Stop the 1.5-second retry loop. Keep the ledger position visible,
-                # but clear the pending attempt until a human requests a fresh retry.
+                # Stop repeated attempts. Keep the ledger position visible until a
+                # human can reconcile it or a later fresh history check succeeds.
                 self.store.set_state(f"exit_pending:{mint}", "")
                 self.store.set_state(f"exit_pending_amount_raw:{mint}", "")
                 self.store.set_state(f"exit_pending_source_wallet:{mint}", "")
                 self.store.set_state(f"exit_pending_source_signature:{mint}", "")
                 if manual_exit:
                     self.message = (
-                        f"Manual exit for {mint[:8]} paused: zero token balance was reported by "
-                        "the configured wallet RPC. Verify on-chain holdings; click Manual exit "
-                        "again only after confirming the balance or correcting the RPC/wallet."
+                        f"Manual exit for {mint[:8]} paused: zero wallet balance and no matching full-sale "
+                        "transaction could be verified. Position retained for reconciliation."
                     )
                 logger.error(
-                    "Sell paused for %s: token balance is zero after fallback lookup; "
-                    "position retained and automatic retry suppressed pending reconciliation",
+                    "Sell paused for %s: zero token balance and no verified matching full-sale transaction; "
+                    "position retained and automatic retry suppressed",
                     mint,
                 )
                 return False
