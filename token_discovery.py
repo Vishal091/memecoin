@@ -401,6 +401,20 @@ class TokenDiscoveryShadow:
         supply_pct = lambda amount: (amount / supply * 100.0) if supply > 0 else 100.0
         top5_pct = supply_pct(sum(amount for _owner, amount in
                                   sorted(user_holders, key=lambda entry: entry[1], reverse=True)[:5]))
+        if creator:
+            creator_accounts_result = self.rpc.call(
+                "getTokenAccountsByOwner",
+                [creator, {"mint": mint}, {"encoding": "jsonParsed", "commitment": "confirmed"}],
+            ) or {}
+            creator_accounts = creator_accounts_result.get("value")
+            if not isinstance(creator_accounts, list):
+                return {"safe": False, "reason": "Creator token accounts could not be verified", "checks": ["creator holdings unavailable"]}
+            creator_holding_raw = 0
+            for creator_account in creator_accounts:
+                info = ((((creator_account.get("account") or {}).get("data") or {}).get("parsed") or {}).get("info")) or {}
+                if str(info.get("mint") or "") != mint:
+                    return {"safe": False, "reason": "Creator token account mint mismatch", "checks": ["creator account mismatch"]}
+                creator_holding_raw += int(((info.get("tokenAmount") or {}).get("amount")) or 0)
         creator_pct = supply_pct(creator_holding_raw)
         if creator and creator_pct > 20.0:
             return {
