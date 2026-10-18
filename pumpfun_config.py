@@ -133,8 +133,8 @@ class PumpFunSettings:
             token_discovery_max_watched_tokens=max(1, min(10, _int("TOKEN_DISCOVERY_MAX_WATCHED_TOKENS", 5))),
             token_discovery_watch_seconds=max(30, min(600, _int("TOKEN_DISCOVERY_WATCH_SECONDS", 180))),
             token_discovery_max_launches_per_minute=max(1, min(60, _int("TOKEN_DISCOVERY_MAX_LAUNCHES_PER_MINUTE", 12))),
-            # This live-trial floor cannot be lowered below $2,500 by local config.
-            token_discovery_min_liquidity_usd=max(2500.0, _float("TOKEN_DISCOVERY_MIN_LIQUIDITY_USD", 2500.0)),
+            # This live-trial floor cannot be lowered below $1,000 by local config.
+            token_discovery_min_liquidity_usd=max(1000.0, _float("TOKEN_DISCOVERY_MIN_LIQUIDITY_USD", 1000.0)),
             token_discovery_min_score=max(0, min(100, _int("TOKEN_DISCOVERY_MIN_SCORE", 75))),
             token_discovery_min_unique_buyers=max(2, min(100, _int("TOKEN_DISCOVERY_MIN_UNIQUE_BUYERS", 5))),
             token_discovery_shadow_window_seconds=max(60, min(3600, _int("TOKEN_DISCOVERY_SHADOW_WINDOW_SECONDS", 900))),
