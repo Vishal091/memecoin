@@ -11,13 +11,56 @@ from pumpfun_bot import (
     native_build_retry_delay_seconds,
 )
 from native_pump import (
+    NativePumpExecutor,
     TransactionBuildFailed,
     TransactionExpiredNotLanded,
     TransactionOutcomeUncertain,
+    TransactionSimulationFailed,
 )
 from solana_rpc import SolanaRPC
 from storage import Store
 
+
+
+class NativeSimulationFailureTests(unittest.TestCase):
+    class FakeTransaction:
+        def __bytes__(self):
+            return b"unsigned-transaction"
+
+    class FakeRPC:
+        def __init__(self, err, logs):
+            self.err = err
+            self.logs = logs
+
+        def call(self, method, params):
+            if method != "simulateTransaction":
+                raise AssertionError(f"unexpected RPC method: {method}")
+            return {"value": {"err": self.err, "logs": self.logs}}
+
+    def _executor(self, err, logs):
+        executor = object.__new__(NativePumpExecutor)
+        executor.rpc = self.FakeRPC(err, logs)
+        return executor
+
+    def test_slippage_6042_is_typed_as_retryable_pre_submit_failure(self):
+        executor = self._executor(
+            {"InstructionError": [3, {"Custom": 6042}]},
+            ["Program log: Error Code: BuySlippageBelowMinTokensOut"],
+        )
+        with self.assertRaises(TransactionSimulationFailed) as raised:
+            executor._simulate(self.FakeTransaction(), "pump-program")
+        self.assertTrue(raised.exception.retryable)
+        self.assertIn("6042", raised.exception.detail)
+
+    def test_other_simulation_failure_is_pre_submit_but_not_slippage_retryable(self):
+        executor = self._executor(
+            {"InstructionError": [1, {"Custom": 9999}]},
+            ["Program log: Invalid account state"],
+        )
+        with self.assertRaises(TransactionSimulationFailed) as raised:
+            executor._simulate(self.FakeTransaction(), "pump-program")
+        self.assertFalse(raised.exception.retryable)
+        self.assertIn("simulation failed", raised.exception.detail.lower())
 
 
 class LossExitGracePeriodTests(unittest.TestCase):
