@@ -726,7 +726,12 @@ class TokenDiscoveryShadow:
             return
         mint = str(event.get("mint") or "").strip()
         c = self._load(mint) if mint else None
-        if not c or not c.get("security_passed") or c.get("status") not in {"watching", "shadow_open"}:
+        if not c or not c.get("security_passed"):
+            return
+        live_position_active = c.get("live_entry_status") == "opened"
+        if c.get("status") not in {"watching", "shadow_open"} and not (
+            live_position_active and c.get("status") == "shadow_closed_15m"
+        ):
             return
         if not c.get("subscribed") or float(c.get("subscription_expires_at", 0)) < time.time():
             return
@@ -829,7 +834,11 @@ class TokenDiscoveryShadow:
         for c in rows:
             status = c.get("status")
             mint = str(c.get("mint") or "")
-            if not mint or status not in {"watching", "shadow_open"}:
+            live_position_active = c.get("live_entry_status") == "opened"
+            if not mint or (
+                status not in {"watching", "shadow_open"}
+                and not (live_position_active and status == "shadow_closed_15m")
+            ):
                 continue
             if c.get("subscribed") and now >= float(c.get("subscription_expires_at", 0)):
                 c["subscribed"] = False
