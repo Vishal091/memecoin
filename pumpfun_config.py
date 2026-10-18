@@ -161,8 +161,8 @@ class PumpFunSettings:
                 raise ValueError("TOKEN_DISCOVERY_LIVE_ENABLED requires TOKEN_DISCOVERY_ENABLED=true")
             if self.mode != "live":
                 raise ValueError("TOKEN_DISCOVERY_LIVE_ENABLED requires BOT_MODE=live")
-            if not (0 < self.token_discovery_max_entry_usd <= 0.50):
-                raise ValueError("TOKEN_DISCOVERY_MAX_ENTRY_USD must be > 0 and capped at $0.50")
+            if not (0.10 <= self.token_discovery_max_entry_usd <= 0.50):
+                raise ValueError("TOKEN_DISCOVERY_MAX_ENTRY_USD must be between $0.10 and the $0.50 hard cap")
         if self.mode == "live":
             if self.live_confirmation != "I_ACCEPT_THE_RISK_AND_UNDERSTAND_LIVE_TRADING":
                 raise ValueError("Live mode not armed. Review risks and set LIVE_CONFIRMATION locally.")
