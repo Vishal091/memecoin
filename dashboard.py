@@ -34,6 +34,10 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px 8px
 <div class="metric"><small>Active traders</small><strong id="walletCount">0</strong></div></div>
  <section class="panel"><h2>Trade-feed diagnostics</h2><div id="feedSummary" class="status">Checking feed status…</div>
  <div id="feedDetail" class="muted">Waiting for feed counters…</div><div id="rpcFeedDetail" class="muted" style="margin-top:8px">Waiting for Solana logs feed…</div><div id="signalDetail" class="muted" style="margin-top:8px"></div></section>
+<section class="panel"><div class="toolbar"><div><h2>Independent token discovery <span class="pill">SHADOW ONLY</span></h2><div class="muted">New-token safety checks and hypothetical entries; this strategy never submits an order.</div></div></div>
+ <div id="discoverySummary" class="status">Checking independent scanner…</div>
+ <div class="scroll"><table><thead><tr><th>Token</th><th>Status / score</th><th>Real curve liquidity</th><th>Buyers / flow</th><th>Shadow return</th><th>Decision</th></tr></thead><tbody id="discoveryCandidates"><tr><td colspan="6" class="empty">No discovery candidates recorded.</td></tr></tbody></table></div>
+ <div class="footer">Token creation events are free from PumpPortal; token-specific trade subscriptions are metered. The scanner caps subscriptions and records hypothetical results only. Passing a screen does not prove a token cannot rug.</div></section>
 <section class="panel"><div class="toolbar"><div><h2>Top Pump.fun traders</h2><div class="muted">Choose a period, then copy its current top 10.</div></div>
 <div><select id="window"><option value="overall">Overall composite</option><option value="month">Month (1M)</option><option value="week">Week (1W)</option><option value="day" selected>Day (1D)</option></select>
 <button class="primary" id="copyTop">Copy this Top 10</button> <button id="stopCopy">Stop copying</button></div></div>
@@ -60,6 +64,21 @@ function render(d){
   el("rpcFeedDetail").textContent="RPC log feed: "+(!r.enabled?"disabled":(r.connected?"connected":"disconnected"))+" · "+(r.subscribed_wallet_count||0)+" wallets subscribed · "+(r.notifications_received||0)+" notifications · "+ago(r.last_notification_at);
   var notices=[];if(f.error)notices.push("Feed error: "+f.error);if(f.last_notice)notices.push("Provider notice: "+f.last_notice);if(f.last_event_summary)notices.push("Last event: "+f.last_event_summary);if(r.error)notices.push("RPC log feed error: "+r.error);
   el("signalDetail").textContent=notices.join(" · ")+" · Parsed signals: "+(ss.parsed_signals||0)+" · Unparsed: "+(ss.unparsed_events||0)+" · Duplicate: "+(ss.duplicate_events||0)+" · Unwatched: "+(ss.unwatched_events||0)+" · Sells with no position: "+(ss.sell_without_position||0)+" · RPC-derived signals: "+(ss.rpc_log_signals||0);
+  var td=d.token_discovery||{};
+  el("discoverySummary").textContent=td.enabled
+    ? "ENABLED · SHADOW ONLY · Launch events "+(td.launch_events||0)+" · On-chain safety scans "+(td.safety_scans||0)+" · Rejected "+(td.safety_rejected||0)+" · Skipped (capacity/rate) "+((td.capacity_skips||0)+(td.rate_limit_skips||0))+" · Hypothetical entries "+(td.shadow_entries||0)+" · Active token subscriptions "+(td.active_watch_count||0)+"/"+(td.max_watched_tokens||0)+" · Min verified curve liquidity $"+num(td.min_liquidity_usd)+" · Score threshold "+(td.min_score||0)
+    : "DISABLED · To enable side-by-side shadow testing, set TOKEN_DISCOVERY_ENABLED=true in your local .env and restart the bot. It cannot submit live orders.";
+  function esc(v){return String(v===undefined||v===null?"":v).replace(/[&<>"']/g,function(ch){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]})}
+  var dc=td.candidates||[];
+  el("discoveryCandidates").innerHTML=dc.length?dc.map(function(x){
+    var move=x.shadow_entry_price_usd?Number(x.current_return_pct||0):null;
+    var ret=move===null?"—":((move>=0?"+":"")+move.toFixed(1)+"%")+" (peak "+((Number(x.max_return_pct||0)>=0?"+":"")+Number(x.max_return_pct||0).toFixed(1)+"%)");
+    var status=String(x.status||"—").replace(/_/g," ");
+    var score=Number(x.score||0);
+    var liquidity=Number(x.real_liquidity_usd||0);
+    var flow=Number(x.buy_volume_sol||0)-Number(x.sell_volume_sol||0);
+    return "<tr><td><div>"+esc(x.name||x.symbol||"Unnamed token")+"</div><div class='addr' title='"+esc(x.mint)+"'>"+short(esc(x.mint))+"</div><a class='muted' target='_blank' rel='noreferrer' href='https://pump.fun/coin/"+encodeURIComponent(x.mint||"")+"'>Pump.fun ↗</a></td><td>"+esc(status)+" · "+score+"/100</td><td>$"+num(liquidity)+"</td><td>"+(x.unique_buyers||0)+" · "+flow.toFixed(3)+" SOL net</td><td class='"+(move===null?"":(move>=0?"green":"red"))+"'>"+esc(ret)+"</td><td>"+esc(x.reason||"—")+"</td></tr>";
+  }).join(""):"<tr><td colspan='6' class='empty'>No discovery candidates recorded yet.</td></tr>";
   var period=el("window").value;var leaders=((d.leaderboards||{})[period]||[]);
  el("leaders").innerHTML=leaders.length?leaders.map(function(x,i){var score=period==="overall"?"Composite "+(x.rank_score||""):x.profit===null||x.profit===undefined?"—":num(x.profit);return "<tr><td>"+(x.rank||i+1)+"</td><td><div class='addr' title='"+x.wallet+"'>"+short(x.wallet)+"</div><a class='muted' target='_blank' rel='noreferrer' href='https://pump.fun/profile/"+x.wallet+"'>Profile ↗</a></td><td class='hide-sm'>"+score+"</td><td>"+(d.auto_copy&&(d.active_wallets||[]).includes(x.wallet)?"Copying":((d.active_wallets||[]).includes(x.wallet)?"Monitoring open position":"Not copying"))+"</td></tr>"}).join(""):"<tr><td colspan='4' class='empty'>No leaderboard loaded. Check API access/configuration.</td></tr>";
  var ps=d.positions||[];el("positions").innerHTML=ps.length?ps.map(function(p){var m=Number(p.move_pct||0);return "<tr><td><div class='addr' title='"+p.mint+"'>"+short(p.mint)+"</div><a target='_blank' rel='noreferrer' href='https://pump.fun/coin/"+p.mint+"'>Pump.fun ↗</a></td><td>$"+num(p.entry_price_usd)+"</td><td>$"+num(p.last_price_usd)+"</td><td class='"+(m>=0?"green":"red")+"'>"+(m>=0?"+":"")+m.toFixed(1)+"%</td><td><button class='danger exitOne' data-mint='"+p.mint+"'>Manual exit</button></td></tr>"}).join(""):"<tr><td colspan='5' class='empty'>No open positions.</td></tr>";
