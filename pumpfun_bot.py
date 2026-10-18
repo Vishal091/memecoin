@@ -32,6 +32,7 @@ from native_pump import (
     TransactionExpiredNotLanded,
     TransactionFailedOnChain,
     TransactionOutcomeUncertain,
+    TransactionSimulationFailed,
 )
 from solana_rpc import SolanaRPC, SolanaRPCRateLimited, SolanaTransactionNotReady
 from pump_curve import fetch_pump_curve
@@ -1189,6 +1190,20 @@ class PumpFunBot:
                 )
                 return
             except TransactionBuildFailed as exc:
+                # Discovery slippage failures are known pre-submit events. Let the
+                # discovery controller redo fresh checks while the candidate remains
+                # inside its short freshness window; do not turn them into a global halt.
+                if (
+                    strategy == "token_discovery"
+                    and isinstance(exc, TransactionSimulationFailed)
+                    and exc.retryable
+                ):
+                    logger.warning(
+                        "Discovery buy simulation still reports slippage for %s after one fresh rebuild; "
+                        "no transaction was signed or submitted",
+                        mint[:8],
+                    )
+                    raise
                 delay = self._defer_native_build_retry(mint, str(exc))
                 logger.warning(
                     "Skip copied buy for %s: %s. No transaction was signed or submitted; "
@@ -1659,6 +1674,32 @@ class PumpFunBot:
             }
             try:
                 self.buy(signal, strategy="token_discovery", entry_cap_usd=hard_cap)
+            except TransactionSimulationFailed as exc:
+                # The native executor has not signed or submitted this transaction.
+                # For a moving-curve/slippage rejection, refresh all safety gates and
+                # attempt the candidate again once inside its original freshness window.
+                if exc.retryable:
+                    self._schedule_discovery_live_preflight_retry(
+                        candidate,
+                        "Pump SDK slippage simulation failed after one fresh unsigned rebuild; "
+                        "no transaction was signed or submitted",
+                    )
+                    logger.warning(
+                        "Discovery buy delayed for fresh re-preflight mint=%s; simulation rejected slippage before submission",
+                        mint[:8],
+                    )
+                else:
+                    self._set_discovery_live_status(
+                        candidate, "failed",
+                        "Pre-submit transaction simulation failed; no transaction was signed or submitted: "
+                        + " ".join(str(exc.detail).split())[:350],
+                    )
+                    logger.warning(
+                        "Discovery buy skipped mint=%s: simulation failed before signing/submission: %s",
+                        mint[:8], " ".join(str(exc.detail).split())[:220],
+                    )
+                self.token_discovery._update_feed_subscriptions()
+                return
             except TransactionFailedOnChain as exc:
                 # This specific outcome is definitive: the chain reports the swap
                 # failed. Record it and keep the candidate consumed, without turning
