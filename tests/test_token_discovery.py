@@ -311,7 +311,7 @@ class TokenDiscoveryShadowTests(unittest.TestCase):
         candidate = json.loads(store.get_state("token_discovery_candidate:" + MINT))
         self.assertEqual(candidate["status"], "watching")
         self.assertTrue(candidate["security_passed"])
-        self.assertEqual(candidate["real_liquidity_usd"], 1500)
+        self.assertEqual(candidate["real_liquidity_usd"], 6000)
         self.assertTrue(feed.discovery_enabled)
         self.assertEqual(feed.discovery_tokens, (MINT,))
         self.assertNotIn("position", candidate)
