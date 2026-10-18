@@ -1365,10 +1365,8 @@ class PumpFunBot:
             if live_entry_market_cap > 0:
                 candidate["market_cap_usd"] = live_entry_market_cap
                 candidate["market_cap_source"] = "Estimated from fresh on-chain curve price × total supply (FDV-style)"
-                candidate["entry_market_cap_usd"] = live_entry_market_cap
-                candidate["entry_market_cap_source"] = "Estimated at fresh live-entry preflight: price × total supply (FDV-style)"
-                candidate["live_entry_market_cap_usd"] = live_entry_market_cap
-                candidate["live_entry_market_cap_source"] = "Estimated at fresh live-entry preflight: price × total supply (FDV-style)"
+                candidate["live_entry_candidate_market_cap_usd"] = live_entry_market_cap
+                candidate["live_entry_candidate_market_cap_source"] = "Estimated at live-entry preflight: price × total supply (FDV-style)"
             if decimals != 6 or liquidity < self.s.token_discovery_min_liquidity_usd or price <= 0:
                 self._set_discovery_live_status(
                     candidate, "blocked",
@@ -1432,6 +1430,11 @@ class PumpFunBot:
 
             opened = self.store.get_position(mint)
             if opened and opened.get("strategy", "leader_copy") == "token_discovery":
+                if float(candidate.get("live_entry_candidate_market_cap_usd") or 0) > 0:
+                    candidate["live_entry_market_cap_usd"] = candidate["live_entry_candidate_market_cap_usd"]
+                    candidate["live_entry_market_cap_source"] = candidate.get("live_entry_candidate_market_cap_source") or ""
+                    candidate["entry_market_cap_usd"] = candidate["live_entry_market_cap_usd"]
+                    candidate["entry_market_cap_source"] = candidate["live_entry_market_cap_source"]
                 self._set_discovery_live_status(
                     candidate, "opened",
                     f"Live buy confirmed and tracked; entry cap was ${hard_cap:.2f}",
