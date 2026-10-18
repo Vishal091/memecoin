@@ -26,7 +26,12 @@ from pumpfun_config import PumpFunSettings
 from pumpportal_feed import PumpPortalAccountFeed
 from solana_logs_feed import SolanaLogsFeed
 from pumpportal import PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID
-from native_pump import NativePumpExecutor, TransactionBuildFailed, TransactionOutcomeUncertain
+from native_pump import (
+    NativePumpExecutor,
+    TransactionBuildFailed,
+    TransactionExpiredNotLanded,
+    TransactionOutcomeUncertain,
+)
 from solana_rpc import SolanaRPC, SolanaRPCRateLimited, SolanaTransactionNotReady
 from pump_curve import fetch_pump_curve
 from storage import Store
@@ -758,6 +763,51 @@ class PumpFunBot:
         self.store.set_state(f"native_build_failure:{mint}", " ".join(str(detail).split())[:500])
         return delay
 
+    def _handle_expired_not_landed_trade(
+        self,
+        exc: TransactionExpiredNotLanded,
+        *,
+        source_wallet: str | None = None,
+        source_signature: str | None = None,
+        reason: str = "",
+    ) -> None:
+        """Record a verified non-landed transaction without halting or replaying its source signal."""
+        record = {
+            "signature": exc.signature,
+            "action": exc.action,
+            "mint": exc.mint,
+            "detail": exc.detail,
+            "source_wallet": source_wallet or "",
+            "source_signature": source_signature or "",
+            "resolved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "resolution": "blockhash_expired_status_history_absent_token_balance_unchanged",
+        }
+        self.store.set_state(
+            f"reconciled_not_landed_trade:{exc.mint}:{exc.signature}",
+            json.dumps(record, sort_keys=True, separators=(",", ":")),
+        )
+        # Consume this leader event even though our transaction did not land. The
+        # policy is to follow future signals, not replay a stale leader trade.
+        if source_wallet and source_signature:
+            self.store.mark_signature_seen(
+                self._dedupe_key(source_wallet, source_signature), source_wallet
+            )
+
+        # A followed-wallet sell temporarily creates exit_pending before submission.
+        # If that exact source-driven sell is verified not to have landed, remove
+        # only its own pending marker so position management cannot turn it into an
+        # unintended full liquidation on the next cycle. Preserve unrelated exits.
+        if exc.action == "sell" and reason.startswith("followed wallet "):
+            pending_key = f"exit_pending:{exc.mint}"
+            if self.store.get_state(pending_key, "") == reason:
+                self.store.set_state(pending_key, "")
+
+        logger.warning(
+            "Transaction expired and reconciled as NOT LANDED: action=%s mint=%s signature=%s; "
+            "position unchanged and source signal consumed",
+            exc.action, exc.mint, exc.signature,
+        )
+
     def _handle_uncertain_trade(
         self,
         exc: TransactionOutcomeUncertain,
@@ -901,6 +951,13 @@ class PumpFunBot:
                     amount=round(spend / sol_price, 9), denominated_in_sol=True,
                     slippage_bps=self.s.slippage_bps, preferred_pool=venue,
                 )
+            except TransactionExpiredNotLanded as exc:
+                self._handle_expired_not_landed_trade(
+                    exc,
+                    source_wallet=str(signal.get("wallet") or ""),
+                    source_signature=str(signal.get("signature") or ""),
+                )
+                return
             except TransactionOutcomeUncertain as exc:
                 self._handle_uncertain_trade(
                     exc,
@@ -999,6 +1056,14 @@ class PumpFunBot:
                     slippage_bps=self.s.slippage_bps, preferred_pool=preferred,
                     amount_raw=requested_raw,
                 )
+            except TransactionExpiredNotLanded as exc:
+                self._handle_expired_not_landed_trade(
+                    exc,
+                    source_wallet=source_wallet,
+                    source_signature=source_signature,
+                    reason=reason,
+                )
+                return False
             except TransactionOutcomeUncertain as exc:
                 self._handle_uncertain_trade(
                     exc,
