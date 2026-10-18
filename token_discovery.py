@@ -84,6 +84,8 @@ class TokenDiscoveryShadow:
         self.store = store
         self.feed = feed
         self.enabled = bool(getattr(settings, "token_discovery_enabled", False))
+        self.live_enabled = bool(getattr(settings, "token_discovery_live_enabled", False))
+        self.live_entry_cap_usd = min(0.50, float(getattr(settings, "token_discovery_max_entry_usd", 0.50)))
         self.max_watched = max(1, int(getattr(settings, "token_discovery_max_watched_tokens", 5)))
         self.watch_seconds = max(30, int(getattr(settings, "token_discovery_watch_seconds", 180)))
         self.max_scans_per_minute = max(1, int(getattr(settings, "token_discovery_max_launches_per_minute", 12)))
@@ -149,7 +151,9 @@ class TokenDiscoveryShadow:
         rows = self.candidates(200)
         return {
             "enabled": self.enabled,
-            "mode": "SHADOW ONLY",
+            "live_enabled": self.live_enabled,
+            "live_entry_cap_usd": self.live_entry_cap_usd,
+            "mode": "LIVE OPT-IN ENABLED" if self.live_enabled else "SHADOW ONLY",
             "launch_events": self.stats["launch_events"],
             "safety_scans": self.stats["safety_scans"],
             "safety_rejected": self.stats["safety_rejected"],
