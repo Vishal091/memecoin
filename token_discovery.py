@@ -98,6 +98,7 @@ class TokenDiscoveryShadow:
             "launch_events": 0,
             "safety_scans": 0,
             "safety_rejected": 0,
+            "liquidity_rejected": 0,
             "capacity_skips": 0,
             "rate_limit_skips": 0,
             "shadow_entries": 0,
@@ -151,6 +152,7 @@ class TokenDiscoveryShadow:
             "launch_events": self.stats["launch_events"],
             "safety_scans": self.stats["safety_scans"],
             "safety_rejected": self.stats["safety_rejected"],
+            "liquidity_rejected": self.stats["liquidity_rejected"],
             "capacity_skips": self.stats["capacity_skips"],
             "rate_limit_skips": self.stats["rate_limit_skips"],
             "shadow_entries": sum(1 for c in rows if c.get("shadow_entry_price_usd")),
@@ -273,6 +275,20 @@ class TokenDiscoveryShadow:
             return
 
         c = self._new_candidate(mint, event, inspected)
+        real_liquidity = float(inspected.get("liquidity_usd") or 0)
+        if real_liquidity < self.min_liquidity_usd:
+            c["status"] = "rejected"
+            c["subscribed"] = False
+            c["reason"] = (
+                f"Verified real bonding-curve liquidity ${real_liquidity:.0f} "
+                f"below required ${self.min_liquidity_usd:.0f}; not subscribed"
+            )
+            c["liquidity_eligible"] = False
+            self.stats["liquidity_rejected"] += 1
+            self._save(c)
+            logger.info("Shadow discovery rejected %s: %s", mint[:8], c["reason"])
+            return
+        c["liquidity_eligible"] = True
         c["status"] = "watching"
         c["reason"] = "Mint controls and canonical SOL bonding curve verified; observing real buyer flow"
         c["subscribed"] = True
@@ -689,7 +705,20 @@ class TokenDiscoveryShadow:
             if due:
                 try:
                     c = self._refresh_curve(c)
-                    if c.get("status") == "watching":
+                    if (
+                        c.get("status") == "watching"
+                        and float(c.get("real_liquidity_usd") or 0) < self.min_liquidity_usd
+                    ):
+                        c["status"] = "rejected"
+                        c["subscribed"] = False
+                        c["liquidity_eligible"] = False
+                        c["reason"] = (
+                            f"Verified real bonding-curve liquidity fell below "
+                            f"${self.min_liquidity_usd:.0f}; watch removed"
+                        )
+                        self.stats["liquidity_rejected"] += 1
+                    elif c.get("status") == "watching":
+                        c["liquidity_eligible"] = True
                         c = self._maybe_shadow_enter(c, now)
                     elif c.get("status") == "shadow_open":
                         self._mark_shadow_return(c, now)
