@@ -1092,12 +1092,8 @@ class PumpFunBot:
                 mint[:8], curve_liquidity, self.s.token_discovery_min_liquidity_usd,
             )
             return
-        is_realtime_signal = signal.get("source") == "account_trade"
         curve_state_verified = bool(signal.get("curve_state_verified"))
         venue = str(signal.get("venue", "pump"))
-        # Keep the legacy PumpPortal exception only for account-trade events.
-        # RPC notifications may bypass a young/unindexed pair-age filter only
-        # when an on-chain curve snapshot independently confirms sufficient liquidity.
         # Do not allow a websocket signal to bypass the minimum liquidity floor.
         # Discovery can use the canonical on-chain curve only after its fresh
         # security/liquidity checks; regular leader-copy entries need indexed market data.
