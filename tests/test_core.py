@@ -475,7 +475,10 @@ class NativeSendConfirmationTests(unittest.TestCase):
         executor.rpc = FakeRPC()
 
         with self.assertRaises(TransactionOutcomeUncertain) as raised:
-            executor._send_confirm(FakeTransaction(), action="buy", mint="test-mint")
+            executor._send_confirm(
+                FakeTransaction(), action="buy", mint="test-mint",
+                owner="test-wallet", token_before_raw=0,
+            )
 
         self.assertEqual(raised.exception.signature, signature)
         self.assertEqual(raised.exception.action, "buy")
