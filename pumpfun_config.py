@@ -85,6 +85,11 @@ class PumpFunSettings:
     token_discovery_min_unique_buyers: int
     token_discovery_shadow_window_seconds: int
     token_discovery_max_token_age_hours: int
+    trending_discovery_enabled: bool
+    trending_discovery_poll_seconds: int
+    trending_discovery_max_candidates: int
+    trending_min_liquidity_usd: float
+    trending_min_volume_1h_usd: float
     database_path: Path
     log_level: str
 
@@ -158,6 +163,12 @@ class PumpFunSettings:
             token_discovery_shadow_window_seconds=max(60, min(3600, _int("TOKEN_DISCOVERY_SHADOW_WINDOW_SECONDS", 900))),
             # The scanner only queues launches observed inside this rolling age limit; never allow >24h.
             token_discovery_max_token_age_hours=max(1, min(24, _int("TOKEN_DISCOVERY_MAX_TOKEN_AGE_HOURS", 24))),
+            # Trending is a separate, paced, analysis-only pipeline; it never submits trades.
+            trending_discovery_enabled=os.getenv("TRENDING_DISCOVERY_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
+            trending_discovery_poll_seconds=max(60, min(900, _int("TRENDING_DISCOVERY_POLL_SECONDS", 60))),
+            trending_discovery_max_candidates=max(1, min(20, _int("TRENDING_DISCOVERY_MAX_CANDIDATES", 8))),
+            trending_min_liquidity_usd=max(15000.0, _float("TRENDING_MIN_LIQUIDITY_USD", 15000.0)),
+            trending_min_volume_1h_usd=max(10000.0, _float("TRENDING_MIN_VOLUME_1H_USD", 10000.0)),
             database_path=Path(os.getenv("DATABASE_PATH", "memecoin-pumpfun.db")),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )
