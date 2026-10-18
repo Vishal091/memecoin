@@ -68,6 +68,14 @@ class PumpFunSettings:
     request_timeout_seconds: int
     paper_swap_cost_usd: float
     pumpportal_priority_fee_sol: float
+    token_discovery_enabled: bool
+    token_discovery_max_watched_tokens: int
+    token_discovery_watch_seconds: int
+    token_discovery_max_launches_per_minute: int
+    token_discovery_min_liquidity_usd: float
+    token_discovery_min_score: int
+    token_discovery_min_unique_buyers: int
+    token_discovery_shadow_window_seconds: int
     database_path: Path
     log_level: str
 
@@ -115,6 +123,15 @@ class PumpFunSettings:
             request_timeout_seconds=max(3, _int("REQUEST_TIMEOUT_SECONDS", 12)),
             paper_swap_cost_usd=_float("PAPER_SWAP_COST_USD", 0.02),
             pumpportal_priority_fee_sol=_float("PUMPPORTAL_PRIORITY_FEE_SOL", 0.00001),
+            # Independent discovery is opt-in and shadow-only. It never sends transactions.
+            token_discovery_enabled=os.getenv("TOKEN_DISCOVERY_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
+            token_discovery_max_watched_tokens=max(1, min(10, _int("TOKEN_DISCOVERY_MAX_WATCHED_TOKENS", 5))),
+            token_discovery_watch_seconds=max(30, min(600, _int("TOKEN_DISCOVERY_WATCH_SECONDS", 180))),
+            token_discovery_max_launches_per_minute=max(1, min(60, _int("TOKEN_DISCOVERY_MAX_LAUNCHES_PER_MINUTE", 12))),
+            token_discovery_min_liquidity_usd=_float("TOKEN_DISCOVERY_MIN_LIQUIDITY_USD", 1000.0),
+            token_discovery_min_score=max(0, min(100, _int("TOKEN_DISCOVERY_MIN_SCORE", 75))),
+            token_discovery_min_unique_buyers=max(2, min(100, _int("TOKEN_DISCOVERY_MIN_UNIQUE_BUYERS", 5))),
+            token_discovery_shadow_window_seconds=max(60, min(3600, _int("TOKEN_DISCOVERY_SHADOW_WINDOW_SECONDS", 900))),
             database_path=Path(os.getenv("DATABASE_PATH", "memecoin-pumpfun.db")),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )
