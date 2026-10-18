@@ -228,6 +228,30 @@ class TokenDiscoveryScoringTests(unittest.TestCase):
         self.assertIn("Risky Token-2022 extension", result["reason"])
 
 
+class TokenDiscoveryMarketCapTests(unittest.TestCase):
+    def test_new_candidate_converts_pumpportal_market_cap_sol_to_usd(self):
+        scanner = TokenDiscoveryShadow(settings(), FakeRPC(), FakeMarket(), FakeStore())
+        candidate = scanner._new_candidate(
+            MINT,
+            {"mint": MINT, "name": "CapTest", "marketCapSol": 20},
+            {"safe": True, "price_usd": 0.0001, "total_supply_tokens": 1_000_000_000},
+        )
+        self.assertEqual(candidate["market_cap_usd"], 3000.0)
+        self.assertIn("marketCapSol", candidate["market_cap_source"])
+        self.assertEqual(candidate["total_supply_tokens"], 1_000_000_000)
+        self.assertEqual(candidate["entry_market_cap_usd"], 0.0)
+
+    def test_price_times_supply_is_labeled_as_estimate(self):
+        scanner = TokenDiscoveryShadow(settings(), FakeRPC(), FakeMarket(), FakeStore())
+        candidate = scanner._new_candidate(
+            MINT,
+            {"mint": MINT, "name": "EstimateTest"},
+            {"safe": True, "price_usd": 0.0002, "total_supply_tokens": 1_000_000_000},
+        )
+        self.assertEqual(candidate["market_cap_usd"], 200_000.0)
+        self.assertIn("Estimated:", candidate["market_cap_source"])
+
+
 class TokenDiscoveryShadowTests(unittest.TestCase):
     def test_low_real_curve_liquidity_is_rejected_without_using_watch_slot(self):
         store = FakeStore()
@@ -280,6 +304,9 @@ class TokenDiscoveryShadowTests(unittest.TestCase):
             "subscription_expires_at": now + 180,
             "last_chain_check": now, "created_at": now,
             "real_liquidity_usd": 1500, "price_usd": 0.0001,
+            "total_supply_tokens": 1_000_000_000,
+            "market_cap_usd": 100_000.0, "market_cap_source": "Estimated: test price × supply",
+            "entry_market_cap_usd": 0.0, "entry_market_cap_source": "",
             "score": 0, "score_components": {},
             "buy_trades": 0, "sell_trades": 0,
             "unique_buyers": 0, "buyer_wallets": [],
@@ -301,6 +328,7 @@ class TokenDiscoveryShadowTests(unittest.TestCase):
                 "signature": f"trade-signature-{i}",
                 "solAmount": 0.3,
                 "tokenAmount": 1_000_000,
+                "marketCapSol": 20,
             })
 
         observed = json.loads(store.get_state("token_discovery_candidate:" + MINT))
@@ -310,6 +338,9 @@ class TokenDiscoveryShadowTests(unittest.TestCase):
         self.assertEqual(observed["unique_buyers"], 5)
         self.assertAlmostEqual(observed["buy_volume_sol"], 1.5)
         self.assertGreater(observed["shadow_entry_price_usd"], 0)
+        self.assertEqual(observed["entry_market_cap_usd"], 3000.0)
+        self.assertEqual(observed["market_cap_usd"], 3000.0)
+        self.assertIn("PumpPortal marketCapSol", observed["entry_market_cap_source"])
         self.assertIn("SHADOW ENTRY only", observed["reason"])
         self.assertEqual(scanner.stats["shadow_entries"], 1)
         self.assertNotIn("trades", store.state)
