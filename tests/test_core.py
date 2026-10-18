@@ -19,6 +19,7 @@ from native_pump import (
 )
 from solana_rpc import SolanaRPC
 from storage import Store
+from token_discovery import TokenDiscoveryShadow
 
 
 
@@ -61,6 +62,155 @@ class NativeSimulationFailureTests(unittest.TestCase):
             executor._simulate(self.FakeTransaction(), "pump-program")
         self.assertFalse(raised.exception.retryable)
         self.assertIn("simulation failed", raised.exception.detail.lower())
+
+class DiscoveryQueueTests(unittest.TestCase):
+    class FakeStore:
+        def __init__(self):
+            self.state = {}
+
+        def get_state(self, key, default=""):
+            return self.state.get(key, default)
+
+        def set_state(self, key, value):
+            self.state[str(key)] = str(value)
+
+        def list_state_prefix(self, prefix, limit=1000):
+            rows = [(k, v) for k, v in self.state.items() if k.startswith(prefix)]
+            return rows[:limit]
+
+        def delete_state(self, key):
+            self.state.pop(key, None)
+
+        def list_positions(self):
+            return []
+
+    class FakeMarket:
+        def sol_price_usd(self):
+            return 150.0
+
+    def _discovery(self, *, liquidity=6500.0, max_age_hours=24):
+        settings = SimpleNamespace(
+            token_discovery_enabled=True,
+            token_discovery_live_enabled=False,
+            token_discovery_max_entry_usd=0.50,
+            token_discovery_max_watched_tokens=5,
+            token_discovery_watch_seconds=180,
+            token_discovery_max_launches_per_minute=12,
+            token_discovery_min_liquidity_usd=5000.0,
+            token_discovery_min_score=80,
+            token_discovery_min_unique_buyers=8,
+            token_discovery_shadow_window_seconds=900,
+            token_discovery_max_token_age_hours=max_age_hours,
+            pumpfun_auth_token="",
+            request_timeout_seconds=5,
+        )
+        discovery = TokenDiscoveryShadow(
+            settings, object(), self.FakeMarket(), self.FakeStore(), None
+        )
+        discovery._inspect_new_token = lambda mint, creator="": {
+            "safe": True,
+            "reason": "test safe",
+            "checks": ["test"],
+            "liquidity_usd": liquidity,
+            "price_usd": 0.01,
+            "decimals": 6,
+            "total_supply_tokens": 1_000_000_000,
+            "top5_holder_supply_pct": 10.0,
+            "creator_supply_pct": 1.0,
+        }
+        return discovery
+
+    def test_full_watch_capacity_queues_launch_then_processes_when_slot_frees(self):
+        from token_discovery import STATE_PREFIX
+        from market_data import WSOL_MINT
+        import json
+        import time
+
+        discovery = self._discovery()
+        now = time.time()
+        for i in range(5):
+            row = {
+                "mint": f"watch-mint-{i}",
+                "created_at": now,
+                "status": "watching",
+                "subscribed": True,
+                "subscription_expires_at": now + 300,
+                "last_updated_at": now,
+            }
+            discovery.store.set_state(STATE_PREFIX + row["mint"], json.dumps(row))
+
+        discovery.on_new_token_event({
+            "mint": WSOL_MINT, "name": "Queued coin", "symbol": "QUEUE",
+            "traderPublicKey": "creator-wallet",
+        })
+        queued = discovery._load(WSOL_MINT)
+        self.assertEqual(queued["status"], "queued")
+        self.assertEqual(discovery.dashboard_snapshot()["queue_count"], 1)
+
+        for row in discovery.candidates(100):
+            if str(row.get("mint", "")).startswith("watch-mint-"):
+                row["status"] = "watch_expired"
+                row["subscribed"] = False
+                discovery._save(row)
+
+        discovery._process_queued_launches(time.time())
+        processed = discovery._load(WSOL_MINT)
+        self.assertEqual(processed["status"], "watching")
+        self.assertEqual(discovery.stats["queue_processed"], 1)
+        self.assertEqual(discovery.stats["safety_scans"], 1)
+
+    def test_launches_older_than_24_hours_expire_instead_of_scanning(self):
+        from market_data import WSOL_MINT
+        import time
+
+        discovery = self._discovery(max_age_hours=24)
+        now = time.time()
+        discovery._queue_launch_event(
+            WSOL_MINT,
+            {
+                "mint": WSOL_MINT,
+                "name": "Old coin",
+                "symbol": "OLD",
+                "_bot_observed_created_at": now - (25 * 3600),
+            },
+            "test queue",
+            now,
+        )
+        discovery._process_queued_launches(now)
+        candidate = discovery._load(WSOL_MINT)
+        self.assertEqual(candidate["status"], "expired")
+        self.assertEqual(discovery.stats["queue_expired"], 1)
+        self.assertEqual(discovery.stats["safety_scans"], 0)
+
+    def test_creation_timestamp_parser_accepts_milliseconds(self):
+        now = datetime.now(timezone.utc).timestamp()
+        parsed = TokenDiscoveryShadow._coin_created_at({
+            "created_timestamp": int(now * 1000)
+        })
+        self.assertIsNotNone(parsed)
+        self.assertAlmostEqual(parsed, now, delta=0.01)
+
+    def test_low_real_curve_liquidity_is_rejected_at_five_thousand_floor(self):
+        from market_data import WSOL_MINT
+        import time
+
+        discovery = self._discovery(liquidity=4999.0)
+        now = time.time()
+        discovery._scan_and_register(
+            WSOL_MINT,
+            {
+                "mint": WSOL_MINT,
+                "name": "Low-liquidity coin",
+                "symbol": "LOW",
+                "_bot_observed_created_at": now,
+            },
+            now,
+        )
+        candidate = discovery._load(WSOL_MINT)
+        self.assertEqual(candidate["status"], "rejected")
+        self.assertIn("below required $5000", candidate["reason"])
+        self.assertEqual(discovery.stats["liquidity_rejected"], 1)
+
 
 
 class LossExitGracePeriodTests(unittest.TestCase):
