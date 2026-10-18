@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from pumpfun_bot import PumpFunBot
 from pumpfun_config import PumpFunSettings
+from native_pump import TransactionFailedOnChain
 from storage import Store
 
 
@@ -288,6 +289,33 @@ class LiveDiscoveryCandidateGatesTests(unittest.TestCase):
         self.assertTrue(signal["fresh_security_verified"])
         self.assertEqual(scanner.candidate["live_entry_status"], "opened")
         self.assertTrue(scanner.updated_subscriptions)
+
+    def test_confirmed_slippage_failure_is_logged_without_automatic_retry_or_global_halt(self):
+        c = self.candidate(time.time() - 1)
+        scanner = self.FakeDiscovery(c, {
+            "safe": True, "liquidity_usd": 1700.0, "price_usd": 0.00011,
+            "decimals": 6, "checks": ["authorities absent"],
+            "top5_holder_supply_pct": 20.0, "creator_supply_pct": 10.0,
+        })
+        bot = self.make_bot(c, scanner)
+
+        def fail_confirmed(signal, *, strategy, entry_cap_usd):
+            raise TransactionFailedOnChain(
+                "failed-signature",
+                "buy",
+                signal["mint"],
+                "{'InstructionError': [3, {'Custom': 6042}]}",
+            )
+
+        bot.buy = fail_confirmed
+
+        bot._process_discovery_live_entries()
+
+        self.assertEqual(scanner.candidate["live_entry_status"], "failed")
+        self.assertIn("6042", scanner.candidate["live_entry_reason"])
+        self.assertIn("failed-signature", scanner.candidate["live_entry_reason"])
+        self.assertEqual(bot.store.positions, [])
+        self.assertEqual(bot.store.get_state("manual_review_halt", "0"), "0")
 
     def test_one_discovery_position_blocks_another_candidate(self):
         c = self.candidate(time.time() - 1)

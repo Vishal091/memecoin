@@ -30,6 +30,7 @@ from native_pump import (
     NativePumpExecutor,
     TransactionBuildFailed,
     TransactionExpiredNotLanded,
+    TransactionFailedOnChain,
     TransactionOutcomeUncertain,
 )
 from solana_rpc import SolanaRPC, SolanaRPCRateLimited, SolanaTransactionNotReady
@@ -1388,7 +1389,20 @@ class PumpFunBot:
                 "curve_state_verified": True,
                 "fresh_security_verified": True,
             }
-            self.buy(signal, strategy="token_discovery", entry_cap_usd=hard_cap)
+            try:
+                self.buy(signal, strategy="token_discovery", entry_cap_usd=hard_cap)
+            except TransactionFailedOnChain as exc:
+                # This specific outcome is definitive: the chain reports the swap
+                # failed. Record it and keep the candidate consumed, without turning
+                # a known slippage rejection into a generic runtime/manual-review halt.
+                # Leader-copy and sell paths retain their existing fail-closed handling.
+                detail = f"Confirmed on-chain swap failure: {exc.detail}; signature={exc.signature}; no token fill confirmed"
+                self._set_discovery_live_status(candidate, "failed", detail)
+                logger.warning(
+                    "Live discovery BUY failed on-chain mint=%s signature=%s error=%s; candidate will not auto-retry",
+                    mint[:8], exc.signature, exc.detail,
+                )
+                return
 
             opened = self.store.get_position(mint)
             if opened and opened.get("strategy", "leader_copy") == "token_discovery":

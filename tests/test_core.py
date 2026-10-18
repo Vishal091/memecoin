@@ -540,6 +540,42 @@ class NativeSendConfirmationTests(unittest.TestCase):
         self.assertEqual(raised.exception.action, "buy")
         self.assertEqual(raised.exception.mint, "test-mint")
 
+    def test_confirmed_on_chain_error_raises_typed_failed_outcome(self):
+        from native_pump import NativePumpExecutor, TransactionFailedOnChain
+
+        signature = "confirmed-failed-signature"
+
+        class FakeTransaction:
+            signatures = [signature]
+
+            def __bytes__(self):
+                return b"test-signed-transaction"
+
+        class FakeRPC:
+            def call(self, method, params):
+                if method == "sendTransaction":
+                    return signature
+                if method == "getSignatureStatuses":
+                    return {"value": [{
+                        "err": {"InstructionError": [3, {"Custom": 6042}]},
+                        "confirmationStatus": "confirmed",
+                    }]}
+                raise AssertionError(f"unexpected RPC method: {method}")
+
+        executor = object.__new__(NativePumpExecutor)
+        executor.rpc = FakeRPC()
+
+        with self.assertRaises(TransactionFailedOnChain) as raised:
+            executor._send_confirm(
+                FakeTransaction(), action="buy", mint="test-mint",
+                owner="test-wallet", token_before_raw=0,
+            )
+
+        self.assertEqual(raised.exception.signature, signature)
+        self.assertEqual(raised.exception.action, "buy")
+        self.assertEqual(raised.exception.mint, "test-mint")
+        self.assertIn("6042", raised.exception.detail)
+
     def test_expired_transaction_is_reconciled_when_history_absent_and_balance_unchanged(self):
         from native_pump import NativePumpExecutor
         import time
