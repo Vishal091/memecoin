@@ -194,6 +194,75 @@ class Store:
         with self.db:
             self.db.execute("DELETE FROM positions WHERE mint=?", (mint,))
 
+    def reconcile_confirmed_full_exit(
+        self,
+        position: dict,
+        *,
+        mode: str,
+        tx_signature: str,
+        ts: str,
+        reason: str,
+    ) -> bool:
+        """Atomically remove a stale position after an independently verified on-chain full sale.
+
+        The reconciliation row deliberately uses zero/N/A ledger values. Historical USD
+        proceeds and realized P&L must not be fabricated when the original fill was not
+        persisted. A transaction signature is the idempotency key for the audit row.
+        """
+        mint = str(position.get("mint") or "")
+        amount_raw = str(position.get("amount_raw") or "")
+        if not mint or not amount_raw or not tx_signature:
+            return False
+
+        with self.db:
+            current = self.db.execute(
+                "SELECT amount_raw FROM positions WHERE mint=?", (mint,)
+            ).fetchone()
+            if not current:
+                return False
+            if str(current["amount_raw"]) != amount_raw:
+                # Do not remove a position that changed while chain reconciliation ran.
+                return False
+
+            existing = self.db.execute(
+                "SELECT 1 FROM trades WHERE mint=? AND tx_signature=? LIMIT 1",
+                (mint, tx_signature),
+            ).fetchone()
+            if not existing:
+                self.db.execute(
+                    """INSERT INTO trades
+                    (ts,mode,action,mint,amount_raw,price_usd,value_usd,pnl_usd,reason,
+                     source_wallet,source_signature,tx_signature,strategy)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        str(ts or utc_now()), str(mode), "RECONCILED_EXIT", mint,
+                        amount_raw, 0.0, 0.0, 0.0, str(reason),
+                        position.get("source_wallet"), position.get("source_signature"),
+                        tx_signature, str(position.get("strategy") or "leader_copy"),
+                    ),
+                )
+
+            self.db.execute("DELETE FROM positions WHERE mint=?", (mint,))
+            state_values = {
+                f"exit_reconciled:{mint}": tx_signature,
+                f"exit_pending:{mint}": "",
+                f"exit_pending_amount_raw:{mint}": "",
+                f"exit_pending_source_wallet:{mint}": "",
+                f"exit_pending_source_signature:{mint}": "",
+                f"exit_blocked_balance_zero:{mint}": "",
+                f"native_build_retry_after:{mint}": "",
+                f"native_build_failure:{mint}": "",
+                f"loss_exit_hold_notice_at:{mint}": "",
+                f"pool:{mint}": "",
+            }
+            for key, value in state_values.items():
+                self.db.execute(
+                    """INSERT INTO state(key,value) VALUES(?,?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                    (key, value),
+                )
+        return True
+
     def add_trade(self, *, mode: str, action: str, mint: str, amount_raw: str,
                   price_usd: float, value_usd: float, pnl_usd: float = 0.0,
                   reason: str, source_wallet: str | None = None,
