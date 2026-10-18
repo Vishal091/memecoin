@@ -412,6 +412,34 @@ class LossExitGracePeriodTests(unittest.TestCase):
             0.0,
         )
 
+    def test_catastrophic_price_drop_bypasses_minimum_hold(self):
+        now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
+        position = {
+            "entry_price_usd": 1.0,
+            "opened_at": (now - timedelta(seconds=10)).isoformat(timespec="seconds"),
+        }
+        self.assertEqual(
+            loss_exit_hold_remaining_seconds(
+                position, 0.49, "marked loss stop", 120,
+                emergency_loss_bypass_pct=0.50, now=now.timestamp(),
+            ),
+            0.0,
+        )
+
+    def test_explicit_manual_exit_bypasses_minimum_hold_when_losing(self):
+        now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
+        position = {
+            "entry_price_usd": 1.0,
+            "opened_at": (now - timedelta(seconds=10)).isoformat(timespec="seconds"),
+        }
+        self.assertEqual(
+            loss_exit_hold_remaining_seconds(
+                position, 0.75, "manual exit requested from dashboard", 120,
+                now=now.timestamp(),
+            ),
+            0.0,
+        )
+
     def test_profit_and_emergency_liquidation_bypass_loss_grace_period(self):
         now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
         position = {
