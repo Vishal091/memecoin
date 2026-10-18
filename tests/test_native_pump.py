@@ -94,6 +94,38 @@ class NativePreSubmissionBuildFailureTests(unittest.TestCase):
         self.assertIn("fetchSellState(mint, wallet, tokenProgram)", source)
 
 
+class TokenBalanceFallbackTests(unittest.TestCase):
+    def test_zero_mint_filter_falls_back_to_token_2022_program_accounts(self):
+        mint = "test-mint"
+        owner = "test-wallet"
+        token_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+
+        class FakeRPC:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params):
+                self.calls.append((method, params))
+                if method == "getTokenAccountsByOwner" and params[1] == {"mint": mint}:
+                    return {"value": []}
+                if method == "getAccountInfo":
+                    return {"value": {"owner": token_2022, "data": ["", "base64"]}}
+                if method == "getTokenAccountsByOwner" and params[1] == {"programId": token_2022}:
+                    return {"value": [{
+                        "account": {"data": {"parsed": {"info": {
+                            "mint": mint,
+                            "tokenAmount": {"amount": "123456", "decimals": 6},
+                        }}}}
+                    }]}
+                raise AssertionError(f"Unexpected RPC call: {method} {params}")
+
+        executor = object.__new__(NativePumpExecutor)
+        executor.rpc = FakeRPC()
+
+        self.assertEqual(executor.token_balance_raw(owner, mint), 123456)
+        self.assertEqual(len(executor.rpc.calls), 3)
+
+
 class NativeTransactionGuardTests(unittest.TestCase):
     def validate(self, tx, wallet, mint, action="buy", route="pump", budget=1_000, raw=100):
         validate_native_transaction(
