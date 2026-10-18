@@ -314,7 +314,7 @@ class DiscoveryQueueTests(unittest.TestCase):
         self.assertEqual(discovery.dashboard_snapshot()["queue_count"], 0)
 
 
-    def test_low_real_curve_liquidity_is_rejected_at_five_thousand_floor(self):
+    def test_low_real_curve_liquidity_waits_for_liquidity_at_five_thousand_floor(self):
         from market_data import WSOL_MINT
         import time
 
@@ -331,9 +331,10 @@ class DiscoveryQueueTests(unittest.TestCase):
             now,
         )
         candidate = discovery._load(WSOL_MINT)
-        self.assertEqual(candidate["status"], "rejected")
-        self.assertIn("below required $5000", candidate["reason"])
-        self.assertEqual(discovery.stats["liquidity_rejected"], 1)
+        self.assertEqual(candidate["status"], "waiting_liquidity")
+        self.assertFalse(candidate["subscribed"])
+        self.assertIn("below $5000", candidate["reason"])
+        self.assertEqual(discovery.stats["liquidity_rejected"], 0)
 
 
 
