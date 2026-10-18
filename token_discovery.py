@@ -470,8 +470,14 @@ class TokenDiscoveryShadow:
         if not isinstance(curve, PumpCurveSnapshot):
             return {"safe": False, "reason": "Canonical bonding curve data could not be verified", "checks": ["curve parse failed"]}
         default_quote_mint = "11111111111111111111111111111111"
-        if getattr(curve, "quote_mint", None) not in (None, "", default_quote_mint):
-            return {"safe": False, "reason": "Token uses a non-SOL quote asset unsupported by this discovery test", "checks": ["quote mint rejected"]}
+        wrapped_sol_mint = "So11111111111111111111111111111111111111112"
+        quote_mint = getattr(curve, "quote_mint", None)
+        if quote_mint not in {default_quote_mint, wrapped_sol_mint}:
+            return {
+                "safe": False,
+                "reason": "Quote mint is missing or unsupported; SOL quote could not be independently verified",
+                "checks": ["quote mint missing/unsupported"],
+            }
         if curve.complete:
             return {"safe": False, "reason": "Bonding curve is already complete; migrated pool is not covered by this first version", "checks": ["curve completed"]}
         sol_price = float(self.market.sol_price_usd())
