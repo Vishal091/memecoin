@@ -220,9 +220,10 @@ class PumpFunBot:
             logger.error("Operational warning (automatic global halts disabled): %s", incoming[:500])
 
     def _loss_streak_pause_reason(self) -> str:
-        """Loss streaks are diagnostic only and never block new entries."""
+        """Clear legacy loss-pause state; loss streaks never block new entries."""
         if self.store.get_state("consecutive_loss_pause_day", ""):
             self.store.set_state("consecutive_loss_pause_day", "")
+            self.store.set_state("consecutive_losing_exits", "0")
         return ""
 
     def _record_realized_exit_risk(self, realized_pnl: float) -> None:
