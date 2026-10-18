@@ -374,15 +374,56 @@ class NativePumpExecutor:
         return int(result.get("value", 0))
 
     def token_balance_raw(self, owner: str, mint: str) -> int:
+        """Return a wallet's raw token balance, with a token-program-specific fallback.
+
+        Some RPC providers do not reliably return Token-2022 accounts for the mint
+        filter. If that query yields zero, read the mint's owner program and inspect
+        the wallet's accounts for that program before concluding the balance is zero.
+        """
+        def sum_mint_rows(rows) -> int:
+            total = 0
+            for row in rows or []:
+                try:
+                    info = row["account"]["data"]["parsed"]["info"]
+                    if info.get("mint") != mint:
+                        continue
+                    total += int(info["tokenAmount"]["amount"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return total
+
         result = self.rpc.call("getTokenAccountsByOwner", [
             owner, {"mint": mint}, {"encoding": "jsonParsed", "commitment": "confirmed"}
         ]) or {}
-        total = 0
-        for row in result.get("value", []):
-            try:
-                total += int(row["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"])
-            except (KeyError, TypeError, ValueError):
-                continue
+        total = sum_mint_rows(result.get("value", []))
+        if total > 0:
+            return total
+
+        # Fallback is intentionally only used on a zero-result mint query, so
+        # successful sell preflights keep their normal low RPC cost.
+        mint_result = self.rpc.call("getAccountInfo", [
+            mint, {"encoding": "base64", "commitment": "confirmed"}
+        ]) or {}
+        mint_account = mint_result.get("value") or {}
+        token_program = str(mint_account.get("owner") or "")
+        supported_programs = {
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+        }
+        if token_program not in supported_programs:
+            return total
+
+        fallback = self.rpc.call("getTokenAccountsByOwner", [
+            owner, {"programId": token_program},
+            {"encoding": "jsonParsed", "commitment": "confirmed"}
+        ]) or {}
+        fallback_total = sum_mint_rows(fallback.get("value", []))
+        if fallback_total > 0:
+            logger.warning(
+                "Token balance lookup for mint=%s found %s raw units using the token-program fallback",
+                mint[:8], fallback_total,
+            )
+            return fallback_total
         return total
 
     def _build_unsigned(self, payload: dict[str, Any]) -> tuple[VersionedTransaction, dict[str, Any]]:
