@@ -151,6 +151,17 @@ class TokenDiscoveryShadow:
                     return 0.0, ""
         return 0.0, ""
 
+    def _market_cap_from_market(self, market: dict | None) -> tuple[float, str]:
+        raw = (market or {}).get("raw") or {}
+        for key in ("marketCap", "market_cap_usd", "marketCapUsd"):
+            try:
+                value = float(raw.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                return value, f"indexed market reported field: {key}"
+        return 0.0, ""
+
     @staticmethod
     def _estimated_market_cap(price_usd: float, total_supply_tokens: float) -> tuple[float, str]:
         if price_usd > 0 and total_supply_tokens > 0:
@@ -616,6 +627,17 @@ class TokenDiscoveryShadow:
                     market = None
                 if market and float(market.get("price_usd") or 0) > 0:
                     c["price_usd"] = float(market["price_usd"])
+                    reported_cap, reported_source = self._market_cap_from_market(market)
+                    if reported_cap > 0:
+                        c["market_cap_usd"] = reported_cap
+                        c["market_cap_source"] = reported_source
+                    else:
+                        estimated_cap, estimated_source = self._estimated_market_cap(
+                            float(market["price_usd"]), float(c.get("total_supply_tokens") or 0)
+                        )
+                        if estimated_cap > 0:
+                            c["market_cap_usd"] = estimated_cap
+                            c["market_cap_source"] = estimated_source
                     c["shadow_mark_source"] = "indexed market price; migrated pool reserves not independently verified"
                     c["reason"] = "Graduated; shadow performance marked from indexed market price only"
                 else:
