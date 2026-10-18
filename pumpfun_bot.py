@@ -38,6 +38,7 @@ from solana_rpc import SolanaRPC, SolanaRPCRateLimited, SolanaTransactionNotRead
 from pump_curve import fetch_pump_curve
 from storage import Store
 from token_discovery import TokenDiscoveryShadow
+from trending_scanner import TrendingTokenScanner
 
 logger = logging.getLogger("pumpfun")
 
@@ -169,6 +170,9 @@ class PumpFunBot:
                      if self.s.pumpportal_api_key else None)
         self.token_discovery = TokenDiscoveryShadow(
             self.s, self.rpc, self.market, self.store, self.feed
+        )
+        self.trending_scanner = TrendingTokenScanner(
+            self.s, self.rpc, timeout=self.s.request_timeout_seconds
         )
         if self.feed:
             self.feed.set_discovery_subscriptions(self.token_discovery.enabled, [])
@@ -416,6 +420,7 @@ class PumpFunBot:
             "positions": positions,
             "trades": trades,
             "token_discovery": token_discovery_state,
+            "trending_discovery": self.trending_scanner.dashboard_snapshot(),
             "feed_connected": bool(self.feed and self.feed.connected.is_set()),
             "feed_error": self.feed.last_error if self.feed else "",
             "feed_stats": ({
@@ -2225,6 +2230,7 @@ class PumpFunBot:
         if not once:
             self.dashboard = DashboardServer(self.s.dashboard_port, self.dashboard_snapshot, self.commands)
             self.dashboard.start()
+            self.trending_scanner.start()
         if self.feed and not self.feed.is_alive() and not once:
             self.feed.start()
         if self.logs_feed and not self.logs_feed.is_alive() and not once:
@@ -2319,6 +2325,7 @@ class PumpFunBot:
                     break
                 time.sleep(0.20)
         finally:
+            self.trending_scanner.stop()
             if self.feed and self.feed.is_alive():
                 self.feed.stop()
             if self.logs_feed and self.logs_feed.is_alive():
