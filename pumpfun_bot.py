@@ -207,10 +207,12 @@ class PumpFunBot:
         """Record an operational warning; automatic global entry halts are disabled."""
         incoming = " ".join(str(reason or "").split()).strip()
         existing = self.store.get_state("manual_review_reason", "").strip()
-        if append_reason and existing and incoming and incoming not in existing:
+        if existing and incoming and incoming not in existing and append_reason:
             combined = f"{existing}; additionally: {incoming}"
         else:
-            combined = incoming or existing
+            # Preserve the first diagnosis unless an explicitly appended transaction
+            # outcome provides additional detail.
+            combined = existing or incoming
         # Keep the reason for diagnosis, but never latch a global trading halt.
         self.store.set_state("manual_review_halt", "0")
         self.store.set_state("manual_review_reason", combined)
