@@ -77,6 +77,9 @@ class PumpFunSettings:
     token_discovery_max_watched_tokens: int
     token_discovery_watch_seconds: int
     token_discovery_max_launches_per_minute: int
+    token_discovery_queue_size: int
+    token_discovery_max_queue_age_seconds: int
+    token_discovery_max_entry_age_seconds: int
     token_discovery_min_liquidity_usd: float
     token_discovery_min_score: int
     token_discovery_min_unique_buyers: int
@@ -143,7 +146,11 @@ class PumpFunSettings:
             token_discovery_max_watched_tokens=max(1, min(10, _int("TOKEN_DISCOVERY_MAX_WATCHED_TOKENS", 5))),
             # Observe flow for at least five minutes even if an older local .env says 180 seconds.
             token_discovery_watch_seconds=max(300, min(600, _int("TOKEN_DISCOVERY_WATCH_SECONDS", 300))),
-            token_discovery_max_launches_per_minute=max(1, min(60, _int("TOKEN_DISCOVERY_MAX_LAUNCHES_PER_MINUTE", 12))),
+            token_discovery_max_launches_per_minute=max(1, min(60, _int("TOKEN_DISCOVERY_MAX_LAUNCHES_PER_MINUTE", 30))),
+            # Keep the persisted opportunity queue large but strictly bounded.
+            token_discovery_queue_size=max(100, min(5000, _int("TOKEN_DISCOVERY_QUEUE_SIZE", 1000))),
+            token_discovery_max_queue_age_seconds=max(60, min(900, _int("TOKEN_DISCOVERY_MAX_QUEUE_AGE_SECONDS", 180))),
+            token_discovery_max_entry_age_seconds=max(60, min(600, _int("TOKEN_DISCOVERY_MAX_ENTRY_AGE_SECONDS", 300))),
             # Conservative discovery floors cannot be lowered by local config.
             token_discovery_min_liquidity_usd=max(5000.0, _float("TOKEN_DISCOVERY_MIN_LIQUIDITY_USD", 5000.0)),
             token_discovery_min_score=max(80, min(100, _int("TOKEN_DISCOVERY_MIN_SCORE", 80))),
