@@ -367,6 +367,9 @@ class StrategyPersistenceTests(unittest.TestCase):
                 "opened_at": "now", "last_price_usd": 0.5, "invested_usd": 0.5,
                 "source_wallet": None, "source_signature": "discovery-source",
                 "strategy": "token_discovery",
+                "entry_market_cap_usd": 500_000.0,
+                "total_supply_tokens": 1_000_000_000.0,
+                "entry_market_cap_source": "Estimated: executed average price × total supply (FDV-style)",
             }
             store.upsert_position(position)
             store.add_trade(
@@ -375,7 +378,11 @@ class StrategyPersistenceTests(unittest.TestCase):
                 reason="independent token discovery pump buy",
                 source_signature="discovery-source", strategy="token_discovery",
             )
-            self.assertEqual(store.get_position("discovery-mint")["strategy"], "token_discovery")
+            stored_position = store.get_position("discovery-mint")
+            self.assertEqual(stored_position["strategy"], "token_discovery")
+            self.assertEqual(stored_position["entry_market_cap_usd"], 500_000.0)
+            self.assertEqual(stored_position["total_supply_tokens"], 1_000_000_000.0)
+            self.assertEqual(stored_position["entry_market_cap_source"], "Estimated: executed average price × total supply (FDV-style)")
             self.assertEqual(store.recent_trades(1)[0]["strategy"], "token_discovery")
             store.close()
 
