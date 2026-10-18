@@ -73,6 +73,7 @@ function render(d){
   el("discoveryCandidates").innerHTML=dc.length?dc.map(function(x){
     var move=x.shadow_entry_price_usd?Number(x.current_return_pct||0):null;
     var ret=move===null?"—":((move>=0?"+":"")+move.toFixed(1)+"%")+" (peak "+((Number(x.max_return_pct||0)>=0?"+":"")+Number(x.max_return_pct||0).toFixed(1)+"%)");
+    if(move!==null){var marks=["1m","5m","15m"].map(function(k){var v=x["return_"+k+"_pct"];return k+": "+(v===null||v===undefined?"pending":((Number(v)>=0?"+":"")+Number(v).toFixed(1)+"%"))});ret+=" · "+marks.join(" / ")}
     var status=String(x.status||"—").replace(/_/g," ");
     var score=Number(x.score||0);
     var liquidity=Number(x.real_liquidity_usd||0);
