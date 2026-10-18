@@ -45,6 +45,36 @@ def raw_to_units(amount_raw: int | str, decimals: int) -> float:
     return int(amount_raw) / (10 ** decimals)
 
 
+def loss_exit_hold_remaining_seconds(
+    position: dict,
+    mark_price: float,
+    reason: str,
+    minimum_hold_seconds: int,
+    *,
+    now: float | None = None,
+) -> float:
+    """Seconds remaining in the minimum holding period for a loss-making exit."""
+    entry_price = float(position.get("entry_price_usd") or 0)
+    normalized_reason = str(reason or "").strip().lower()
+    # Hard portfolio-wide liquidation and experiment shutdown override this grace period.
+    if normalized_reason.startswith(("total loss limit", "experiment expiry")):
+        return 0.0
+    if entry_price <= 0 or mark_price <= 0 or mark_price >= entry_price:
+        return 0.0
+    try:
+        opened_at = datetime.fromisoformat(
+            str(position.get("opened_at") or "").replace("Z", "+00:00")
+        )
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        age_seconds = (time.time() if now is None else float(now)) - opened_at.timestamp()
+    except (TypeError, ValueError, OverflowError, OSError):
+        # Legacy/malformed timestamps must not lock an existing position forever.
+        return 0.0
+    required_seconds = max(120, int(minimum_hold_seconds))
+    return max(0.0, required_seconds - age_seconds)
+
+
 def native_build_retry_delay_seconds(detail: str) -> int:
     """Back off pre-submission builder failures without retrying every management tick."""
     normalized = str(detail or "").lower()
@@ -940,6 +970,9 @@ class PumpFunBot:
             pending_key = f"exit_pending:{exc.mint}"
             if self.store.get_state(pending_key, "") == reason:
                 self.store.set_state(pending_key, "")
+                self.store.set_state(f"exit_pending_amount_raw:{exc.mint}", "")
+                self.store.set_state(f"exit_pending_source_wallet:{exc.mint}", "")
+                self.store.set_state(f"exit_pending_source_signature:{exc.mint}", "")
 
         logger.warning(
             "Transaction expired and reconciled as NOT LANDED: action=%s mint=%s signature=%s; "
@@ -1241,16 +1274,58 @@ class PumpFunBot:
                      reason.startswith("followed wallet ") or reason.startswith("experiment expiry") or
                      reason.startswith("total loss limit"))
         pending_key = f"exit_pending:{mint}"
+        pending_amount_key = f"exit_pending_amount_raw:{mint}"
+        pending_wallet_key = f"exit_pending_source_wallet:{mint}"
+        pending_signature_key = f"exit_pending_source_signature:{mint}"
         if full_exit:
             self.store.set_state(pending_key, reason)
+            if source_wallet:
+                self.store.set_state(pending_wallet_key, source_wallet)
+            elif not was_pending_exit:
+                self.store.set_state(pending_wallet_key, "")
+            if source_signature:
+                self.store.set_state(pending_signature_key, source_signature)
+            elif not was_pending_exit:
+                self.store.set_state(pending_signature_key, "")
         current_raw = int(position["amount_raw"])
         requested_raw = min(max(0, int(amount_raw)), current_raw)
         if requested_raw <= 0:
             return False
+        if full_exit:
+            # Preserve partial leader sells if the exit must wait for the grace period.
+            self.store.set_state(pending_amount_key, str(requested_raw))
         decimals = int(position["decimals"])
         market = self.market.token_market(mint)
         mark_price = float(market["price_usd"]) if market else float(position["last_price_usd"])
         if mark_price <= 0:
+            return False
+
+        minimum_hold = max(
+            120, int(getattr(self.s, "min_hold_before_loss_exit_seconds", 120))
+        )
+        wait_seconds = loss_exit_hold_remaining_seconds(
+            position, mark_price, reason, minimum_hold
+        )
+        if wait_seconds > 0:
+            # Recheck automatic stop conditions each tick instead of freezing a stale
+            # trigger, so a recovery above entry naturally cancels the loss stop.
+            if reason in {"marked loss stop", "trailing stop"}:
+                self.store.set_state(pending_key, "")
+                self.store.set_state(pending_amount_key, "")
+                self.store.set_state(pending_wallet_key, "")
+                self.store.set_state(pending_signature_key, "")
+            notice_key = f"loss_exit_hold_notice_at:{mint}"
+            try:
+                last_notice = float(self.store.get_state(notice_key, "0") or 0)
+            except (TypeError, ValueError):
+                last_notice = 0.0
+            now = time.time()
+            if now - last_notice >= 30:
+                logger.warning(
+                    "Deferring loss exit for %s by %.1fs to enforce the %ds minimum hold",
+                    mint[:8], wait_seconds, minimum_hold,
+                )
+                self.store.set_state(notice_key, str(now))
             return False
 
         if self.s.mode == "paper":
@@ -1345,6 +1420,10 @@ class PumpFunBot:
             self.price_cache[mint] = mark_price
             self.price_cache_at[mint] = time.time()
         self.store.set_state(pending_key, "")
+        self.store.set_state(pending_amount_key, "")
+        self.store.set_state(pending_wallet_key, "")
+        self.store.set_state(pending_signature_key, "")
+        self.store.set_state(f"loss_exit_hold_notice_at:{mint}", "")
         self._refresh_feed_subscriptions()
         logger.warning("SELL %s raw=%s proceeds=%.4f PnL=%.4f reason=%s", mint, sold_raw, proceeds, realized_pnl, reason)
         if self.s.mode == "live":
@@ -1635,7 +1714,28 @@ class PumpFunBot:
                 continue
             pending = self.store.get_state(f"exit_pending:{mint}", "")
             if pending:
-                self.sell(mint, int(position["amount_raw"]), f"pending exit: {pending}")
+                current_raw = int(position["amount_raw"])
+                # Emergency liquidation overrides a previously deferred partial sell.
+                if pending.lower().startswith(("total loss limit", "experiment expiry")):
+                    pending_amount = current_raw
+                else:
+                    pending_amount_text = self.store.get_state(
+                        f"exit_pending_amount_raw:{mint}", str(current_raw)
+                    )
+                    try:
+                        pending_amount = int(pending_amount_text or current_raw)
+                    except (TypeError, ValueError):
+                        pending_amount = current_raw
+                pending_wallet = self.store.get_state(
+                    f"exit_pending_source_wallet:{mint}", ""
+                ) or None
+                pending_signature = self.store.get_state(
+                    f"exit_pending_source_signature:{mint}", ""
+                ) or None
+                self.sell(
+                    mint, pending_amount, f"pending exit: {pending}",
+                    pending_wallet, pending_signature,
+                )
                 continue
             price = self._mark_price(mint, float(position["last_price_usd"]))
             if price <= 0:
