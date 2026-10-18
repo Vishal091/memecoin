@@ -426,6 +426,138 @@ class NativePumpExecutor:
             return fallback_total
         return total
 
+    def find_confirmed_full_sale(
+        self,
+        owner: str,
+        mint: str,
+        expected_raw: int,
+        opened_at: str,
+        *,
+        scan_limit: int = 1000,
+    ) -> dict[str, Any] | None:
+        """Find a confirmed, wallet-signed full Pump/PumpSwap sale for a stale position.
+
+        This is a read-only reconciliation helper. It never submits transactions and
+        deliberately requires the wallet's entire recorded token balance to move from
+        exactly expected_raw to zero in a successful sell instruction after opened_at.
+        """
+        expected_raw = int(expected_raw)
+        if not owner or not mint or expected_raw <= 0:
+            return None
+
+        try:
+            opened = datetime.fromisoformat(str(opened_at or "").replace("Z", "+00:00"))
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+            opened_ts = opened.timestamp()
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+
+        accounts_result = self.rpc.call("getTokenAccountsByOwner", [
+            owner, {"mint": mint}, {"encoding": "jsonParsed", "commitment": "confirmed"}
+        ]) or {}
+        token_accounts = []
+        for row in accounts_result.get("value", []) or []:
+            try:
+                info = row["account"]["data"]["parsed"]["info"]
+                if info.get("mint") == mint and row.get("pubkey"):
+                    token_accounts.append(str(row["pubkey"]))
+            except (KeyError, TypeError):
+                continue
+        if not token_accounts:
+            return None
+
+        signatures: dict[str, int] = {}
+        for token_account in dict.fromkeys(token_accounts):
+            rows = self.rpc.call("getSignaturesForAddress", [
+                token_account, {"limit": max(1, min(1000, int(scan_limit))),
+                                "commitment": "confirmed"}
+            ]) or []
+            for row in rows:
+                signature = str(row.get("signature") or "")
+                try:
+                    block_time = int(row.get("blockTime") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if not signature or block_time < opened_ts:
+                    continue
+                signatures[signature] = max(block_time, signatures.get(signature, 0))
+
+        pump_programs = {
+            PUMP_PROGRAM_ID,
+            PUMPSWAP_PROGRAM_ID,
+        }
+        for signature, block_time in sorted(
+            signatures.items(), key=lambda item: item[1], reverse=True
+        ):
+            tx = self.rpc.transaction(signature)
+            if not tx:
+                continue
+            meta = tx.get("meta") or {}
+            if meta.get("err") is not None:
+                continue
+
+            message = ((tx.get("transaction") or {}).get("message") or {})
+            account_keys = message.get("accountKeys") or []
+            key_strings = [
+                str(key if isinstance(key, str) else key.get("pubkey", ""))
+                for key in account_keys
+            ]
+            signers = {
+                str(key.get("pubkey", ""))
+                for key in account_keys
+                if isinstance(key, dict) and key.get("signer")
+            }
+            if owner not in signers:
+                continue
+
+            logs = [str(line) for line in (meta.get("logMessages") or [])]
+            log_text = "\n".join(logs).lower()
+            has_pump_program = any(
+                f"program {program.lower()} invoke" in line.lower()
+                for line in logs for program in pump_programs
+            )
+            has_sell_instruction = (
+                "instruction: sellv2" in log_text
+                or "instruction: sell" in log_text
+                or "instruction: sell_v2" in log_text
+            )
+            if not (has_pump_program and has_sell_instruction):
+                continue
+
+            def wallet_mint_amount(rows) -> int:
+                total = 0
+                for balance in rows or []:
+                    if balance.get("mint") != mint:
+                        continue
+                    index = balance.get("accountIndex")
+                    indexed_account = (
+                        key_strings[index]
+                        if isinstance(index, int) and 0 <= index < len(key_strings)
+                        else ""
+                    )
+                    if balance.get("owner") != owner and indexed_account not in token_accounts:
+                        continue
+                    try:
+                        total += int((balance.get("uiTokenAmount") or {}).get("amount", "0"))
+                    except (TypeError, ValueError):
+                        continue
+                return total
+
+            pre_raw = wallet_mint_amount(meta.get("preTokenBalances"))
+            post_raw = wallet_mint_amount(meta.get("postTokenBalances"))
+            if pre_raw != expected_raw or post_raw != 0:
+                continue
+
+            return {
+                "signature": signature,
+                "block_time": block_time,
+                "raw_sold": expected_raw,
+                "pre_raw": pre_raw,
+                "post_raw": post_raw,
+            }
+        return None
+
     def _build_unsigned(self, payload: dict[str, Any]) -> tuple[VersionedTransaction, dict[str, Any]]:
         result = subprocess.run(
             [self.node, str(BUILDER)],
