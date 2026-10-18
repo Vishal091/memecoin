@@ -81,7 +81,7 @@ class LiveDiscoveryConfigTests(unittest.TestCase):
         self.assertFalse(config.token_discovery_live_enabled)
         self.assertEqual(config.token_discovery_max_entry_usd, 0.50)
 
-    def test_discovery_liquidity_floor_cannot_be_lowered_below_1000(self):
+    def test_discovery_liquidity_floor_cannot_be_lowered_below_5000(self):
         with patch.dict(os.environ, {
             "BOT_MODE": "paper",
             "TOKEN_DISCOVERY_ENABLED": "true",
@@ -89,7 +89,7 @@ class LiveDiscoveryConfigTests(unittest.TestCase):
             "TOKEN_DISCOVERY_MIN_LIQUIDITY_USD": "500",
         }):
             config = PumpFunSettings.load()
-        self.assertEqual(config.token_discovery_min_liquidity_usd, 1000.0)
+        self.assertEqual(config.token_discovery_min_liquidity_usd, 5000.0)
 
     def test_live_discovery_requires_live_mode_and_scanner_enabled(self):
         with patch.dict(os.environ, {
@@ -119,10 +119,10 @@ class LiveDiscoveryBuyTests(unittest.TestCase):
             token_discovery_enabled=True,
             token_discovery_live_enabled=live_enabled,
             token_discovery_max_entry_usd=max_entry,
-            token_discovery_min_liquidity_usd=1000.0,
-            min_liquidity_usd=1000.0,
+            token_discovery_min_liquidity_usd=5000.0,
+            min_liquidity_usd=5000.0,
             allow_unindexed_pump_curve=True,
-            min_pair_age_seconds=10,
+            min_pair_age_seconds=90,
             slippage_bps=300,
             max_entry_usd=global_entry_max,
             max_total_exposure_usd=3.0,
@@ -156,7 +156,7 @@ class LiveDiscoveryBuyTests(unittest.TestCase):
             "amount_ui": 0.0,
             "decimals": 6,
             "observed_price_usd": 0.0001,
-            "curve_liquidity_usd": 1500.0,
+            "curve_liquidity_usd": 6500.0,
             "venue": "pump",
             "source": "token_discovery",
             "curve_state_verified": True,
@@ -260,13 +260,13 @@ class LiveDiscoveryCandidateGatesTests(unittest.TestCase):
             "security_passed": True,
             "shadow_entry_at": entry_at,
             "shadow_entry_price_usd": 0.0001,
-            "unique_buyers": 5,
-            "buy_trades": 5,
+            "unique_buyers": 8,
+            "buy_trades": 8,
             "sell_trades": 0,
             "buy_volume_sol": 1.5,
             "sell_volume_sol": 0.0,
-            "real_liquidity_usd": 1500.0,
-            "score": 78,
+            "real_liquidity_usd": 6000.0,
+            "score": 90,
             "gate_reasons": [],
         }
 
@@ -275,7 +275,7 @@ class LiveDiscoveryCandidateGatesTests(unittest.TestCase):
         bot.s = SimpleNamespace(
             mode="live", token_discovery_enabled=True,
             token_discovery_live_enabled=True, token_discovery_max_entry_usd=0.50,
-            token_discovery_min_liquidity_usd=1000.0,
+            token_discovery_min_liquidity_usd=5000.0,
         )
         bot.run_started_at = time.time() - 10
         bot.store = FakeStore(positions)
@@ -313,7 +313,7 @@ class LiveDiscoveryCandidateGatesTests(unittest.TestCase):
             "top5_holder_supply_pct": 20.0, "creator_supply_pct": 10.0,
         })
         bot = self.make_bot(c, scanner)
-        bot.s.token_discovery_min_liquidity_usd = 2500.0
+        bot.s.token_discovery_min_liquidity_usd = 5000.0
 
         bot._process_discovery_live_entries()
 
@@ -324,7 +324,7 @@ class LiveDiscoveryCandidateGatesTests(unittest.TestCase):
 
         scanner.candidate["live_entry_retry_at"] = time.time() - 1
         scanner.inspected = {
-            "safe": True, "liquidity_usd": 3100.0, "price_usd": 0.00011,
+            "safe": True, "liquidity_usd": 5100.0, "price_usd": 0.00011,
             "decimals": 6, "checks": ["authorities absent"],
             "top5_holder_supply_pct": 20.0, "creator_supply_pct": 10.0,
         }
@@ -363,7 +363,7 @@ class LiveDiscoveryCandidateGatesTests(unittest.TestCase):
     def test_rechecks_on_chain_then_sends_only_capped_entry(self):
         c = self.candidate(time.time() - 1)
         scanner = self.FakeDiscovery(c, {
-            "safe": True, "liquidity_usd": 1700.0, "price_usd": 0.00011,
+            "safe": True, "liquidity_usd": 6000.0, "price_usd": 0.00011,
             "decimals": 6, "checks": ["authorities absent"],
             "top5_holder_supply_pct": 20.0, "creator_supply_pct": 10.0,
         })
@@ -383,7 +383,7 @@ class LiveDiscoveryCandidateGatesTests(unittest.TestCase):
     def test_confirmed_slippage_failure_is_logged_without_automatic_retry_or_global_halt(self):
         c = self.candidate(time.time() - 1)
         scanner = self.FakeDiscovery(c, {
-            "safe": True, "liquidity_usd": 1700.0, "price_usd": 0.00011,
+            "safe": True, "liquidity_usd": 6000.0, "price_usd": 0.00011,
             "decimals": 6, "checks": ["authorities absent"],
             "top5_holder_supply_pct": 20.0, "creator_supply_pct": 10.0,
         })
