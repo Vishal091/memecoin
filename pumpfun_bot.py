@@ -1263,6 +1263,17 @@ class PumpFunBot:
         for candidate in self.token_discovery.candidates(300):
             if candidate.get("status") != "shadow_open" or not candidate.get("would_buy"):
                 continue
+            # A previous process may have stopped after marking submission but
+            # before persisting the result. Never replay that candidate. Surface it as
+            # needing reconciliation rather than leaving a misleading "submitting" label.
+            if candidate.get("live_entry_status") == "submitting":
+                old_entry_at = float(candidate.get("shadow_entry_at") or 0)
+                if old_entry_at < self.run_started_at:
+                    self._set_discovery_live_status(
+                        candidate, "needs_reconciliation",
+                        "Previous process ended during a live submission; verify its transaction signature and wallet balance. No automatic retry.",
+                    )
+                continue
             # Candidate attempts are one-shot and persisted before any send to avoid
             # duplicate buys across loops or restarts after an ambiguous outcome.
             if candidate.get("live_entry_status"):
