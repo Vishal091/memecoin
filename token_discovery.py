@@ -92,7 +92,7 @@ class TokenDiscoveryShadow:
         self.live_enabled = bool(getattr(settings, "token_discovery_live_enabled", False))
         self.live_entry_cap_usd = min(0.50, float(getattr(settings, "token_discovery_max_entry_usd", 0.50)))
         self.max_watched = max(1, int(getattr(settings, "token_discovery_max_watched_tokens", 5)))
-        self.watch_seconds = max(30, int(getattr(settings, "token_discovery_watch_seconds", 180)))
+        self.watch_seconds = max(300, min(600, int(getattr(settings, "token_discovery_watch_seconds", 300))))
         self.max_scans_per_minute = max(1, int(getattr(settings, "token_discovery_max_launches_per_minute", 12)))
         self.min_liquidity_usd = max(5000.0, float(getattr(settings, "token_discovery_min_liquidity_usd", 5000.0)))
         self.min_score = max(80, min(100, int(getattr(settings, "token_discovery_min_score", 80))))
