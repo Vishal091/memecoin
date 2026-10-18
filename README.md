@@ -13,7 +13,7 @@ A local Windows/Python experiment for watching Pump.fun's trader leaderboard and
 - Provides a local dashboard: period selector, top-10 copy button, stop-copy button, position-by-position manual exit, manual exit all, recent trades, and estimated P&L.
 - Tracks positions in a local SQLite ledger; staged take-profits, trailing exits, downside stops, daily pause, total-loss halt, and the seven-day experiment limit are included.
 
-- Optional independent token discovery runs alongside leader copying in **shadow-only mode by default**. A separate local opt-in can route a fresh passing candidate through the existing live executor, after repeating all on-chain safety checks and global risk gates. Live discovery buys are hard-capped at $0.50 each and at one open discovery position; a screen is not a rug-pull guarantee.
+- Optional independent token discovery runs alongside leader copying in **shadow-only mode by default**. A separate local opt-in can route a fresh passing candidate through the existing live executor, after repeating all on-chain safety checks and global risk gates. Live discovery swap input is hard-capped at $0.50 and limited to one open discovery position; the wallet debit can be higher when network fees or new token-account rent apply. A screen is not a rug-pull guarantee.
 - The discovery panel reports rejects and hypothetical returns beside the existing leader-copy positions/trades, and labels any live discovery entry separately. It is not a rug-pull guarantee.
 
 ## Important external dependencies
@@ -63,7 +63,7 @@ The scanner is an add-on; it does not replace or change leader-copy entry/exit b
 TOKEN_DISCOVERY_ENABLED=true
 # Leave false until you explicitly decide to submit real-money discovery trades.
 TOKEN_DISCOVERY_LIVE_ENABLED=false
-# Hard code ceiling: $0.50 per discovery buy; permitted configuration range is $0.10–$0.50.
+# Hard code ceiling: $0.50 swap input per discovery buy; total wallet debit can be higher due to rent/fees.
 TOKEN_DISCOVERY_MAX_ENTRY_USD=0.50
 TOKEN_DISCOVERY_MAX_WATCHED_TOKENS=5
 TOKEN_DISCOVERY_WATCH_SECONDS=180
@@ -76,7 +76,7 @@ TOKEN_DISCOVERY_SHADOW_WINDOW_SECONDS=900
 
 Restart the bot. The dashboard displays candidate status, verified real bonding-curve liquidity (minimum $1,000), entry/current market-cap estimates, holder concentration, unique buyers, buy/sell SOL flow, score, hypothetical returns, and any live-entry result. It uses the same PumpPortal WebSocket as account-trade copying and subscribes to a capped number of token streams; those token-trade messages are metered. New token events that cannot be checked on chain are rejected.
 
-Live execution is deliberately a second opt-in. When you're ready to accept real-money risk, use a dedicated wallet and add `TOKEN_DISCOVERY_LIVE_ENABLED=true` to the local `.env` while keeping `TOKEN_DISCOVERY_ENABLED=true`, `BOT_MODE=live`, and the required live confirmation setting. Each buy is capped in code at $0.50 even if `TOKEN_DISCOVERY_MAX_ENTRY_USD` is set higher; at most one position tagged `token_discovery` can be open. Old shadow entries from previous bot runs are marked stale and are not bought. Live entries repeat the mint authority, freeze authority, Token-2022 extension, holder concentration, quote-mint and canonical curve checks immediately before execution, then must pass the existing global exposure/drawdown gates. Existing position management is responsible for exits, but neither a stop nor any liquidity check guarantees a successful sale.
+Live execution is deliberately a second opt-in. When you're ready to accept real-money risk, use a dedicated wallet and add `TOKEN_DISCOVERY_LIVE_ENABLED=true` to the local `.env` while keeping `TOKEN_DISCOVERY_ENABLED=true`, `BOT_MODE=live`, and the required live confirmation setting. Each swap input is capped in code at $0.50 even if `TOKEN_DISCOVERY_MAX_ENTRY_USD` is set higher; the actual wallet debit may be higher due to account rent and network/priority fees. P&L uses the all-in wallet debit, while the token price used for stops is based on swap input divided by tokens received. At most one position tagged `token_discovery` can be open. Old shadow entries from previous bot runs are marked stale and are not bought. Live entries repeat the mint authority, freeze authority, Token-2022 extension, holder concentration, quote-mint and canonical curve checks immediately before execution, then must pass the existing global exposure/drawdown gates. Existing position management is responsible for exits, but neither a stop nor any liquidity check guarantees a successful sale.
 
 The minimum discovery liquidity setting is enforced at no less than $1,000. Entry/current market-cap numbers are estimates when derived from token price × total supply; the dashboard labels their source and they should not be treated as guaranteed realizable value.
 
