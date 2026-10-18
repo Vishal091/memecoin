@@ -1335,8 +1335,46 @@ class PumpFunBot:
 
     def _set_discovery_live_status(self, candidate: dict, status: str, reason: str) -> None:
         candidate["live_entry_status"] = status
+        candidate["live_entry_status_updated_at"] = time.time()
         candidate["live_entry_reason"] = " ".join(str(reason or "").split())[:500]
         self.token_discovery._save(candidate)
+
+    def _schedule_discovery_live_preflight_retry(self, candidate: dict, reason: str) -> None:
+        """Retry transient pre-submission failures only while the original entry is fresh."""
+        now = time.time()
+        entry_at = float(candidate.get("shadow_entry_at") or 0)
+        retries = int(candidate.get("live_entry_retry_count") or 0)
+        fresh = (
+            entry_at >= self.run_started_at
+            and entry_at <= now
+            and now - entry_at <= 30
+        )
+        candidate["live_entry_preflight_at"] = now
+        checked_at = datetime.now().astimezone().strftime("%H:%M:%S")
+        detail = f"{reason}; preflight checked at {checked_at} local; no transaction submitted"
+        if fresh and retries < 2:
+            retry_count = retries + 1
+            candidate["live_entry_status"] = "retryable"
+            candidate["live_entry_status_updated_at"] = now
+            candidate["live_entry_retry_count"] = retry_count
+            candidate["live_entry_retry_at"] = now + 4
+            candidate["live_entry_reason"] = (
+                f"{detail}; retry {retry_count}/2 in 4s while inside the original 30s freshness window"
+            )[:500]
+            self.token_discovery._save(candidate)
+            logger.warning(
+                "Discovery live preflight will retry mint=%s attempt=%d/2: %s",
+                str(candidate.get("mint") or "")[:8], retry_count, reason,
+            )
+            return
+
+        if not fresh:
+            status = "skipped_stale"
+            detail += "; original 30s entry freshness window expired, no catch-up buy"
+        else:
+            status = "blocked"
+            detail += "; transient preflight retry limit reached, no buy submitted"
+        self._set_discovery_live_status(candidate, status, detail)
 
     def _process_discovery_live_entries(self) -> None:
         """Turn only fresh, newly-qualified shadow entries into small opt-in live buys."""
@@ -1352,24 +1390,35 @@ class PumpFunBot:
         for candidate in self.token_discovery.candidates(300):
             if candidate.get("status") != "shadow_open" or not candidate.get("would_buy"):
                 continue
+            live_status = str(candidate.get("live_entry_status") or "")
+            mint = str(candidate.get("mint") or "")
+            entry_at = float(candidate.get("shadow_entry_at") or 0)
+
             # A previous process may have stopped after marking submission but
-            # before persisting the result. Never replay that candidate. Surface it as
-            # needing reconciliation rather than leaving a misleading "submitting" label.
-            if candidate.get("live_entry_status") == "submitting":
-                old_entry_at = float(candidate.get("shadow_entry_at") or 0)
-                if old_entry_at < self.run_started_at:
+            # before persisting the result. Never replay that candidate.
+            if live_status == "submitting":
+                if entry_at < self.run_started_at:
                     self._set_discovery_live_status(
                         candidate, "needs_reconciliation",
                         "Previous process ended during a live submission; verify its transaction signature and wallet balance. No automatic retry.",
                     )
                 continue
-            # Candidate attempts are one-shot and persisted before any send to avoid
-            # duplicate buys across loops or restarts after an ambiguous outcome.
-            if candidate.get("live_entry_status"):
+            # A crash during preflight happens before any transaction is prepared or
+            # sent. Such a candidate is safe to skip as stale, but never catch up.
+            if live_status == "checking":
+                if entry_at < self.run_started_at:
+                    self._set_discovery_live_status(
+                        candidate, "skipped_stale",
+                        "Previous process ended during preflight before submission; original entry is stale and will not be bought",
+                    )
                 continue
 
-            mint = str(candidate.get("mint") or "")
-            entry_at = float(candidate.get("shadow_entry_at") or 0)
+            retrying = live_status == "retryable"
+            # Only transient preflight failures are retryable. All submitted,
+            # uncertain, failed, and non-transient blocked attempts remain one-shot.
+            if live_status and not retrying:
+                continue
+
             if (
                 not mint
                 or entry_at < self.run_started_at
@@ -1380,6 +1429,9 @@ class PumpFunBot:
                     candidate, "skipped_stale",
                     "Shadow entry is not fresh in this bot run; no catch-up live buy",
                 )
+                continue
+
+            if retrying and now < float(candidate.get("live_entry_retry_at") or 0):
                 continue
 
             positions = self.store.list_positions()
@@ -1398,13 +1450,17 @@ class PumpFunBot:
 
             # Recompute metrics and repeat every on-chain launch gate immediately
             # before spending, rather than trusting the earlier shadow snapshot.
-            candidate = self.token_discovery._apply_score(candidate)
-            if not candidate.get("would_buy"):
-                self._set_discovery_live_status(
-                    candidate, "blocked",
-                    "Entry gates no longer pass: " + "; ".join(candidate.get("gate_reasons") or []),
-                )
-                continue
+            # For a retry, the previous preflight may have stored low liquidity.
+            # Re-read the chain first instead of letting that stale snapshot suppress
+            # a still-fresh candidate before we can verify its current reserves.
+            if not retrying:
+                candidate = self.token_discovery._apply_score(candidate)
+                if not candidate.get("would_buy"):
+                    self._set_discovery_live_status(
+                        candidate, "blocked",
+                        "Entry gates no longer pass: " + "; ".join(candidate.get("gate_reasons") or []),
+                    )
+                    continue
 
             candidate["live_entry_status"] = "checking"
             candidate["live_entry_reason"] = "Repeating on-chain safety checks before live entry"
@@ -1414,12 +1470,10 @@ class PumpFunBot:
                     mint, creator=str(candidate.get("creator") or "")
                 )
             except Exception as exc:
-                self._set_discovery_live_status(
-                    candidate, "blocked",
-                    f"Fresh on-chain safety recheck failed ({type(exc).__name__}); no order submitted",
+                self._schedule_discovery_live_preflight_retry(
+                    candidate,
+                    f"Fresh on-chain safety recheck unavailable ({type(exc).__name__})",
                 )
-                logger.warning("Discovery live entry blocked mint=%s: on-chain recheck failed: %s",
-                               mint[:8], type(exc).__name__)
                 continue
 
             if not inspected.get("safe"):
@@ -1451,10 +1505,17 @@ class PumpFunBot:
                 candidate["market_cap_source"] = "Estimated from fresh on-chain curve price × total supply (FDV-style)"
                 candidate["live_entry_candidate_market_cap_usd"] = live_entry_market_cap
                 candidate["live_entry_candidate_market_cap_source"] = "Estimated at live-entry preflight: price × total supply (FDV-style)"
-            if decimals != 6 or liquidity < self.s.token_discovery_min_liquidity_usd or price <= 0:
+            if decimals != 6:
                 self._set_discovery_live_status(
                     candidate, "blocked",
-                    f"Fresh entry requirements failed (decimals={decimals}, real curve liquidity=${liquidity:.0f}, price valid={price > 0})",
+                    f"Fresh entry rejected: unsupported token decimals={decimals}; no order submitted",
+                )
+                continue
+
+            if liquidity < self.s.token_discovery_min_liquidity_usd or price <= 0:
+                self._schedule_discovery_live_preflight_retry(
+                    candidate,
+                    f"Fresh entry requirements failed (decimals={decimals}, real curve liquidity=${liquidity:.0f}, minimum=${self.s.token_discovery_min_liquidity_usd:.0f}, price valid={price > 0})",
                 )
                 continue
 
