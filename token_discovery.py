@@ -643,7 +643,7 @@ class TokenDiscoveryShadow:
             c["reason"] = (
                 f"On-chain safety checks passed; verified real curve liquidity "
                 f"${real_liquidity:.0f} is below ${self.min_liquidity_usd:.0f}; "
-                "watching for a verified liquidity event before trade-flow screening"
+                "waiting for a verified liquidity event before trade-flow screening"
             )
             self._save(c)
             logger.info("Discovery waiting for liquidity mint=%s real_curve_liquidity=$%.0f floor=$%.0f",
