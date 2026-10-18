@@ -1108,9 +1108,9 @@ class PumpFunBot:
             allow_verified_curve_age_bypass
             and (market is None or int(market.get("pair_age_seconds") or 0) < self.s.min_pair_age_seconds)
         )
-        if strategy == "leader_copy" and market is None:
+        if market is None and not allow_verified_curve_age_bypass:
             logger.info(
-                "Reject copied buy %s: indexed market pair unavailable; cannot verify liquidity and pair age",
+                "Reject buy %s: indexed market pair unavailable and unindexed-entry bypass is disabled",
                 mint[:8],
             )
             return
