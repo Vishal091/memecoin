@@ -1118,6 +1118,7 @@ class PumpFunBot:
         venue = str(signal.get("venue", "pump"))
         if venue not in {"pump", "pump-amm"}:
             venue = "pump"
+        entry_started_at = time.time()
 
         if self.s.mode == "paper":
             cost = self.s.paper_swap_cost_usd
@@ -1129,7 +1130,9 @@ class PumpFunBot:
             self.store.set_state("paper_cash", cash - spend - cost)
             tx_sig = "PAPER-" + signal["signature"][:20]
             cost_basis = spend + cost
-            effective_price = cost_basis / raw_to_units(raw_out, decimals)
+            # Token entry price is swap notional per token. Simulated costs belong
+            # in P&L basis, not in the token price used by stops and profit targets.
+            effective_price = spend / raw_to_units(raw_out, decimals)
             used_pool = venue
         else:
             assert self.keypair is not None and self.wallet_address is not None
@@ -1166,21 +1169,24 @@ class PumpFunBot:
             raw_out = int(result["total_output_amount"])
             if raw_out <= 0:
                 raise RuntimeError("PumpPortal confirmed a buy without a positive token balance delta")
+            # Wallet SOL delta includes swap input plus network/priority fees and
+            # account rent. Keep that all-in amount in P&L basis, but never treat
+            # fixed overhead as token price movement for the stop thresholds.
             effective_spend = max(0, -int(result["sol_delta_lamports"])) / 1_000_000_000 * sol_price
             cost_basis = effective_spend if effective_spend > 0 else spend
-            effective_price = cost_basis / raw_to_units(raw_out, decimals)
+            effective_price = spend / raw_to_units(raw_out, decimals)
 
         position = {
             "mint": mint, "decimals": decimals, "amount_raw": str(raw_out),
             "entry_price_usd": effective_price, "initial_amount_raw": str(raw_out),
-            "peak_price_usd": observed_price, "tp1_done": 0, "tp2_done": 0,
-            "opened_at": timestamp, "last_price_usd": observed_price,
+            "peak_price_usd": effective_price, "tp1_done": 0, "tp2_done": 0,
+            "opened_at": timestamp, "last_price_usd": effective_price,
             "invested_usd": cost_basis, "source_wallet": source_wallet,
             "source_signature": source_signature, "strategy": strategy,
             "total_supply_tokens": total_supply_tokens,
             "entry_market_cap_usd": effective_price * total_supply_tokens if total_supply_tokens > 0 else 0.0,
             "entry_market_cap_source": (
-                "Estimated: executed average token price × total supply (FDV-style)"
+                "Estimated: actual swap notional per token × total supply (FDV-style)"
                 if total_supply_tokens > 0 else ""
             ),
         }
@@ -1198,8 +1204,11 @@ class PumpFunBot:
             source_wallet=source_wallet, source_signature=source_signature,
             tx_signature=tx_sig, strategy=strategy,
         )
-        self.price_cache[mint] = observed_price
-        self.price_cache_at[mint] = time.time()
+        # Do not overwrite a fresher trade tick that arrived while the swap was
+        # being built/submitted. Otherwise seed the mark from the actual swap fill.
+        if float(self.price_cache_at.get(mint, 0) or 0) <= entry_started_at:
+            self.price_cache[mint] = effective_price
+            self.price_cache_at[mint] = time.time()
         logger.warning(
             "BUY %s raw=%s cost=%.4f USD strategy=%s source=%s pool=%s",
             mint, raw_out, cost_basis, strategy, source_wallet or "token-discovery", used_pool,
@@ -1323,6 +1332,15 @@ class PumpFunBot:
         if remaining == 0:
             self.price_cache.pop(mint, None)
             self.price_cache_at.pop(mint, None)
+            if strategy == "token_discovery":
+                discovery = getattr(self, "token_discovery", None)
+                candidate = discovery._load(mint) if discovery else None
+                if candidate:
+                    candidate["live_entry_status"] = "closed"
+                    candidate["live_entry_reason"] = (
+                        f"Live position fully exited via {reason}; realized P&L ${realized_pnl:+.4f}"
+                    )
+                    discovery._save(candidate)
         else:
             self.price_cache[mint] = mark_price
             self.price_cache_at[mint] = time.time()
@@ -1576,10 +1594,16 @@ class PumpFunBot:
 
             opened = self.store.get_position(mint)
             if opened and opened.get("strategy", "leader_copy") == "token_discovery":
-                if float(candidate.get("live_entry_candidate_market_cap_usd") or 0) > 0:
-                    candidate["live_entry_market_cap_usd"] = candidate["live_entry_candidate_market_cap_usd"]
-                    candidate["live_entry_market_cap_source"] = candidate.get("live_entry_candidate_market_cap_source") or ""
-                    candidate["entry_market_cap_usd"] = candidate["live_entry_market_cap_usd"]
+                # Use executed swap price for the live entry market-cap estimate,
+                # not the preflight quote observed before confirmation.
+                executed_cap = float(opened.get("entry_market_cap_usd") or 0)
+                if executed_cap > 0:
+                    candidate["live_entry_market_cap_usd"] = executed_cap
+                    candidate["live_entry_market_cap_source"] = (
+                        opened.get("entry_market_cap_source")
+                        or "Estimated from actual swap notional per token × total supply (FDV-style)"
+                    )
+                    candidate["entry_market_cap_usd"] = executed_cap
                     candidate["entry_market_cap_source"] = candidate["live_entry_market_cap_source"]
                 self._set_discovery_live_status(
                     candidate, "opened",
