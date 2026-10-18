@@ -209,6 +209,26 @@ class TokenDiscoveryScoringTests(unittest.TestCase):
 
 
 class TokenDiscoveryShadowTests(unittest.TestCase):
+    def test_low_real_curve_liquidity_is_rejected_without_using_watch_slot(self):
+        store = FakeStore()
+        feed = FakeFeed()
+        # 1 SOL real curve reserve => approximately $300 two-sided value at $150/SOL.
+        rpc = FakeRPC(curve_data=curve_account_data(real_sol=1_000_000_000))
+        scanner = TokenDiscoveryShadow(settings(), rpc, FakeMarket(), store, feed)
+
+        scanner.on_new_token_event({
+            "mint": MINT, "name": "TooThin", "symbol": "THIN",
+            "traderPublicKey": "Creator111111111111111111111111111111111111",
+            "txType": "create",
+        })
+
+        candidate = json.loads(store.get_state("token_discovery_candidate:" + MINT))
+        self.assertEqual(candidate["status"], "rejected")
+        self.assertFalse(candidate["subscribed"])
+        self.assertIn("below required $1000", candidate["reason"])
+        self.assertEqual(scanner.stats["liquidity_rejected"], 1)
+        self.assertEqual(feed.discovery_tokens, ())
+
     def test_new_token_is_verified_and_only_subscribed_for_shadow_observation(self):
         store = FakeStore()
         feed = FakeFeed()
