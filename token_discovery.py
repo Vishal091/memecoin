@@ -75,7 +75,7 @@ def score_candidate_metrics(
 
 
 class TokenDiscoveryShadow:
-    """Find and rank launch candidates without making live or paper-balance trades."""
+    """Screen new launches and record shadow returns; live execution is owned by the opt-in bot path."""
 
     def __init__(self, settings, rpc, market, store, feed=None):
         self.settings = settings
@@ -84,6 +84,8 @@ class TokenDiscoveryShadow:
         self.store = store
         self.feed = feed
         self.enabled = bool(getattr(settings, "token_discovery_enabled", False))
+        self.live_enabled = bool(getattr(settings, "token_discovery_live_enabled", False))
+        self.live_entry_cap_usd = min(0.50, float(getattr(settings, "token_discovery_max_entry_usd", 0.50)))
         self.max_watched = max(1, int(getattr(settings, "token_discovery_max_watched_tokens", 5)))
         self.watch_seconds = max(30, int(getattr(settings, "token_discovery_watch_seconds", 180)))
         self.max_scans_per_minute = max(1, int(getattr(settings, "token_discovery_max_launches_per_minute", 12)))
@@ -94,6 +96,7 @@ class TokenDiscoveryShadow:
         self._recent_scans: deque[float] = deque()
         self._last_chain_check: dict[str, float] = {}
         self._last_skip_log_at = 0.0
+        self._last_subscription_refresh = 0.0
         self.stats = {
             "launch_events": 0,
             "safety_scans": 0,
@@ -148,7 +151,9 @@ class TokenDiscoveryShadow:
         rows = self.candidates(200)
         return {
             "enabled": self.enabled,
-            "mode": "SHADOW ONLY",
+            "live_enabled": self.live_enabled,
+            "live_entry_cap_usd": self.live_entry_cap_usd,
+            "mode": "LIVE OPT-IN ENABLED" if self.live_enabled else "SHADOW ONLY",
             "launch_events": self.stats["launch_events"],
             "safety_scans": self.stats["safety_scans"],
             "safety_rejected": self.stats["safety_rejected"],
@@ -170,14 +175,36 @@ class TokenDiscoveryShadow:
         if not self.feed:
             return
         now = time.time()
+        rows = self.candidates(500)
+        live_position_mints = set()
+        if hasattr(self.store, "list_positions"):
+            live_position_mints = {
+                str(p.get("mint") or "")
+                for p in self.store.list_positions()
+                if p.get("strategy", "leader_copy") == "token_discovery"
+            }
         tokens = []
-        for c in self.candidates(500):
+        # Keep a live discovery position on the trade stream after its original
+        # observation window; price updates are important for automatic exits.
+        for c in rows:
+            mint = str(c.get("mint") or "")
+            if mint in live_position_mints:
+                expiry = float(c.get("subscription_expires_at", 0) or 0)
+                if expiry < now + 60:
+                    c["subscribed"] = True
+                    c["subscription_expires_at"] = now + max(self.watch_seconds, 120)
+                    self._save(c)
+                tokens.append(mint)
+        for c in rows:
+            mint = str(c.get("mint") or "")
+            if mint in live_position_mints or mint in tokens:
+                continue
             if (
                 c.get("subscribed")
                 and float(c.get("subscription_expires_at", 0)) > now
                 and c.get("status") in {"watching", "shadow_open"}
             ):
-                tokens.append(str(c.get("mint", "")))
+                tokens.append(mint)
         self.feed.set_discovery_subscriptions(self.enabled, tokens[:self.max_watched])
 
     def _active_watch_count(self, now: float) -> int:
@@ -738,8 +765,11 @@ class TokenDiscoveryShadow:
                         c["reason"] = f"Shadow mark unavailable ({type(exc).__name__}); retaining last mark"
                 self._save(c)
                 changed = True
-        if changed:
+        # Refresh subscriptions periodically so a live held token remains streamed
+        # and completed shadow-only candidates are eventually unsubscribed.
+        if changed or now - self._last_subscription_refresh >= 30:
             self._update_feed_subscriptions()
+            self._last_subscription_refresh = now
         self._trim_candidates()
 
     def _trim_candidates(self) -> None:

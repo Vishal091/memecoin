@@ -65,6 +65,9 @@ def _pubkey_string(value) -> str:
 class PumpFunBot:
     def __init__(self, settings: PumpFunSettings):
         self.s = settings
+        # Used to prevent old persisted shadow entries from unexpectedly becoming
+        # live orders after a restart or after live discovery is newly enabled.
+        self.run_started_at = time.time()
         db_path = self.s.database_path
         if not db_path.is_absolute():
             db_path = Path(__file__).resolve().parent / db_path
@@ -246,6 +249,7 @@ class PumpFunBot:
                 "mint": p["mint"], "amount_raw": p["amount_raw"], "decimals": p["decimals"],
                 "entry_price_usd": entry, "last_price_usd": mark, "move_pct": move,
                 "source_wallet": p.get("source_wallet", ""),
+                "strategy": p.get("strategy", "leader_copy"),
             })
         trades = self.store.recent_trades(15)
         leaders = {}
@@ -255,6 +259,16 @@ class PumpFunBot:
                 "profit": item.get("profit"), "rank_score": item.get("rank_score"),
             } for item in rows]
         paused = self.store.get_state("copy_paused", "0") == "1"
+        token_discovery_state = self.token_discovery.dashboard_snapshot()
+        token_discovery_state.update({
+            "live_enabled": bool(self.s.mode == "live" and self.s.token_discovery_live_enabled),
+            "live_entry_cap_usd": min(0.50, float(self.s.token_discovery_max_entry_usd)),
+            "live_open_positions": sum(
+                1 for p in self.store.list_positions()
+                if p.get("strategy", "leader_copy") == "token_discovery"
+            ),
+            "live_position_limit": 1,
+        })
         state = {
             "mode": self.s.mode,
             "message": self.message,
@@ -268,7 +282,7 @@ class PumpFunBot:
             "equity_usd": self.last_equity_usd,
             "positions": positions,
             "trades": trades,
-            "token_discovery": self.token_discovery.dashboard_snapshot(),
+            "token_discovery": token_discovery_state,
             "feed_connected": bool(self.feed and self.feed.connected.is_set()),
             "feed_error": self.feed.last_error if self.feed else "",
             "feed_stats": ({
@@ -749,10 +763,13 @@ class PumpFunBot:
             self.store.set_state("daily_paused", "1")
             logger.error("Daily drawdown limit reached (%.2f USD); entries paused until next UTC day", daily_loss)
 
-    def _can_enter(self, equity: float) -> tuple[bool, str]:
+    def _can_enter(
+        self, equity: float, *, strategy: str = "leader_copy",
+        entry_cap_usd: float | None = None,
+    ) -> tuple[bool, str]:
         if self.store.get_state("experiment_expired", "0") == "1":
             return False, "Seven-day experiment is over"
-        if self.store.get_state("copy_paused", "0") == "1":
+        if strategy != "token_discovery" and self.store.get_state("copy_paused", "0") == "1":
             return False, "Copying is paused from the dashboard"
         if self.store.get_state("manual_review_halt", "0") == "1":
             return False, "Manual review halt active: " + self.store.get_state("manual_review_reason", "")
@@ -768,8 +785,12 @@ class PumpFunBot:
             return False, "Equity is zero or less"
         exposure = self._current_positions_value()
         room = self.s.max_total_exposure_usd - exposure
-        spend = min(self.s.max_entry_usd, room)
-        if spend < 0.50:
+        configured_cap = self.s.max_entry_usd if entry_cap_usd is None else float(entry_cap_usd)
+        if strategy == "token_discovery":
+            configured_cap = min(0.50, configured_cap, float(self.s.token_discovery_max_entry_usd))
+        spend = min(self.s.max_entry_usd, configured_cap, room)
+        minimum_practical_spend = 0.10 if strategy == "token_discovery" else 0.50
+        if spend < minimum_practical_spend:
             return False, "Too little exposure headroom for a practical trade"
         if self.s.mode == "paper":
             cash = float(self.store.get_state("paper_cash", "0"))
@@ -893,8 +914,40 @@ class PumpFunBot:
             exc.action, exc.mint, exc.signature,
         )
 
-    def buy(self, signal: dict):
+    def buy(
+        self, signal: dict, *, strategy: str = "leader_copy",
+        entry_cap_usd: float | None = None,
+    ):
         mint = signal["mint"]
+        if strategy == "token_discovery":
+            if (
+                self.s.mode != "live"
+                or not self.s.token_discovery_enabled
+                or not self.s.token_discovery_live_enabled
+                or signal.get("source") != "token_discovery"
+                or signal.get("fresh_security_verified") is not True
+            ):
+                logger.warning("Reject discovery buy %s: live discovery opt-in or fresh security verification missing", mint[:8])
+                return
+            discovery_positions = [
+                p for p in self.store.list_positions()
+                if p.get("strategy", "leader_copy") == "token_discovery"
+            ]
+            if discovery_positions:
+                logger.info("Reject discovery buy %s: one live discovery position is already open", mint[:8])
+                return
+            entry_cap_usd = min(
+                0.50, float(self.s.token_discovery_max_entry_usd),
+                float(entry_cap_usd if entry_cap_usd is not None else self.s.token_discovery_max_entry_usd),
+            )
+            if entry_cap_usd <= 0:
+                logger.warning("Reject discovery buy %s: discovery entry cap is zero", mint[:8])
+                return
+        elif strategy != "leader_copy":
+            logger.warning("Reject buy %s: unsupported entry strategy %s", mint[:8], strategy)
+            return
+        source_wallet = str(signal.get("wallet") or "") or None
+        source_signature = str(signal.get("signature") or "") or None
         if self.store.get_state(f"unresolved_trade:{mint}", ""):
             logger.warning(
                 "Skipping buy for %s because an earlier transaction outcome remains unresolved",
@@ -918,6 +971,12 @@ class PumpFunBot:
         curve_liquidity = float(signal.get("curve_liquidity_usd") or 0)
         pair_liquidity = float(market.get("liquidity_usd") or 0) if market else 0.0
         actual_liquidity = max(curve_liquidity, pair_liquidity)
+        if strategy == "token_discovery" and curve_liquidity < self.s.token_discovery_min_liquidity_usd:
+            logger.info(
+                "Reject discovery buy %s: fresh real curve liquidity %.0f USD below %.0f USD",
+                mint[:8], curve_liquidity, self.s.token_discovery_min_liquidity_usd,
+            )
+            return
         is_realtime_signal = signal.get("source") == "account_trade"
         curve_state_verified = bool(signal.get("curve_state_verified"))
         venue = str(signal.get("venue", "pump"))
@@ -953,12 +1012,21 @@ class PumpFunBot:
 
         equity = self.equity()
         self._refresh_risk_state(equity)
-        allowed, reason = self._can_enter(equity)
+        allowed, reason = self._can_enter(
+            equity, strategy=strategy, entry_cap_usd=entry_cap_usd
+        )
         if not allowed:
             logger.info("Reject buy %s: %s", mint, reason)
             return
-        spend = min(self.s.max_entry_usd, self.s.max_total_exposure_usd - self._current_positions_value())
-        if spend < 0.50:
+        effective_entry_cap = self.s.max_entry_usd
+        if strategy == "token_discovery":
+            effective_entry_cap = min(
+                self.s.max_entry_usd, 0.50, float(self.s.token_discovery_max_entry_usd),
+                float(entry_cap_usd if entry_cap_usd is not None else self.s.token_discovery_max_entry_usd),
+            )
+        spend = min(effective_entry_cap, self.s.max_total_exposure_usd - self._current_positions_value())
+        minimum_practical_spend = 0.10 if strategy == "token_discovery" else 0.50
+        if spend < minimum_practical_spend:
             return
 
         decimals = int(signal.get("decimals") or 6)
@@ -990,15 +1058,15 @@ class PumpFunBot:
             except TransactionExpiredNotLanded as exc:
                 self._handle_expired_not_landed_trade(
                     exc,
-                    source_wallet=str(signal.get("wallet") or ""),
-                    source_signature=str(signal.get("signature") or ""),
+                    source_wallet=source_wallet,
+                    source_signature=source_signature,
                 )
                 return
             except TransactionOutcomeUncertain as exc:
                 self._handle_uncertain_trade(
                     exc,
-                    source_wallet=str(signal.get("wallet") or ""),
-                    source_signature=str(signal.get("signature") or ""),
+                    source_wallet=source_wallet,
+                    source_signature=source_signature,
                 )
                 return
             except TransactionBuildFailed as exc:
@@ -1023,18 +1091,29 @@ class PumpFunBot:
             "entry_price_usd": effective_price, "initial_amount_raw": str(raw_out),
             "peak_price_usd": observed_price, "tp1_done": 0, "tp2_done": 0,
             "opened_at": timestamp, "last_price_usd": observed_price,
-            "invested_usd": cost_basis, "source_wallet": signal["wallet"],
-            "source_signature": signal["signature"],
+            "invested_usd": cost_basis, "source_wallet": source_wallet,
+            "source_signature": source_signature, "strategy": strategy,
         }
         self.store.upsert_position(position)
         self.store.set_state(f"pool:{mint}", used_pool)
         self.store.increment_daily_entries()
-        self.store.add_trade(mode=self.s.mode, action="BUY", mint=mint, amount_raw=str(raw_out),
-                             price_usd=effective_price, value_usd=cost_basis, reason=f"copied Pump.fun {used_pool} buy",
-                             source_wallet=signal["wallet"], source_signature=signal["signature"], tx_signature=tx_sig)
+        trade_reason = (
+            f"independent token discovery {used_pool} buy"
+            if strategy == "token_discovery"
+            else f"copied Pump.fun {used_pool} buy"
+        )
+        self.store.add_trade(
+            mode=self.s.mode, action="BUY", mint=mint, amount_raw=str(raw_out),
+            price_usd=effective_price, value_usd=cost_basis, reason=trade_reason,
+            source_wallet=source_wallet, source_signature=source_signature,
+            tx_signature=tx_sig, strategy=strategy,
+        )
         self.price_cache[mint] = observed_price
         self.price_cache_at[mint] = time.time()
-        logger.warning("BUY %s raw=%s cost=%.4f USD leader=%s pool=%s", mint, raw_out, cost_basis, signal["wallet"], used_pool)
+        logger.warning(
+            "BUY %s raw=%s cost=%.4f USD strategy=%s source=%s pool=%s",
+            mint, raw_out, cost_basis, strategy, source_wallet or "token-discovery", used_pool,
+        )
         self._refresh_feed_subscriptions()
         if self.s.mode == "live":
             logger.warning("Live transaction confirmed: https://solscan.io/tx/%s", tx_sig)
@@ -1134,11 +1213,15 @@ class PumpFunBot:
         remaining = max(0, current_raw - sold_raw)
         remaining_basis = max(0.0, float(position["invested_usd"]) - basis)
         self.store.set_state("daily_realized_pnl", float(self.store.get_state("daily_realized_pnl", "0")) + realized_pnl)
-        self.store.add_trade(mode=self.s.mode, action="SELL", mint=mint, amount_raw=str(sold_raw),
-                             price_usd=proceeds / units_sold if units_sold else mark_price,
-                             value_usd=proceeds, pnl_usd=realized_pnl, reason=reason,
-                             source_wallet=position.get("source_wallet") or source_wallet,
-                             source_signature=source_signature or position.get("source_signature"), tx_signature=tx_sig)
+        strategy = position.get("strategy", "leader_copy")
+        self.store.add_trade(
+            mode=self.s.mode, action="SELL", mint=mint, amount_raw=str(sold_raw),
+            price_usd=proceeds / units_sold if units_sold else mark_price,
+            value_usd=proceeds, pnl_usd=realized_pnl, reason=reason,
+            source_wallet=position.get("source_wallet") or source_wallet,
+            source_signature=source_signature or position.get("source_signature"),
+            tx_signature=tx_sig, strategy=strategy,
+        )
         if remaining == 0:
             self.store.delete_position(mint)
             self.store.set_state(f"pool:{mint}", "")
@@ -1159,6 +1242,177 @@ class PumpFunBot:
         if self.s.mode == "live":
             logger.warning("Live transaction confirmed: https://solscan.io/tx/%s", tx_sig)
         return True
+
+    def _set_discovery_live_status(self, candidate: dict, status: str, reason: str) -> None:
+        candidate["live_entry_status"] = status
+        candidate["live_entry_reason"] = " ".join(str(reason or "").split())[:500]
+        self.token_discovery._save(candidate)
+
+    def _process_discovery_live_entries(self) -> None:
+        """Turn only fresh, newly-qualified shadow entries into small opt-in live buys."""
+        if (
+            self.s.mode != "live"
+            or not self.s.token_discovery_enabled
+            or not self.s.token_discovery_live_enabled
+        ):
+            return
+
+        now = time.time()
+        hard_cap = min(0.50, float(self.s.token_discovery_max_entry_usd))
+        for candidate in self.token_discovery.candidates(300):
+            if candidate.get("status") != "shadow_open" or not candidate.get("would_buy"):
+                continue
+            # Candidate attempts are one-shot and persisted before any send to avoid
+            # duplicate buys across loops or restarts after an ambiguous outcome.
+            if candidate.get("live_entry_status"):
+                continue
+
+            mint = str(candidate.get("mint") or "")
+            entry_at = float(candidate.get("shadow_entry_at") or 0)
+            if (
+                not mint
+                or entry_at < self.run_started_at
+                or now < entry_at
+                or now - entry_at > 30
+            ):
+                self._set_discovery_live_status(
+                    candidate, "skipped_stale",
+                    "Shadow entry is not fresh in this bot run; no catch-up live buy",
+                )
+                continue
+
+            positions = self.store.list_positions()
+            if any(p.get("strategy", "leader_copy") == "token_discovery" for p in positions):
+                self._set_discovery_live_status(
+                    candidate, "blocked",
+                    "One live discovery position is already open",
+                )
+                continue
+            if self.store.get_position(mint):
+                self._set_discovery_live_status(
+                    candidate, "blocked",
+                    "A tracked position already exists for this mint",
+                )
+                continue
+
+            # Recompute metrics and repeat every on-chain launch gate immediately
+            # before spending, rather than trusting the earlier shadow snapshot.
+            candidate = self.token_discovery._apply_score(candidate)
+            if not candidate.get("would_buy"):
+                self._set_discovery_live_status(
+                    candidate, "blocked",
+                    "Entry gates no longer pass: " + "; ".join(candidate.get("gate_reasons") or []),
+                )
+                continue
+
+            candidate["live_entry_status"] = "checking"
+            candidate["live_entry_reason"] = "Repeating on-chain safety checks before live entry"
+            self.token_discovery._save(candidate)
+            try:
+                inspected = self.token_discovery._inspect_new_token(
+                    mint, creator=str(candidate.get("creator") or "")
+                )
+            except Exception as exc:
+                self._set_discovery_live_status(
+                    candidate, "blocked",
+                    f"Fresh on-chain safety recheck failed ({type(exc).__name__}); no order submitted",
+                )
+                logger.warning("Discovery live entry blocked mint=%s: on-chain recheck failed: %s",
+                               mint[:8], type(exc).__name__)
+                continue
+
+            if not inspected.get("safe"):
+                candidate["security_passed"] = False
+                self._set_discovery_live_status(
+                    candidate, "blocked",
+                    "Fresh on-chain safety recheck rejected token: " + str(inspected.get("reason") or "unknown reason"),
+                )
+                logger.info("Discovery live entry rejected %s: %s",
+                            mint[:8], inspected.get("reason") or "safety recheck failed")
+                continue
+
+            liquidity = float(inspected.get("liquidity_usd") or 0)
+            price = float(inspected.get("price_usd") or 0)
+            decimals = int(inspected.get("decimals") or 0)
+            candidate.update({
+                "security_passed": True,
+                "security_checks": inspected.get("checks", []),
+                "top5_holder_supply_pct": float(inspected.get("top5_holder_supply_pct") or 0),
+                "creator_supply_pct": float(inspected.get("creator_supply_pct") or 0),
+                "real_liquidity_usd": liquidity,
+                "price_usd": price,
+            })
+            if decimals != 6 or liquidity < self.s.token_discovery_min_liquidity_usd or price <= 0:
+                self._set_discovery_live_status(
+                    candidate, "blocked",
+                    f"Fresh entry requirements failed (decimals={decimals}, real curve liquidity=${liquidity:.0f}, price valid={price > 0})",
+                )
+                continue
+
+            candidate = self.token_discovery._apply_score(candidate)
+            if not candidate.get("would_buy"):
+                self._set_discovery_live_status(
+                    candidate, "blocked",
+                    "Entry gates failed after fresh on-chain recheck: " + "; ".join(candidate.get("gate_reasons") or []),
+                )
+                continue
+
+            equity = self.equity()
+            self._refresh_risk_state(equity)
+            allowed, gate_reason = self._can_enter(
+                equity, strategy="token_discovery", entry_cap_usd=hard_cap
+            )
+            if not allowed:
+                self._set_discovery_live_status(
+                    candidate, "blocked",
+                    "Portfolio risk gate blocked discovery entry: " + gate_reason,
+                )
+                continue
+
+            # Persist a one-shot marker before handing off to the executor. If the
+            # process crashes after submission, this candidate is never replayed.
+            candidate["live_entry_status"] = "submitting"
+            candidate["live_entry_reason"] = f"Submitting at most ${hard_cap:.2f}; awaiting confirmed result"
+            self.token_discovery._save(candidate)
+            signal = {
+                "mint": mint,
+                "wallet": "",
+                "signature": f"token-discovery-{mint}-{int(entry_at * 1000)}",
+                "side": "buy",
+                "amount_ui": 0.0,
+                "decimals": decimals,
+                "observed_price_usd": price,
+                "curve_liquidity_usd": liquidity,
+                "venue": "pump",
+                "source": "token_discovery",
+                "curve_state_verified": True,
+                "fresh_security_verified": True,
+            }
+            self.buy(signal, strategy="token_discovery", entry_cap_usd=hard_cap)
+
+            opened = self.store.get_position(mint)
+            if opened and opened.get("strategy", "leader_copy") == "token_discovery":
+                self._set_discovery_live_status(
+                    candidate, "opened",
+                    f"Live buy confirmed and tracked; entry cap was ${hard_cap:.2f}",
+                )
+                logger.warning(
+                    "Live discovery BUY confirmed mint=%s strategy_cap=$%.2f; position manager will handle exits",
+                    mint[:8], hard_cap,
+                )
+            elif self.store.get_state(f"unresolved_trade:{mint}", ""):
+                self._set_discovery_live_status(
+                    candidate, "uncertain",
+                    "Transaction outcome unresolved; manual reconciliation required and this candidate will not retry",
+                )
+            else:
+                self._set_discovery_live_status(
+                    candidate, "failed",
+                    "No live position was confirmed; inspect bot logs. This candidate will not auto-retry",
+                )
+            self.token_discovery._update_feed_subscriptions()
+            # At most one discovery candidate may initiate execution per loop.
+            return
 
     def manage_positions(self):
         for original in self.store.list_positions():
@@ -1371,6 +1625,7 @@ class PumpFunBot:
                     self._consume_feed_events()
                     self._consume_solana_log_events()
                     self.token_discovery.tick()
+                    self._process_discovery_live_entries()
                     now = time.time()
 
                     if self.leaderboard_client.ready and now - self.last_leaderboard_refresh >= self.s.leaderboard_refresh_seconds:

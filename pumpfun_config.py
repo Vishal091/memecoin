@@ -69,6 +69,8 @@ class PumpFunSettings:
     paper_swap_cost_usd: float
     pumpportal_priority_fee_sol: float
     token_discovery_enabled: bool
+    token_discovery_live_enabled: bool
+    token_discovery_max_entry_usd: float
     token_discovery_max_watched_tokens: int
     token_discovery_watch_seconds: int
     token_discovery_max_launches_per_minute: int
@@ -123,8 +125,11 @@ class PumpFunSettings:
             request_timeout_seconds=max(3, _int("REQUEST_TIMEOUT_SECONDS", 12)),
             paper_swap_cost_usd=_float("PAPER_SWAP_COST_USD", 0.02),
             pumpportal_priority_fee_sol=_float("PUMPPORTAL_PRIORITY_FEE_SOL", 0.00001),
-            # Independent discovery is opt-in and shadow-only. It never sends transactions.
+            # Discovery scanning and live execution have independent opt-ins.
             token_discovery_enabled=os.getenv("TOKEN_DISCOVERY_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
+            token_discovery_live_enabled=os.getenv("TOKEN_DISCOVERY_LIVE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
+            # Hard ceiling: configuration can reduce this but never raise it above $0.50.
+            token_discovery_max_entry_usd=min(0.50, _float("TOKEN_DISCOVERY_MAX_ENTRY_USD", 0.50)),
             token_discovery_max_watched_tokens=max(1, min(10, _int("TOKEN_DISCOVERY_MAX_WATCHED_TOKENS", 5))),
             token_discovery_watch_seconds=max(30, min(600, _int("TOKEN_DISCOVERY_WATCH_SECONDS", 180))),
             token_discovery_max_launches_per_minute=max(1, min(60, _int("TOKEN_DISCOVERY_MAX_LAUNCHES_PER_MINUTE", 12))),
@@ -151,6 +156,13 @@ class PumpFunSettings:
             raise ValueError("TRAILING_STOP_PCT must be between 0 and 1")
         if self.take_profit_1_sell_fraction + self.take_profit_2_sell_fraction >= 1:
             raise ValueError("Take-profit fractions must sum to less than 1")
+        if self.token_discovery_live_enabled:
+            if not self.token_discovery_enabled:
+                raise ValueError("TOKEN_DISCOVERY_LIVE_ENABLED requires TOKEN_DISCOVERY_ENABLED=true")
+            if self.mode != "live":
+                raise ValueError("TOKEN_DISCOVERY_LIVE_ENABLED requires BOT_MODE=live")
+            if not (0.10 <= self.token_discovery_max_entry_usd <= 0.50):
+                raise ValueError("TOKEN_DISCOVERY_MAX_ENTRY_USD must be between $0.10 and the $0.50 hard cap")
         if self.mode == "live":
             if self.live_confirmation != "I_ACCEPT_THE_RISK_AND_UNDERSTAND_LIVE_TRADING":
                 raise ValueError("Live mode not armed. Review risks and set LIVE_CONFIRMATION locally.")

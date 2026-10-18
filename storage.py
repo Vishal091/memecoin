@@ -67,7 +67,8 @@ class Store:
                 initial_amount_raw TEXT NOT NULL, peak_price_usd REAL NOT NULL,
                 tp1_done INTEGER NOT NULL DEFAULT 0, tp2_done INTEGER NOT NULL DEFAULT 0,
                 opened_at TEXT NOT NULL, last_price_usd REAL NOT NULL,
-                invested_usd REAL NOT NULL, source_wallet TEXT, source_signature TEXT
+                invested_usd REAL NOT NULL, source_wallet TEXT, source_signature TEXT,
+                strategy TEXT NOT NULL DEFAULT 'leader_copy'
             );
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
@@ -75,7 +76,7 @@ class Store:
                 amount_raw TEXT NOT NULL, price_usd REAL NOT NULL,
                 value_usd REAL NOT NULL, pnl_usd REAL NOT NULL DEFAULT 0,
                 reason TEXT NOT NULL, source_wallet TEXT, source_signature TEXT,
-                tx_signature TEXT
+                tx_signature TEXT, strategy TEXT NOT NULL DEFAULT 'leader_copy'
             );
             """)
             self.db.execute("INSERT OR IGNORE INTO state(key,value) VALUES('paper_cash',?)", (str(starting_cash),))
@@ -93,6 +94,11 @@ class Store:
                 self.db.execute("ALTER TABLE positions ADD COLUMN source_wallet TEXT")
             if "source_signature" not in pos_columns:
                 self.db.execute("ALTER TABLE positions ADD COLUMN source_signature TEXT")
+            if "strategy" not in pos_columns:
+                self.db.execute("ALTER TABLE positions ADD COLUMN strategy TEXT NOT NULL DEFAULT 'leader_copy'")
+            trade_columns = {row[1] for row in self.db.execute("PRAGMA table_info(trades)").fetchall()}
+            if "strategy" not in trade_columns:
+                self.db.execute("ALTER TABLE trades ADD COLUMN strategy TEXT NOT NULL DEFAULT 'leader_copy'")
 
     def close(self) -> None:
         self.db.close()
@@ -158,13 +164,13 @@ class Store:
     def upsert_position(self, p: dict) -> None:
         columns = ("mint", "decimals", "amount_raw", "entry_price_usd", "initial_amount_raw",
                    "peak_price_usd", "tp1_done", "tp2_done", "opened_at", "last_price_usd", "invested_usd",
-                   "source_wallet", "source_signature")
+                   "source_wallet", "source_signature", "strategy")
         with self.db:
             self.db.execute(
                 "INSERT INTO positions (" + ",".join(columns) + ") VALUES (" + ",".join("?" for _ in columns) + ") "
                 "ON CONFLICT(mint) DO UPDATE SET " +
                 ",".join(f"{c}=excluded.{c}" for c in columns if c != "mint"),
-                tuple(p[c] for c in columns))
+                tuple(p.get(c, "leader_copy") if c == "strategy" else p.get(c) for c in columns))
 
     def delete_position(self, mint: str) -> None:
         with self.db:
@@ -173,13 +179,14 @@ class Store:
     def add_trade(self, *, mode: str, action: str, mint: str, amount_raw: str,
                   price_usd: float, value_usd: float, pnl_usd: float = 0.0,
                   reason: str, source_wallet: str | None = None,
-                  source_signature: str | None = None, tx_signature: str | None = None) -> None:
+                  source_signature: str | None = None, tx_signature: str | None = None,
+                  strategy: str = "leader_copy") -> None:
         with self.db:
             self.db.execute("""INSERT INTO trades
-                (ts,mode,action,mint,amount_raw,price_usd,value_usd,pnl_usd,reason,source_wallet,source_signature,tx_signature)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (ts,mode,action,mint,amount_raw,price_usd,value_usd,pnl_usd,reason,source_wallet,source_signature,tx_signature,strategy)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (utc_now(), mode, action, mint, str(amount_raw), float(price_usd), float(value_usd),
-                 float(pnl_usd), reason, source_wallet, source_signature, tx_signature))
+                 float(pnl_usd), reason, source_wallet, source_signature, tx_signature, str(strategy or "leader_copy")))
 
     def equity_snapshot(self) -> dict:
         return {
