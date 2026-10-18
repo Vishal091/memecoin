@@ -190,6 +190,69 @@ class DiscoveryQueueTests(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertAlmostEqual(parsed, now, delta=0.01)
 
+    def test_backfill_queues_recent_candidates_without_scanning_inline(self):
+        from market_data import WSOL_MINT
+        import time
+
+        discovery = self._discovery()
+        now = time.time()
+        created_at = now - 3600
+        discovery.backfill_page_size = 1
+        discovery._backfill_results.put({
+            "offset": 0,
+            "rows": [{
+                "mint": WSOL_MINT,
+                "name": "Backfill coin",
+                "symbol": "BACKFILL",
+                "created_timestamp": int(created_at * 1000),
+            }],
+            "error": "",
+        })
+
+        discovery._drain_recent_launch_backfill(now)
+
+        candidate = discovery._load(WSOL_MINT)
+        self.assertEqual(candidate["status"], "queued")
+        self.assertIn("authenticated recent-launch backfill", candidate["reason"])
+        self.assertAlmostEqual(candidate["created_at"], created_at, delta=0.01)
+        self.assertEqual(discovery.stats["backfill_polls"], 1)
+        self.assertEqual(discovery.stats["backfill_candidates_seen"], 1)
+        self.assertEqual(discovery.stats["safety_scans"], 0)
+        self.assertEqual(discovery.dashboard_snapshot()["queue_count"], 1)
+
+    def test_backfill_stops_paging_when_existing_rows_cross_24_hour_cutoff(self):
+        from market_data import WSOL_MINT
+        import time
+
+        discovery = self._discovery()
+        now = time.time()
+        old_at = now - (25 * 3600)
+        other_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        for mint in (WSOL_MINT, other_mint):
+            discovery._save({
+                "mint": mint,
+                "created_at": old_at,
+                "status": "expired",
+                "subscribed": False,
+            })
+        discovery.backfill_page_size = 2
+        discovery._backfill_offset = 200
+        discovery._backfill_results.put({
+            "offset": 200,
+            "rows": [
+                {"mint": WSOL_MINT, "created_timestamp": int(old_at * 1000)},
+                {"mint": other_mint, "created_timestamp": int(old_at * 1000)},
+            ],
+            "error": "",
+        })
+
+        discovery._drain_recent_launch_backfill(now)
+
+        self.assertEqual(discovery._backfill_offset, 0)
+        self.assertEqual(discovery.stats["backfill_polls"], 1)
+        self.assertEqual(discovery.dashboard_snapshot()["queue_count"], 0)
+
+
     def test_backfill_queues_recent_candidates_without_scanning_them_inline(self):
         from market_data import WSOL_MINT
         import time
@@ -249,7 +312,7 @@ class DiscoveryQueueTests(unittest.TestCase):
 
         self.assertEqual(discovery._backfill_offset, 0)
         self.assertEqual(discovery.stats["backfill_polls"], 1)
-        self.assertEqual(discovery.stats["queue_count"] if "queue_count" in discovery.stats else 0, 0)
+        self.assertEqual(discovery.dashboard_snapshot()["queue_count"], 0)
 
     def test_low_real_curve_liquidity_is_rejected_at_five_thousand_floor(self):
         from market_data import WSOL_MINT
