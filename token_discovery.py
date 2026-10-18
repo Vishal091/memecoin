@@ -243,7 +243,8 @@ class TokenDiscoveryShadow:
         self._recent_scans.append(now)
         self.stats["safety_scans"] += 1
         try:
-            inspected = self._inspect_new_token(mint)
+            creator = str(event.get("traderPublicKey") or event.get("creator") or "")
+            inspected = self._inspect_new_token(mint, creator=creator)
         except Exception as exc:
             self.stats["safety_rejected"] += 1
             self._record_skipped(
@@ -292,6 +293,8 @@ class TokenDiscoveryShadow:
             "reason": "",
             "security_passed": bool(inspected.get("safe", False)),
             "security_checks": inspected.get("checks", []),
+            "top5_holder_supply_pct": float(inspected.get("top5_holder_supply_pct") or 0),
+            "creator_supply_pct": float(inspected.get("creator_supply_pct") or 0),
             "real_liquidity_usd": float(inspected.get("liquidity_usd") or 0),
             "price_usd": float(inspected.get("price_usd") or 0),
             "score": 0,
@@ -316,7 +319,7 @@ class TokenDiscoveryShadow:
             "return_15m_pct": None,
         }
 
-    def _inspect_new_token(self, mint: str) -> dict:
+    def _inspect_new_token(self, mint: str, creator: str = "") -> dict:
         from pump_curve import PumpCurveSnapshot
 
         mint_result = self.rpc.call(
@@ -353,9 +356,72 @@ class TokenDiscoveryShadow:
             if name not in TOKEN_METADATA_SAFE_EXTENSIONS:
                 return {"safe": False, "reason": f"Unreviewed Token-2022 extension: {name or 'unknown'}", "checks": ["extension allowlist rejected"]}
 
+        curve_address = bonding_curve_address(mint)
+        largest_result = self.rpc.call(
+            "getTokenLargestAccounts",
+            [mint, {"commitment": "confirmed"}],
+        ) or {}
+        largest_accounts = largest_result.get("value")
+        if not isinstance(largest_accounts, list) or not largest_accounts:
+            return {
+                "safe": False,
+                "reason": "Largest token-holder accounts are unavailable; concentration risk cannot be checked",
+                "checks": ["holder distribution unavailable"],
+            }
+        holder_addresses = [str(row.get("address") or "") for row in largest_accounts]
+        if any(not address for address in holder_addresses):
+            return {"safe": False, "reason": "Largest-holder response contains an invalid account", "checks": ["holder response malformed"]}
+        holder_response = self.rpc.call(
+            "getMultipleAccounts",
+            [holder_addresses, {"encoding": "jsonParsed", "commitment": "confirmed"}],
+        ) or {}
+        holder_rows = holder_response.get("value")
+        if not isinstance(holder_rows, list) or len(holder_rows) != len(holder_addresses):
+            return {"safe": False, "reason": "Holder account details could not be verified", "checks": ["holder account lookup failed"]}
+        user_holders = []
+        creator_holding_raw = 0
+        for row in holder_rows:
+            if not isinstance(row, dict):
+                return {"safe": False, "reason": "A largest-holder account is not indexed; concentration check failed closed", "checks": ["holder account missing"]}
+            info = ((((row.get("data") or {}).get("parsed") or {}).get("info")) or {})
+            if str(info.get("mint") or "") != mint:
+                return {"safe": False, "reason": "Largest-holder account does not match the candidate mint", "checks": ["holder mint mismatch"]}
+            owner = str(info.get("owner") or "")
+            try:
+                amount_raw = int(((info.get("tokenAmount") or {}).get("amount")) or 0)
+            except (TypeError, ValueError):
+                return {"safe": False, "reason": "Largest-holder token amount could not be parsed", "checks": ["holder amount invalid"]}
+            if owner == curve_address:
+                # The canonical bonding curve's token inventory is not an insider wallet.
+                continue
+            user_holders.append((owner, amount_raw))
+            if creator and owner == creator:
+                creator_holding_raw += amount_raw
+
+        supply_pct = lambda amount: (amount / supply * 100.0) if supply > 0 else 100.0
+        top5_pct = supply_pct(sum(amount for _owner, amount in
+                                  sorted(user_holders, key=lambda entry: entry[1], reverse=True)[:5]))
+        creator_pct = supply_pct(creator_holding_raw)
+        if creator and creator_pct > 20.0:
+            return {
+                "safe": False,
+                "reason": f"Creator directly holds {creator_pct:.1f}% of total supply (limit 20%)",
+                "checks": ["creator concentration rejected"],
+                "top5_holder_supply_pct": round(top5_pct, 3),
+                "creator_supply_pct": round(creator_pct, 3),
+            }
+        if top5_pct > 35.0:
+            return {
+                "safe": False,
+                "reason": f"Top five non-curve holders control {top5_pct:.1f}% of total supply (limit 35%)",
+                "checks": ["top-holder concentration rejected"],
+                "top5_holder_supply_pct": round(top5_pct, 3),
+                "creator_supply_pct": round(creator_pct, 3),
+            }
+
         curve_result = self.rpc.call(
             "getAccountInfo",
-            [bonding_curve_address(mint), {"encoding": "base64", "commitment": "confirmed"}],
+            [curve_address, {"encoding": "base64", "commitment": "confirmed"}],
         ) or {}
         curve_account = curve_result.get("value")
         if not isinstance(curve_account, dict):
@@ -377,6 +443,8 @@ class TokenDiscoveryShadow:
             "SPL token program verified",
             "mint and freeze authorities absent",
             "only recognized metadata extensions present",
+            f"top five non-curve holders control {top5_pct:.1f}% of supply",
+            f"creator directly holds {creator_pct:.1f}% of supply",
             "canonical Pump bonding curve verified",
             "SOL quote and real SOL reserves verified",
         ]
@@ -389,6 +457,8 @@ class TokenDiscoveryShadow:
             "liquidity_usd": liquidity,
             "price_usd": price,
             "decimals": decimals,
+            "top5_holder_supply_pct": round(top5_pct, 3),
+            "creator_supply_pct": round(creator_pct, 3),
         }
 
     def _refresh_curve(self, c: dict) -> dict:
