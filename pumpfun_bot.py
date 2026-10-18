@@ -199,6 +199,47 @@ class PumpFunBot:
         self.store.set_state("manual_review_halt", "1")
         self.store.set_state("manual_review_reason", combined)
 
+    def _loss_streak_pause_reason(self) -> str:
+        """Pause new entries for the remainder of the UTC day after a loss streak."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        pause_day = self.store.get_state("consecutive_loss_pause_day", "")
+        if pause_day and pause_day != today:
+            self.store.set_state("consecutive_loss_pause_day", "")
+            self.store.set_state("consecutive_losing_exits", "0")
+            return ""
+        if pause_day == today:
+            try:
+                streak = int(self.store.get_state("consecutive_losing_exits", "0") or 0)
+            except (TypeError, ValueError):
+                streak = 0
+            threshold = max(2, int(getattr(self.s, "max_consecutive_losses", 3)))
+            return (
+                f"Consecutive-loss pause active after {streak} losing exits; "
+                f"new entries blocked until the next UTC day (threshold {threshold})."
+            )
+        return ""
+
+    def _record_realized_exit_risk(self, realized_pnl: float) -> None:
+        """Update the persisted loss streak after each confirmed sell."""
+        # This also clears a pause that belonged to a previous UTC day.
+        self._loss_streak_pause_reason()
+        try:
+            streak = int(self.store.get_state("consecutive_losing_exits", "0") or 0)
+        except (TypeError, ValueError):
+            streak = 0
+        streak = streak + 1 if float(realized_pnl) <= 0 else 0
+        self.store.set_state("consecutive_losing_exits", str(streak))
+        threshold = max(2, int(getattr(self.s, "max_consecutive_losses", 3)))
+        today = datetime.now(timezone.utc).date().isoformat()
+        pause_day = self.store.get_state("consecutive_loss_pause_day", "")
+        if streak >= threshold and pause_day != today:
+            self.store.set_state("consecutive_loss_pause_day", today)
+            logger.error(
+                "Consecutive-loss circuit breaker activated after %d exits with non-positive realized P&L; "
+                "new entries paused until the next UTC day",
+                streak,
+            )
+
     def _copy_block_reason(self) -> str:
         """Explain durable safety gates that must be cleared before new copy entries."""
         if self.store.get_state("halted", "0") == "1":
@@ -211,6 +252,9 @@ class PumpFunBot:
             return "The seven-day experiment has expired."
         if self.store.get_state("daily_paused", "0") == "1":
             return "Daily loss pause is active until the UTC day resets."
+        streak_reason = self._loss_streak_pause_reason()
+        if streak_reason:
+            return streak_reason
         return ""
 
     def _refresh_feed_subscriptions(self) -> None:
@@ -871,6 +915,9 @@ class PumpFunBot:
             return False, "Overall loss halt active: " + self.store.get_state("halt_reason")
         if self.store.get_state("daily_paused", "0") == "1":
             return False, "Daily loss pause active"
+        streak_reason = self._loss_streak_pause_reason()
+        if streak_reason:
+            return False, streak_reason
         if self.store.daily_entries() >= self.s.max_entries_per_day:
             return False, "Daily entry cap reached"
         if len(self.store.list_positions()) >= self.s.max_open_positions:
@@ -1402,6 +1449,7 @@ class PumpFunBot:
         remaining = max(0, current_raw - sold_raw)
         remaining_basis = max(0.0, float(position["invested_usd"]) - basis)
         self.store.set_state("daily_realized_pnl", float(self.store.get_state("daily_realized_pnl", "0")) + realized_pnl)
+        self._record_realized_exit_risk(realized_pnl)
         strategy = position.get("strategy", "leader_copy")
         self.store.add_trade(
             mode=self.s.mode, action="SELL", mint=mint, amount_raw=str(sold_raw),
