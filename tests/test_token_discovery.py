@@ -67,7 +67,7 @@ class FakeMarket:
 
 
 class FakeRPC:
-    def __init__(self, mint_info=None, curve_data=None):
+    def __init__(self, mint_info=None, curve_data=None, holder_owner=None, holder_amount="900000000000000"):
         self.mint_info = mint_info or {
             "decimals": 6,
             "supply": "1000000000000000",
@@ -75,6 +75,8 @@ class FakeRPC:
             "freezeAuthority": None,
         }
         self.curve_data = curve_data or curve_account_data()
+        self.holder_owner = holder_owner or bonding_curve_address(MINT)
+        self.holder_amount = str(holder_amount)
         self.calls = []
 
     def call(self, method, params):
@@ -87,6 +89,16 @@ class FakeRPC:
                     "data": {"program": "spl-token", "parsed": {"info": self.mint_info}},
                 }
             }
+        if method == "getTokenLargestAccounts" and address == MINT:
+            return {"value": [{"address": "LargestTokenAccount111111111111111111111111111111"}]}
+        if method == "getMultipleAccounts":
+            return {"value": [{
+                "data": {"parsed": {"info": {
+                    "mint": MINT,
+                    "owner": self.holder_owner,
+                    "tokenAmount": {"amount": self.holder_amount, "decimals": 6},
+                }}}
+            } for _ in params[0]]}
         if method == "getAccountInfo" and address == bonding_curve_address(MINT):
             return {
                 "value": {
@@ -152,6 +164,24 @@ class TokenDiscoveryScoringTests(unittest.TestCase):
         self.assertFalse(result["safe"])
         self.assertIn("Mint authority remains active", result["reason"])
         self.assertEqual(len(rpc.calls), 1, "Do not inspect or subscribe to the curve after a failed mint gate")
+
+    def test_high_non_curve_holder_concentration_is_a_hard_reject(self):
+        rpc = FakeRPC(
+            holder_owner="Insider111111111111111111111111111111111111",
+            holder_amount="400000000000000",
+        )
+        scanner = TokenDiscoveryShadow(settings(), rpc, FakeMarket(), FakeStore())
+        result = scanner._inspect_new_token(MINT)
+        self.assertFalse(result["safe"])
+        self.assertIn("Top five non-curve holders control 40.0%", result["reason"])
+
+    def test_creator_holding_above_limit_is_a_hard_reject(self):
+        creator = "DevWallet1111111111111111111111111111111111"
+        rpc = FakeRPC(holder_owner=creator, holder_amount="250000000000000")
+        scanner = TokenDiscoveryShadow(settings(), rpc, FakeMarket(), FakeStore())
+        result = scanner._inspect_new_token(MINT, creator=creator)
+        self.assertFalse(result["safe"])
+        self.assertIn("Creator directly holds 25.0%", result["reason"])
 
     def test_unreviewed_token_2022_extension_is_a_hard_reject(self):
         rpc = FakeRPC(mint_info={
