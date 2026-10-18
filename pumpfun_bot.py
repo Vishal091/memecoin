@@ -65,6 +65,9 @@ def _pubkey_string(value) -> str:
 class PumpFunBot:
     def __init__(self, settings: PumpFunSettings):
         self.s = settings
+        # Used to prevent old persisted shadow entries from unexpectedly becoming
+        # live orders after a restart or after live discovery is newly enabled.
+        self.run_started_at = time.time()
         db_path = self.s.database_path
         if not db_path.is_absolute():
             db_path = Path(__file__).resolve().parent / db_path
@@ -246,6 +249,7 @@ class PumpFunBot:
                 "mint": p["mint"], "amount_raw": p["amount_raw"], "decimals": p["decimals"],
                 "entry_price_usd": entry, "last_price_usd": mark, "move_pct": move,
                 "source_wallet": p.get("source_wallet", ""),
+                "strategy": p.get("strategy", "leader_copy"),
             })
         trades = self.store.recent_trades(15)
         leaders = {}
@@ -255,6 +259,16 @@ class PumpFunBot:
                 "profit": item.get("profit"), "rank_score": item.get("rank_score"),
             } for item in rows]
         paused = self.store.get_state("copy_paused", "0") == "1"
+        token_discovery_state = self.token_discovery.dashboard_snapshot()
+        token_discovery_state.update({
+            "live_enabled": bool(self.s.mode == "live" and self.s.token_discovery_live_enabled),
+            "live_entry_cap_usd": min(0.50, float(self.s.token_discovery_max_entry_usd)),
+            "live_open_positions": sum(
+                1 for p in self.store.list_positions()
+                if p.get("strategy", "leader_copy") == "token_discovery"
+            ),
+            "live_position_limit": 1,
+        })
         state = {
             "mode": self.s.mode,
             "message": self.message,
@@ -268,7 +282,7 @@ class PumpFunBot:
             "equity_usd": self.last_equity_usd,
             "positions": positions,
             "trades": trades,
-            "token_discovery": self.token_discovery.dashboard_snapshot(),
+            "token_discovery": token_discovery_state,
             "feed_connected": bool(self.feed and self.feed.connected.is_set()),
             "feed_error": self.feed.last_error if self.feed else "",
             "feed_stats": ({
@@ -749,10 +763,13 @@ class PumpFunBot:
             self.store.set_state("daily_paused", "1")
             logger.error("Daily drawdown limit reached (%.2f USD); entries paused until next UTC day", daily_loss)
 
-    def _can_enter(self, equity: float) -> tuple[bool, str]:
+    def _can_enter(
+        self, equity: float, *, strategy: str = "leader_copy",
+        entry_cap_usd: float | None = None,
+    ) -> tuple[bool, str]:
         if self.store.get_state("experiment_expired", "0") == "1":
             return False, "Seven-day experiment is over"
-        if self.store.get_state("copy_paused", "0") == "1":
+        if strategy != "token_discovery" and self.store.get_state("copy_paused", "0") == "1":
             return False, "Copying is paused from the dashboard"
         if self.store.get_state("manual_review_halt", "0") == "1":
             return False, "Manual review halt active: " + self.store.get_state("manual_review_reason", "")
@@ -768,7 +785,10 @@ class PumpFunBot:
             return False, "Equity is zero or less"
         exposure = self._current_positions_value()
         room = self.s.max_total_exposure_usd - exposure
-        spend = min(self.s.max_entry_usd, room)
+        configured_cap = self.s.max_entry_usd if entry_cap_usd is None else float(entry_cap_usd)
+        if strategy == "token_discovery":
+            configured_cap = min(0.50, configured_cap, float(self.s.token_discovery_max_entry_usd))
+        spend = min(self.s.max_entry_usd, configured_cap, room)
         if spend < 0.50:
             return False, "Too little exposure headroom for a practical trade"
         if self.s.mode == "paper":
@@ -893,8 +913,40 @@ class PumpFunBot:
             exc.action, exc.mint, exc.signature,
         )
 
-    def buy(self, signal: dict):
+    def buy(
+        self, signal: dict, *, strategy: str = "leader_copy",
+        entry_cap_usd: float | None = None,
+    ):
         mint = signal["mint"]
+        if strategy == "token_discovery":
+            if (
+                self.s.mode != "live"
+                or not self.s.token_discovery_enabled
+                or not self.s.token_discovery_live_enabled
+                or signal.get("source") != "token_discovery"
+                or signal.get("fresh_security_verified") is not True
+            ):
+                logger.warning("Reject discovery buy %s: live discovery opt-in or fresh security verification missing", mint[:8])
+                return
+            discovery_positions = [
+                p for p in self.store.list_positions()
+                if p.get("strategy", "leader_copy") == "token_discovery"
+            ]
+            if discovery_positions:
+                logger.info("Reject discovery buy %s: one live discovery position is already open", mint[:8])
+                return
+            entry_cap_usd = min(
+                0.50, float(self.s.token_discovery_max_entry_usd),
+                float(entry_cap_usd if entry_cap_usd is not None else self.s.token_discovery_max_entry_usd),
+            )
+            if entry_cap_usd <= 0:
+                logger.warning("Reject discovery buy %s: discovery entry cap is zero", mint[:8])
+                return
+        elif strategy != "leader_copy":
+            logger.warning("Reject buy %s: unsupported entry strategy %s", mint[:8], strategy)
+            return
+        source_wallet = str(signal.get("wallet") or "") or None
+        source_signature = str(signal.get("signature") or "") or None
         if self.store.get_state(f"unresolved_trade:{mint}", ""):
             logger.warning(
                 "Skipping buy for %s because an earlier transaction outcome remains unresolved",
@@ -918,6 +970,12 @@ class PumpFunBot:
         curve_liquidity = float(signal.get("curve_liquidity_usd") or 0)
         pair_liquidity = float(market.get("liquidity_usd") or 0) if market else 0.0
         actual_liquidity = max(curve_liquidity, pair_liquidity)
+        if strategy == "token_discovery" and curve_liquidity < self.s.token_discovery_min_liquidity_usd:
+            logger.info(
+                "Reject discovery buy %s: fresh real curve liquidity %.0f USD below %.0f USD",
+                mint[:8], curve_liquidity, self.s.token_discovery_min_liquidity_usd,
+            )
+            return
         is_realtime_signal = signal.get("source") == "account_trade"
         curve_state_verified = bool(signal.get("curve_state_verified"))
         venue = str(signal.get("venue", "pump"))
@@ -953,11 +1011,19 @@ class PumpFunBot:
 
         equity = self.equity()
         self._refresh_risk_state(equity)
-        allowed, reason = self._can_enter(equity)
+        allowed, reason = self._can_enter(
+            equity, strategy=strategy, entry_cap_usd=entry_cap_usd
+        )
         if not allowed:
             logger.info("Reject buy %s: %s", mint, reason)
             return
-        spend = min(self.s.max_entry_usd, self.s.max_total_exposure_usd - self._current_positions_value())
+        effective_entry_cap = self.s.max_entry_usd
+        if strategy == "token_discovery":
+            effective_entry_cap = min(
+                0.50, float(self.s.token_discovery_max_entry_usd),
+                float(entry_cap_usd if entry_cap_usd is not None else self.s.token_discovery_max_entry_usd),
+            )
+        spend = min(effective_entry_cap, self.s.max_total_exposure_usd - self._current_positions_value())
         if spend < 0.50:
             return
 
@@ -990,15 +1056,15 @@ class PumpFunBot:
             except TransactionExpiredNotLanded as exc:
                 self._handle_expired_not_landed_trade(
                     exc,
-                    source_wallet=str(signal.get("wallet") or ""),
-                    source_signature=str(signal.get("signature") or ""),
+                    source_wallet=source_wallet,
+                    source_signature=source_signature,
                 )
                 return
             except TransactionOutcomeUncertain as exc:
                 self._handle_uncertain_trade(
                     exc,
-                    source_wallet=str(signal.get("wallet") or ""),
-                    source_signature=str(signal.get("signature") or ""),
+                    source_wallet=source_wallet,
+                    source_signature=source_signature,
                 )
                 return
             except TransactionBuildFailed as exc:
@@ -1023,18 +1089,29 @@ class PumpFunBot:
             "entry_price_usd": effective_price, "initial_amount_raw": str(raw_out),
             "peak_price_usd": observed_price, "tp1_done": 0, "tp2_done": 0,
             "opened_at": timestamp, "last_price_usd": observed_price,
-            "invested_usd": cost_basis, "source_wallet": signal["wallet"],
-            "source_signature": signal["signature"],
+            "invested_usd": cost_basis, "source_wallet": source_wallet,
+            "source_signature": source_signature, "strategy": strategy,
         }
         self.store.upsert_position(position)
         self.store.set_state(f"pool:{mint}", used_pool)
         self.store.increment_daily_entries()
-        self.store.add_trade(mode=self.s.mode, action="BUY", mint=mint, amount_raw=str(raw_out),
-                             price_usd=effective_price, value_usd=cost_basis, reason=f"copied Pump.fun {used_pool} buy",
-                             source_wallet=signal["wallet"], source_signature=signal["signature"], tx_signature=tx_sig)
+        trade_reason = (
+            f"independent token discovery {used_pool} buy"
+            if strategy == "token_discovery"
+            else f"copied Pump.fun {used_pool} buy"
+        )
+        self.store.add_trade(
+            mode=self.s.mode, action="BUY", mint=mint, amount_raw=str(raw_out),
+            price_usd=effective_price, value_usd=cost_basis, reason=trade_reason,
+            source_wallet=source_wallet, source_signature=source_signature,
+            tx_signature=tx_sig, strategy=strategy,
+        )
         self.price_cache[mint] = observed_price
         self.price_cache_at[mint] = time.time()
-        logger.warning("BUY %s raw=%s cost=%.4f USD leader=%s pool=%s", mint, raw_out, cost_basis, signal["wallet"], used_pool)
+        logger.warning(
+            "BUY %s raw=%s cost=%.4f USD strategy=%s source=%s pool=%s",
+            mint, raw_out, cost_basis, strategy, source_wallet or "token-discovery", used_pool,
+        )
         self._refresh_feed_subscriptions()
         if self.s.mode == "live":
             logger.warning("Live transaction confirmed: https://solscan.io/tx/%s", tx_sig)
@@ -1134,11 +1211,15 @@ class PumpFunBot:
         remaining = max(0, current_raw - sold_raw)
         remaining_basis = max(0.0, float(position["invested_usd"]) - basis)
         self.store.set_state("daily_realized_pnl", float(self.store.get_state("daily_realized_pnl", "0")) + realized_pnl)
-        self.store.add_trade(mode=self.s.mode, action="SELL", mint=mint, amount_raw=str(sold_raw),
-                             price_usd=proceeds / units_sold if units_sold else mark_price,
-                             value_usd=proceeds, pnl_usd=realized_pnl, reason=reason,
-                             source_wallet=position.get("source_wallet") or source_wallet,
-                             source_signature=source_signature or position.get("source_signature"), tx_signature=tx_sig)
+        strategy = position.get("strategy", "leader_copy")
+        self.store.add_trade(
+            mode=self.s.mode, action="SELL", mint=mint, amount_raw=str(sold_raw),
+            price_usd=proceeds / units_sold if units_sold else mark_price,
+            value_usd=proceeds, pnl_usd=realized_pnl, reason=reason,
+            source_wallet=position.get("source_wallet") or source_wallet,
+            source_signature=source_signature or position.get("source_signature"),
+            tx_signature=tx_sig, strategy=strategy,
+        )
         if remaining == 0:
             self.store.delete_position(mint)
             self.store.set_state(f"pool:{mint}", "")
