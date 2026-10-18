@@ -81,6 +81,16 @@ class LiveDiscoveryConfigTests(unittest.TestCase):
         self.assertFalse(config.token_discovery_live_enabled)
         self.assertEqual(config.token_discovery_max_entry_usd, 0.50)
 
+    def test_discovery_liquidity_floor_cannot_be_lowered_below_2500(self):
+        with patch.dict(os.environ, {
+            "BOT_MODE": "paper",
+            "TOKEN_DISCOVERY_ENABLED": "true",
+            "TOKEN_DISCOVERY_LIVE_ENABLED": "false",
+            "TOKEN_DISCOVERY_MIN_LIQUIDITY_USD": "1000",
+        }):
+            config = PumpFunSettings.load()
+        self.assertEqual(config.token_discovery_min_liquidity_usd, 2500.0)
+
     def test_live_discovery_requires_live_mode_and_scanner_enabled(self):
         with patch.dict(os.environ, {
             "BOT_MODE": "paper",
