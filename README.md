@@ -13,8 +13,9 @@ A local Windows/Python experiment for watching Pump.fun's trader leaderboard and
 - Provides a local dashboard: period selector, top-10 copy button, stop-copy button, position-by-position manual exit, manual exit all, recent trades, and estimated P&L.
 - Tracks positions in a local SQLite ledger; staged take-profits, trailing exits, downside stops, daily pause, total-loss halt, and the seven-day experiment limit are included.
 
-- Optional independent token discovery runs alongside leader copying in **shadow-only mode by default**. A separate local opt-in can route a fresh passing candidate through the existing live executor, after repeating all on-chain safety checks and global risk gates. Live discovery swap input is hard-capped at $0.50 and limited to one open discovery position; the wallet debit can be higher when network fees or new token-account rent apply. A screen is not a rug-pull guarantee.
-- The discovery panel reports rejects and hypothetical returns beside the existing leader-copy positions/trades, and labels any live discovery entry separately. It is not a rug-pull guarantee.
+- Optional independent token discovery runs alongside leader copying in **shadow-only mode by default**. Live discovery remains separately opted in, with a $0.50 maximum swap input and at most one open discovery position.
+- Entry filters now enforce at least $5,000 verified real bonding-curve liquidity, a score of 80/100, at least eight unique buyers, creator/top-holder concentration checks, and fresh on-chain rechecks before live entry. Regular leader-copy entries also require indexed market data and the hard $5,000 liquidity floor.
+- The scanner persists a bounded queue of launch events it actually observes and expires queued candidates after 24 hours. This is **not a historical backfill**: launches that happened while the bot was offline will not be discovered by this WebSocket stream. Queue overload and all entry/ execution outcomes are surfaced in the dashboard. These controls can reduce weak entries; they cannot guarantee profit or prevent every rug pull.
 
 ## Important external dependencies
 
@@ -66,19 +67,20 @@ TOKEN_DISCOVERY_LIVE_ENABLED=false
 # Hard code ceiling: $0.50 swap input per discovery buy; total wallet debit can be higher due to rent/fees.
 TOKEN_DISCOVERY_MAX_ENTRY_USD=0.50
 TOKEN_DISCOVERY_MAX_WATCHED_TOKENS=5
-TOKEN_DISCOVERY_WATCH_SECONDS=180
+TOKEN_DISCOVERY_WATCH_SECONDS=300
 TOKEN_DISCOVERY_MAX_LAUNCHES_PER_MINUTE=12
-TOKEN_DISCOVERY_MIN_LIQUIDITY_USD=1000
-TOKEN_DISCOVERY_MIN_SCORE=75
-TOKEN_DISCOVERY_MIN_UNIQUE_BUYERS=5
+TOKEN_DISCOVERY_MIN_LIQUIDITY_USD=5000
+TOKEN_DISCOVERY_MIN_SCORE=80
+TOKEN_DISCOVERY_MIN_UNIQUE_BUYERS=8
+TOKEN_DISCOVERY_MAX_TOKEN_AGE_HOURS=24
 TOKEN_DISCOVERY_SHADOW_WINDOW_SECONDS=900
 ```
 
-Restart the bot. The dashboard displays candidate status, verified real bonding-curve liquidity (minimum $1,000), entry/current market-cap estimates, holder concentration, unique buyers, buy/sell SOL flow, score, hypothetical returns, and any live-entry result. It uses the same PumpPortal WebSocket as account-trade copying and subscribes to a capped number of token streams; those token-trade messages are metered. New token events that cannot be checked on chain are rejected.
+Restart the bot. The dashboard displays candidate status, observed launch-event age, verified real bonding-curve liquidity (minimum $5,000), entry/current market-cap estimates, holder concentration, unique buyers, buy/sell SOL flow, score, hypothetical returns, queue state, and live-entry result. It uses the same PumpPortal WebSocket as account-trade copying and subscribes to a capped number of token streams; those token-trade messages are metered. Launches seen while the queue is full may be dropped and counted. The 24-hour age window is measured from the bot's observed new-token event and is persistent across restarts; it cannot discover launches missed while the bot was offline.
 
 Live execution is deliberately a second opt-in. When you're ready to accept real-money risk, use a dedicated wallet and add `TOKEN_DISCOVERY_LIVE_ENABLED=true` to the local `.env` while keeping `TOKEN_DISCOVERY_ENABLED=true`, `BOT_MODE=live`, and the required live confirmation setting. Each swap input is capped in code at $0.50 even if `TOKEN_DISCOVERY_MAX_ENTRY_USD` is set higher; the actual wallet debit may be higher due to account rent and network/priority fees. P&L uses the all-in wallet debit, while the token price used for stops is based on swap input divided by tokens received. At most one position tagged `token_discovery` can be open. Old shadow entries from previous bot runs are marked stale and are not bought. Live entries repeat the mint authority, freeze authority, Token-2022 extension, holder concentration, quote-mint and canonical curve checks immediately before execution, then must pass the existing global exposure/drawdown gates. Existing position management is responsible for exits, but neither a stop nor any liquidity check guarantees a successful sale.
 
-The minimum discovery liquidity setting is enforced at no less than $1,000. Entry/current market-cap numbers are estimates when derived from token price × total supply; the dashboard labels their source and they should not be treated as guaranteed realizable value.
+The minimum discovery liquidity is enforced at no less than $5,000, the score floor at 80/100, and the unique-buyer floor at eight. The configured maximum launch-event age is capped at 24 hours. These are stricter filters, not a guarantee of profit. Entry/current market-cap numbers are estimates when derived from token price × total supply; the dashboard labels their source and they should not be treated as guaranteed realizable value. A high shadow peak is not realized P&L because execution timing, fees, slippage and exit liquidity can differ.
 
 This initial version only enters ungraduated SOL-quoted Pump bonding curves. It does not enter migrated PumpSwap pools whose reserves have not been independently verified. Token screens and score thresholds are hypotheses, not claims of profitability. Keep `TOKEN_DISCOVERY_LIVE_ENABLED=false` until you specifically choose to begin this live trial.
 
