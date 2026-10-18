@@ -37,6 +37,20 @@ class TransactionOutcomeUncertain(RuntimeError):
         )
 
 
+class TransactionExpiredNotLanded(RuntimeError):
+    """The transaction's blockhash expired and independent state checks show no trade occurred."""
+
+    def __init__(self, signature: str, action: str, mint: str, detail: str):
+        self.signature = str(signature)
+        self.action = str(action)
+        self.mint = str(mint)
+        self.detail = str(detail)
+        super().__init__(
+            f"{self.action.upper()} transaction expired without landing for mint {self.mint}; "
+            f"signature={self.signature}; {self.detail}"
+        )
+
+
 ROOT = Path(__file__).resolve().parent
 BUILDER = ROOT / "native_pump_builder.mjs"
 
@@ -388,7 +402,14 @@ class NativePumpExecutor:
             raise RuntimeError("Simulation did not invoke the expected official Pump venue")
 
     def _send_confirm(
-        self, transaction: VersionedTransaction, *, action: str, mint: str
+        self,
+        transaction: VersionedTransaction,
+        *,
+        action: str,
+        mint: str,
+        owner: str,
+        token_before_raw: int,
+        last_valid_block_height: int | None = None,
     ) -> str:
         # A signed Solana transaction has a deterministic first signature. Capture it
         # before submission so a lost sendTransaction response cannot hide the signature.
@@ -417,33 +438,124 @@ class NativePumpExecutor:
             )
         signature = local_signature
 
-        deadline = time.monotonic() + 30
+        # Thirty seconds can be shorter than the transaction's blockhash validity
+        # window. Keep polling through expiry; transient status lookup errors should
+        # not immediately turn into a manual halt.
+        started = time.monotonic()
+        deadline = started + 90
+        next_height_check = started
+        expired_observations = 0
+        last_lookup_error = ""
+
         while time.monotonic() < deadline:
             try:
                 result = self.rpc.call(
                     "getSignatureStatuses",
                     [[signature], {"searchTransactionHistory": True}],
                 ) or {}
+                statuses = result.get("value") or []
+                status = statuses[0] if statuses else None
             except Exception as exc:
-                raise TransactionOutcomeUncertain(
-                    signature, action, mint,
-                    f"submitted transaction status lookup failed ({type(exc).__name__})",
-                ) from exc
+                last_lookup_error = f"{type(exc).__name__}: {exc}"
+                status = None
 
-            statuses = result.get("value") or []
-            status = statuses[0] if statuses else None
-            if status:
+            if status is not None:
                 if status.get("err") is not None:
                     raise RuntimeError(
                         f"Transaction failed on-chain: {status['err']}; signature={signature}"
                     )
                 if status.get("confirmationStatus") in {"confirmed", "finalized"}:
                     return signature
+                expired_observations = 0
+
+            now = time.monotonic()
+            if (
+                last_valid_block_height is not None
+                and now >= next_height_check
+            ):
+                # Query block height less often than status, but frequently enough to
+                # detect when this signed transaction can no longer be accepted.
+                next_height_check = now + 1.0
+                try:
+                    block_height = int(self.rpc.call(
+                        "getBlockHeight", [{"commitment": "confirmed"}]
+                    ))
+                except Exception as exc:
+                    last_lookup_error = f"block-height lookup {type(exc).__name__}: {exc}"
+                else:
+                    if block_height > int(last_valid_block_height) + 2:
+                        # Once the blockhash is expired, reconcile history and the
+                        # wallet's token balance. Declare "not landed" only when all
+                        # reads succeeded, both history queries are empty, and the
+                        # balance is unchanged on two separate observations.
+                        try:
+                            final_result = self.rpc.call(
+                                "getSignatureStatuses",
+                                [[signature], {"searchTransactionHistory": True}],
+                            ) or {}
+                            final_statuses = final_result.get("value") or []
+                            final_status = final_statuses[0] if final_statuses else None
+                        except Exception as exc:
+                            last_lookup_error = f"final status lookup {type(exc).__name__}: {exc}"
+                            expired_observations = 0
+                            final_status = None
+                            status_lookup_ok = False
+                        else:
+                            status_lookup_ok = True
+
+                        if final_status is not None:
+                            if final_status.get("err") is not None:
+                                raise RuntimeError(
+                                    f"Transaction failed on-chain: {final_status['err']}; signature={signature}"
+                                )
+                            if final_status.get("confirmationStatus") in {"confirmed", "finalized"}:
+                                return signature
+                            expired_observations = 0
+                        elif status_lookup_ok:
+                            try:
+                                indexed_tx = self.rpc.transaction(signature)
+                            except Exception as exc:
+                                last_lookup_error = f"transaction lookup {type(exc).__name__}: {exc}"
+                                expired_observations = 0
+                            else:
+                                if indexed_tx is not None:
+                                    meta = indexed_tx.get("meta") or {}
+                                    if meta.get("err") is not None:
+                                        raise RuntimeError(
+                                            f"Transaction failed on-chain: {meta['err']}; signature={signature}"
+                                        )
+                                    return signature
+
+                                try:
+                                    token_after_raw = self.token_balance_raw(owner, mint)
+                                except Exception as exc:
+                                    last_lookup_error = f"post-expiry balance lookup {type(exc).__name__}: {exc}"
+                                    expired_observations = 0
+                                else:
+                                    if int(token_after_raw) != int(token_before_raw):
+                                        raise TransactionOutcomeUncertain(
+                                            signature, action, mint,
+                                            "blockhash expired and signature history is empty, but wallet token "
+                                            f"balance changed from {token_before_raw} to {token_after_raw}",
+                                        )
+                                    expired_observations += 1
+                                    if expired_observations >= 2:
+                                        raise TransactionExpiredNotLanded(
+                                            signature, action, mint,
+                                            "blockhash expired; transaction status and history are absent, "
+                                            f"and token balance stayed at {token_before_raw} raw units",
+                                        )
+                                    time.sleep(0.7)
+                                    continue
+
             time.sleep(0.7)
 
-        raise TransactionOutcomeUncertain(
-            signature, action, mint, "confirmation timed out after 30 seconds"
-        )
+        detail = "confirmation timed out after 90 seconds"
+        if last_valid_block_height is not None:
+            detail += f"; last valid block height={last_valid_block_height}"
+        if last_lookup_error:
+            detail += f"; last RPC lookup issue={last_lookup_error[:180]}"
+        raise TransactionOutcomeUncertain(signature, action, mint, detail)
 
     def trade(self, owner: str, keypair: Keypair, mint: str, action: str, amount: float,
               denominated_in_sol: bool, slippage_bps: int, preferred_pool: str | None = None,
@@ -519,7 +631,17 @@ class NativePumpExecutor:
         self._simulate(unsigned, expected_program)
 
         signed = VersionedTransaction(unsigned.message, [keypair])
-        signature = self._send_confirm(signed, action=action, mint=mint)
+        signature = self._send_confirm(
+            signed,
+            action=action,
+            mint=mint,
+            owner=owner,
+            token_before_raw=token_before,
+            last_valid_block_height=(
+                int(built["lastValidBlockHeight"])
+                if built.get("lastValidBlockHeight") is not None else None
+            ),
+        )
 
         deadline = time.monotonic() + 10
         token_after = token_before
