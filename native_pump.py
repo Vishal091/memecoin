@@ -23,6 +23,20 @@ class TransactionBuildFailed(RuntimeError):
     """The unsigned transaction builder failed before any signing or submission."""
 
 
+class TransactionFailedOnChain(RuntimeError):
+    """A submitted transaction has a confirmed on-chain error and did not execute."""
+
+    def __init__(self, signature: str, action: str, mint: str, detail: str):
+        self.signature = str(signature)
+        self.action = str(action)
+        self.mint = str(mint)
+        self.detail = str(detail)
+        super().__init__(
+            f"{self.action.upper()} failed on-chain for mint {self.mint}; "
+            f"signature={self.signature}; error={self.detail}"
+        )
+
+
 class TransactionOutcomeUncertain(RuntimeError):
     """A signed transaction may have been submitted, but its outcome was not verified."""
 
@@ -461,8 +475,11 @@ class NativePumpExecutor:
 
             if status is not None:
                 if status.get("err") is not None:
-                    raise RuntimeError(
-                        f"Transaction failed on-chain: {status['err']}; signature={signature}"
+                    # Status is confirmed to have an execution error. Keep this
+                    # distinct from timeout/unknown outcomes so callers never treat
+                    # a failed swap as a filled trade or automatically retry it.
+                    raise TransactionFailedOnChain(
+                        signature, action, mint, str(status["err"])
                     )
                 if status.get("confirmationStatus") in {"confirmed", "finalized"}:
                     return signature
