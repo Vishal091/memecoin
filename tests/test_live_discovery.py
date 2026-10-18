@@ -101,7 +101,7 @@ class LiveDiscoveryConfigTests(unittest.TestCase):
 
 
 class LiveDiscoveryBuyTests(unittest.TestCase):
-    def make_bot(self, *, live_enabled=True, max_entry=0.50, positions=None):
+    def make_bot(self, *, live_enabled=True, max_entry=0.50, global_entry_max=2.0, positions=None):
         bot = object.__new__(PumpFunBot)
         bot.s = SimpleNamespace(
             mode="live",
@@ -113,7 +113,7 @@ class LiveDiscoveryBuyTests(unittest.TestCase):
             allow_unindexed_pump_curve=True,
             min_pair_age_seconds=10,
             slippage_bps=300,
-            max_entry_usd=2.0,
+            max_entry_usd=global_entry_max,
             max_total_exposure_usd=3.0,
             max_open_positions=3,
             max_entries_per_day=3,
@@ -167,6 +167,12 @@ class LiveDiscoveryBuyTests(unittest.TestCase):
         bot.buy(self.signal(), strategy="token_discovery", entry_cap_usd=0.50)
         self.assertEqual(bot.executor.calls, [])
         self.assertEqual(len(bot.store.positions), 1)
+
+    def test_respects_lower_global_max_entry_setting(self):
+        bot = self.make_bot(max_entry=0.50, global_entry_max=0.25)
+        bot.buy(self.signal(), strategy="token_discovery", entry_cap_usd=0.50)
+        self.assertEqual(len(bot.executor.calls), 1)
+        self.assertLessEqual(bot.executor.calls[0]["amount"] * 150.0, 0.25 + 1e-7)
 
     def test_live_discovery_executor_hard_caps_spend_at_50_cents(self):
         # Even a malformed in-memory setting or caller argument cannot raise the code cap.
