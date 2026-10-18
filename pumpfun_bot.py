@@ -105,6 +105,7 @@ class PumpFunBot:
         self.price_cache_at = {}
         self.market_price_cache = {}
         self.market_price_cache_at = {}
+        self._market_cap_supply_retry_at = {}
         self.state_lock = threading.RLock()
         self.commands = queue.Queue()
         self.trade_events = queue.Queue()
@@ -236,26 +237,82 @@ class PumpFunBot:
             self.message = self.last_leaderboard_error
             return False
 
+    def _hydrate_position_market_cap(self, position: dict) -> dict:
+        """Backfill total supply/entry-cap metadata for positions from earlier DB schema."""
+        mint = str(position.get("mint") or "")
+        try:
+            supply_tokens = float(position.get("total_supply_tokens") or 0)
+        except (TypeError, ValueError):
+            supply_tokens = 0.0
+        if not mint or supply_tokens > 0:
+            return position
+
+        now = time.time()
+        retry_map = getattr(self, "_market_cap_supply_retry_at", None)
+        if retry_map is None:
+            retry_map = {}
+            self._market_cap_supply_retry_at = retry_map
+        if now < float(retry_map.get(mint, 0)):
+            return position
+        retry_map[mint] = now + 60
+        try:
+            result = self.rpc.call(
+                "getTokenSupply", [mint, {"commitment": "confirmed"}]
+            ) or {}
+            value = result.get("value") or {}
+            raw_supply = int(value.get("amount") or 0)
+            decimals = int(value.get("decimals") or 0)
+            if raw_supply <= 0 or decimals < 0 or decimals > 18:
+                return position
+            supply_tokens = raw_supply / (10 ** decimals)
+            if supply_tokens <= 0:
+                return position
+            position["total_supply_tokens"] = supply_tokens
+            if float(position.get("entry_market_cap_usd") or 0) <= 0:
+                entry_price = float(position.get("entry_price_usd") or 0)
+                if entry_price > 0:
+                    position["entry_market_cap_usd"] = entry_price * supply_tokens
+                    position["entry_market_cap_source"] = (
+                        "Estimated historical entry price × current total supply (FDV-style)"
+                    )
+            self.store.upsert_position(position)
+            logger.info("Backfilled market-cap supply metadata for position %s", mint[:8])
+        except Exception as exc:
+            logger.debug("Market-cap supply lookup unavailable for %s: %s", mint[:8], type(exc).__name__)
+        return position
+
     def _publish_dashboard_state(self, equity: float | None = None) -> None:
         if equity is not None:
             self.last_equity_usd = equity
         positions = []
         for p in self.store.list_positions():
+            p = self._hydrate_position_market_cap(p)
             entry = float(p["entry_price_usd"])
             mark = self._mark_price(p["mint"], float(p["last_price_usd"]))
             if mark <= 0:
                 mark = float(p["last_price_usd"])
             move = ((mark / entry) - 1.0) * 100.0 if entry > 0 else 0.0
             cap_snapshot = self.token_discovery.market_cap_snapshot(p["mint"])
+            supply_tokens = float(p.get("total_supply_tokens") or 0)
+            entry_mc = float(p.get("entry_market_cap_usd") or 0)
+            entry_mc_source = str(p.get("entry_market_cap_source") or "")
+            if entry_mc <= 0:
+                entry_mc = float(cap_snapshot.get("entry_market_cap_usd") or 0)
+                entry_mc_source = str(cap_snapshot.get("entry_market_cap_source") or entry_mc_source)
+            current_mc = float(cap_snapshot.get("current_market_cap_usd") or 0)
+            current_mc_source = str(cap_snapshot.get("current_market_cap_source") or "")
+            if current_mc <= 0 and mark > 0 and supply_tokens > 0:
+                current_mc = mark * supply_tokens
+                current_mc_source = "Estimated: current mark price × total supply (FDV-style)"
             positions.append({
                 "mint": p["mint"], "amount_raw": p["amount_raw"], "decimals": p["decimals"],
                 "entry_price_usd": entry, "last_price_usd": mark, "move_pct": move,
                 "source_wallet": p.get("source_wallet", ""),
                 "strategy": p.get("strategy", "leader_copy"),
-                "entry_market_cap_usd": cap_snapshot["entry_market_cap_usd"],
-                "entry_market_cap_source": cap_snapshot["entry_market_cap_source"],
-                "current_market_cap_usd": cap_snapshot["current_market_cap_usd"],
-                "current_market_cap_source": cap_snapshot["current_market_cap_source"],
+                "entry_market_cap_usd": entry_mc or None,
+                "entry_market_cap_source": entry_mc_source,
+                "current_market_cap_usd": current_mc or None,
+                "current_market_cap_source": current_mc_source,
             })
         trades = self.store.recent_trades(15)
         leaders = {}
