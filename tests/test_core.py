@@ -445,6 +445,7 @@ class LossExitGracePeriodTests(unittest.TestCase):
         def __init__(self, position):
             self.position = position
             self.state = {}
+            self.trades = []
 
         def get_state(self, key, default=""):
             return self.state.get(key, default)
@@ -453,7 +454,17 @@ class LossExitGracePeriodTests(unittest.TestCase):
             self.state[key] = str(value)
 
         def get_position(self, mint):
-            return self.position if self.position.get("mint") == mint else None
+            return self.position if self.position and self.position.get("mint") == mint else None
+
+        def add_trade(self, **trade):
+            self.trades.append(trade)
+
+        def delete_position(self, mint):
+            if self.position and self.position.get("mint") == mint:
+                self.position = None
+
+        def upsert_position(self, position):
+            self.position = position
 
     class FakeMarket:
         def token_market(self, mint):
@@ -484,11 +495,16 @@ class LossExitGracePeriodTests(unittest.TestCase):
         bot.market = self.FakeMarket()
         return bot
 
-    def test_automatic_stop_wait_does_not_persist_stale_pending_trigger(self):
+    def test_automatic_marked_loss_stop_attempts_exit_immediately(self):
         bot = self._bot_with_fresh_position()
-        self.assertFalse(bot.sell("test-mint", 1000, "marked loss stop"))
+        bot.price_cache = {}
+        bot.price_cache_at = {}
+        self.assertTrue(bot.sell("test-mint", 1000, "marked loss stop"))
+        self.assertIsNone(bot.store.get_position("test-mint"))
         self.assertEqual(bot.store.get_state("exit_pending:test-mint", ""), "")
         self.assertEqual(bot.store.get_state("exit_pending_amount_raw:test-mint", ""), "")
+        self.assertEqual(len(bot.store.trades), 1)
+        self.assertEqual(bot.store.trades[0]["action"], "SELL")
 
     def test_losing_leader_sell_preserves_its_partial_amount_while_deferred(self):
         bot = self._bot_with_fresh_position()
