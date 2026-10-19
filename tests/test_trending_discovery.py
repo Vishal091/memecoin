@@ -75,6 +75,25 @@ class TrendingTokenParsingTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["mint"], mint)
 
+    def test_token_token_pool_is_not_treated_as_a_quote_market(self):
+        token_a = "TokenMint33333333333333333333333333333333"
+        token_b = "TokenMint44444444444444444444444444444444"
+        payload = {
+            "data": [{
+                "id": "solana_poolTokenToken1111111111111111111111",
+                "attributes": {"reserve_in_usd": 50000, "volume_usd": {"h1": 20000}},
+                "relationships": {
+                    "base_token": {"data": {"id": "solana_" + token_a}},
+                    "quote_token": {"data": {"id": "solana_" + token_b}},
+                },
+            }],
+            "included": [
+                {"id": "solana_" + token_a, "attributes": {"address": token_a, "symbol": "AAA"}},
+                {"id": "solana_" + token_b, "attributes": {"address": token_b, "symbol": "BBB"}},
+            ],
+        }
+        self.assertEqual(parse_gecko_trending(payload), [])
+
     def test_invalid_or_empty_gecko_payload_returns_no_candidates(self):
         self.assertEqual(parse_gecko_trending(None), [])
         self.assertEqual(parse_gecko_trending({"data": "not-a-list"}), [])
@@ -163,6 +182,44 @@ class RugCheckDecisionTests(unittest.TestCase):
         self.assertTrue(flags)
 
 
+class RugCheckFullReportCompatibilityTests(unittest.TestCase):
+    def test_documented_full_report_shape_is_normalized_for_exact_pool(self):
+        pool = "VerifiedPool33333333333333333333333333333"
+        report = {
+            "token": {"mintAuthority": None, "freezeAuthority": None},
+            "topHolders": [{"pct": 1.2} for _ in range(10)],
+            "risks": [],
+            "score_normalised": 5,
+            "markets": [{"pubkey": pool, "lp": {"lpLockedPct": 95.0}}],
+        }
+        status, flags = evaluate_rugcheck_report(report, pool)
+        self.assertEqual(status, "SAFE_CANDIDATE", flags)
+
+    def test_full_report_does_not_borrow_lp_lock_data_from_a_different_pool(self):
+        report = {
+            "token": {"mintAuthority": None, "freezeAuthority": None},
+            "topHolders": [{"pct": 1.0} for _ in range(10)],
+            "risks": [],
+            "score_normalised": 5,
+            "markets": [{"pubkey": "DifferentPool111111111111111111111111111", "lp": {"lpLockedPct": 99.0}}],
+        }
+        status, flags = evaluate_rugcheck_report(report, "CandidatePool111111111111111111111111111")
+        self.assertEqual(status, "REVIEW")
+        self.assertIn("candidate pool", " ".join(flags).lower())
+
+    def test_high_normalized_rugcheck_score_is_rejected(self):
+        report = {
+            "token": {"mintAuthority": None, "freezeAuthority": None},
+            "topHolders": [{"pct": 1.0} for _ in range(10)],
+            "risks": [],
+            "score_normalised": 50,
+            "markets": [{"pubkey": "VerifiedPool33333333333333333333333333333", "lp": {"lpLockedPct": 99.0}}],
+        }
+        status, flags = evaluate_rugcheck_report(report, "VerifiedPool33333333333333333333333333333")
+        self.assertEqual(status, "REJECTED")
+        self.assertIn("normalized risk score", " ".join(flags).lower())
+
+
 class TrendingScannerSafetyTests(unittest.TestCase):
     def test_missing_token_2022_extension_list_stays_review(self):
         from trending_scanner import TrendingTokenScanner
@@ -188,6 +245,17 @@ class TrendingScannerSafetyTests(unittest.TestCase):
         self.assertEqual(status, "REVIEW")
         self.assertIn("extension list is missing", " ".join(flags))
 
+
+    def test_liquidity_and_volume_rejection_messages_show_real_thresholds(self):
+        scanner = TrendingTokenScanner(self._settings(), rpc=object())
+        low_liq = scanner._evaluate({"mint": "CandidateMint1111111111111111111111111111", "liquidity_usd": 1234, "volume_1h_usd": 25000})
+        self.assertEqual(low_liq["status"], "FILTERED")
+        self.assertIn("$1,234", low_liq["decision"])
+        self.assertIn("$15,000", low_liq["decision"])
+        low_vol = scanner._evaluate({"mint": "CandidateMint2222222222222222222222222222", "liquidity_usd": 25000, "volume_1h_usd": 1234})
+        self.assertEqual(low_vol["status"], "FILTERED")
+        self.assertIn("$1,234", low_vol["decision"])
+        self.assertIn("$10,000", low_vol["decision"])
 
 class TrendingScannerIntegrationTests(unittest.TestCase):
     def _settings(self):
@@ -416,7 +484,7 @@ class TrendingLiveQueueTests(unittest.TestCase):
                 return gecko_payload
             if "/tokens/v1/" in url:
                 return [pair]
-            if "/report/summary" in url:
+            if "/report" in url:
                 return report
             raise AssertionError("Unexpected URL " + url)
         scanner._get_json = get_json
