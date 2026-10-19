@@ -1114,10 +1114,258 @@ class PumpFunBot:
             exc.action, exc.mint, exc.signature,
         )
 
+    def _buy_trending_discovery(
+        self, signal: dict, *, entry_cap_usd: float | None = None,
+    ) -> None:
+        """Execute one freshly re-screened trending-token entry through Jupiter Ultra."""
+        mint = str(signal.get("mint") or "")
+        if (
+            self.s.mode != "live"
+            or not self.s.trending_discovery_enabled
+            or not self.s.trending_discovery_live_enabled
+            or signal.get("source") != "trending_discovery"
+            or signal.get("fresh_security_verified") is not True
+        ):
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "Trending live opt-in or freshly verified security checks are missing"
+            )
+            return
+        if not mint or self.store.get_state(f"unresolved_trade:{mint}", ""):
+            self.trending_scanner.set_live_status(
+                mint, "uncertain", "An unresolved transaction exists for this mint; no repeat order was sent"
+            )
+            return
+        if self.store.get_position(mint):
+            self.trending_scanner.set_live_status(mint, "blocked", "A tracked position already exists for this mint")
+            return
+        discovery_positions = [
+            p for p in self.store.list_positions()
+            if p.get("strategy", "leader_copy") in {"token_discovery", "trending_discovery"}
+        ]
+        if discovery_positions:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "One other discovery position is already open"
+            )
+            return
+
+        # Use the exact DEX Screener pool that was cross-checked by the scanner;
+        # if the best pair changed, require a new full scan instead of guessing.
+        try:
+            market = self.market.token_market(mint)
+        except Exception as exc:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", f"Fresh market-data request failed ({type(exc).__name__})"
+            )
+            return
+        if not market:
+            self.trending_scanner.set_live_status(mint, "blocked", "Fresh DEX market pair is unavailable")
+            return
+        if str(market.get("pair_address") or "") != str(signal.get("dexscreener_pair_address") or ""):
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "Best DEX Screener pool changed since the security scan; rescan required"
+            )
+            return
+        raw_market = market.get("raw") or {}
+        liquidity = float(market.get("liquidity_usd") or 0)
+        price = float(market.get("price_usd") or 0)
+        try:
+            pair_age = int(market.get("pair_age_seconds") or 0)
+        except (TypeError, ValueError):
+            pair_age = 0
+        volume1 = float((raw_market.get("volume") or {}).get("h1") or 0)
+        if liquidity < self.s.trending_min_liquidity_usd:
+            self.trending_scanner.set_live_status(
+                mint, "blocked",
+                f"Fresh same-pool liquidity ${liquidity:,.0f} is below ${self.s.trending_min_liquidity_usd:,.0f}",
+            )
+            return
+        if volume1 < self.s.trending_min_volume_1h_usd:
+            self.trending_scanner.set_live_status(
+                mint, "blocked",
+                f"Fresh same-pool 1h volume ${volume1:,.0f} is below ${self.s.trending_min_volume_1h_usd:,.0f}",
+            )
+            return
+        if pair_age < self.s.min_pair_age_seconds or price <= 0:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "Fresh DEX pair is too young or has no reliable USD price"
+            )
+            return
+        if bool(signal.get("market_data_discrepancy")) or signal.get("same_pool_crosscheck") is not True:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "Independent market sources did not pass the same-pool consistency check"
+            )
+            return
+        try:
+            decimals = int(signal.get("decimals") or -1)
+        except (TypeError, ValueError):
+            decimals = -1
+        if decimals < 0 or decimals > 18:
+            self.trending_scanner.set_live_status(mint, "blocked", "Token decimals are invalid")
+            return
+        if int(signal.get("momentum_score") or 0) < self.s.trending_min_score:
+            self.trending_scanner.set_live_status(
+                mint, "blocked",
+                f"Fresh momentum score is below configured floor {self.s.trending_min_score}/100",
+            )
+            return
+        try:
+            buys = int(signal.get("dexscreener_buys_1h", signal.get("buys_1h", 0)) or 0)
+            sells = int(signal.get("dexscreener_sells_1h", signal.get("sells_1h", 0)) or 0)
+        except (TypeError, ValueError):
+            buys, sells = 0, 0
+        if buys <= sells:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "Fresh one-hour trade flow does not show more buys than sells"
+            )
+            return
+
+        sol_price = self.market.sol_price_usd()
+        hard_cap = min(
+            0.50,
+            float(self.s.trending_discovery_max_entry_usd),
+            float(entry_cap_usd if entry_cap_usd is not None else self.s.trending_discovery_max_entry_usd),
+            float(self.s.max_entry_usd),
+        )
+        equity = self.equity()
+        self._refresh_risk_state(equity)
+        allowed, gate_reason = self._can_enter(
+            equity, strategy="trending_discovery", entry_cap_usd=hard_cap
+        )
+        if not allowed:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "Portfolio risk gate blocked trending entry: " + gate_reason
+            )
+            return
+        room = max(0.0, float(self.s.max_total_exposure_usd) - self._current_positions_value())
+        spend = min(hard_cap, room)
+        if spend < 0.10:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "Less than $0.10 portfolio exposure headroom remains"
+            )
+            return
+        amount_lamports = int(spend / sol_price * 1_000_000_000)
+        if amount_lamports <= 0:
+            self.trending_scanner.set_live_status(mint, "blocked", "SOL input rounds to zero")
+            return
+
+        self.trending_scanner.set_live_status(
+            mint, "submitting", f"Submitting Jupiter Ultra buy with swap input capped at ${spend:.2f}"
+        )
+        source_signature = str(signal.get("signature") or f"trending-discovery-{mint}-{int(time.time())}")
+        try:
+            before_token = self.executor.token_balance_raw(self.wallet_address, mint)
+            before_sol = self.rpc.sol_balance_lamports(self.wallet_address)
+        except Exception as exc:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", f"Could not establish pre-trade wallet balances ({type(exc).__name__})"
+            )
+            return
+        try:
+            result = self.trending_executor.swap(
+                owner=self.wallet_address,
+                keypair=self.keypair,
+                input_mint="So11111111111111111111111111111111111111112",
+                output_mint=mint,
+                amount_raw=amount_lamports,
+                action="buy",
+                output_decimals=decimals,
+                expected_price_usd=price,
+                input_value_usd=spend,
+                max_price_impact_pct=float(self.s.trending_max_price_impact_pct),
+            )
+        except TransactionOutcomeUncertain as exc:
+            self._handle_uncertain_trade(exc, source_wallet=None, source_signature=source_signature)
+            self.trending_scanner.set_live_status(
+                mint, "uncertain", "Jupiter submission outcome is uncertain; verify signature and wallet balances before any retry"
+            )
+            return
+        except TransactionFailedOnChain as exc:
+            self.trending_scanner.set_live_status(
+                mint, "failed", f"Jupiter confirmed on-chain failure: {str(exc.detail)[:350]}"
+            )
+            logger.warning("Trending live buy failed on-chain mint=%s signature=%s", mint[:8], exc.signature)
+            return
+        except (TransactionBuildFailed, TransactionSimulationFailed) as exc:
+            self.trending_scanner.set_live_status(
+                mint, "failed", f"Jupiter pre-submit checks blocked the order: {str(exc)[:350]}"
+            )
+            logger.warning("Trending live buy blocked before submission mint=%s: %s", mint[:8], exc)
+            return
+
+        tx_sig = str(result.get("signature") or "")
+        try:
+            after_token = self.executor.token_balance_raw(self.wallet_address, mint)
+            after_sol = self.rpc.sol_balance_lamports(self.wallet_address)
+        except Exception as exc:
+            uncertain = TransactionOutcomeUncertain(
+                tx_sig, "buy", mint,
+                f"Swap reported success but wallet balance delta could not be verified ({type(exc).__name__})",
+            )
+            self._handle_uncertain_trade(uncertain, source_wallet=None, source_signature=source_signature)
+            self.trending_scanner.set_live_status(
+                mint, "uncertain", "Jupiter reported success, but actual output balance could not be reconciled"
+            )
+            return
+        raw_out = int(after_token) - int(before_token)
+        sol_delta_lamports = int(after_sol) - int(before_sol)
+        if raw_out <= 0 or sol_delta_lamports >= 0 or not tx_sig:
+            uncertain = TransactionOutcomeUncertain(
+                tx_sig or "signature-unavailable", "buy", mint,
+                "Jupiter reported success but token output/SOL debit did not reconcile to the wallet",
+            )
+            self._handle_uncertain_trade(uncertain, source_wallet=None, source_signature=source_signature)
+            self.trending_scanner.set_live_status(
+                mint, "uncertain", "Reported swap did not reconcile to a positive token balance and SOL debit"
+            )
+            return
+
+        total_supply_tokens = float(signal.get("total_supply_tokens") or self._read_total_supply_tokens(mint) or 0)
+        effective_price = spend / raw_to_units(raw_out, decimals)
+        cost_basis = abs(sol_delta_lamports) / 1_000_000_000 * sol_price
+        timestamp = datetime.now(timezone.utc).isoformat()
+        position = {
+            "mint": mint, "decimals": decimals, "amount_raw": str(raw_out),
+            "entry_price_usd": effective_price, "initial_amount_raw": str(raw_out),
+            "peak_price_usd": effective_price, "tp1_done": 0, "tp2_done": 0,
+            "opened_at": timestamp, "last_price_usd": effective_price,
+            "invested_usd": cost_basis, "source_wallet": None,
+            "source_signature": source_signature, "strategy": "trending_discovery",
+            "total_supply_tokens": total_supply_tokens,
+            "entry_market_cap_usd": effective_price * total_supply_tokens if total_supply_tokens > 0 else 0.0,
+            "entry_market_cap_source": (
+                "Estimated: actual Jupiter swap notional per token × total supply (FDV-style)"
+                if total_supply_tokens > 0 else ""
+            ),
+        }
+        self.store.upsert_position(position)
+        self.store.set_state(f"pool:{mint}", "jupiter")
+        self.store.increment_daily_entries()
+        self.store.add_trade(
+            mode=self.s.mode, action="BUY", mint=mint, amount_raw=str(raw_out),
+            price_usd=effective_price, value_usd=cost_basis,
+            reason="trending-token Jupiter Ultra buy",
+            source_wallet=None, source_signature=source_signature,
+            tx_signature=tx_sig, strategy="trending_discovery",
+        )
+        self.price_cache[mint] = effective_price
+        self.price_cache_at[mint] = time.time()
+        self.store.set_state(f"exit_blocked_balance_zero:{mint}", "")
+        self.trending_scanner.set_live_status(
+            mint, "opened", f"Jupiter Ultra buy confirmed and reconciled; swap input cap ${spend:.2f}"
+        )
+        self._refresh_feed_subscriptions()
+        logger.warning(
+            "TRENDING LIVE BUY confirmed mint=%s input_cap=$%.2f actual_wallet_debit=$%.4f",
+            mint[:8], spend, cost_basis,
+        )
+        logger.warning("Live transaction confirmed: https://solscan.io/tx/%s", tx_sig)
+
     def buy(
         self, signal: dict, *, strategy: str = "leader_copy",
         entry_cap_usd: float | None = None,
     ):
+        if strategy == "trending_discovery":
+            return self._buy_trending_discovery(signal, entry_cap_usd=entry_cap_usd)
         mint = signal["mint"]
         if strategy == "token_discovery":
             if (
