@@ -1760,6 +1760,7 @@ class PumpFunBot:
                     return False
                 before_raw = available
                 try:
+                    sell_sol_price_usd = self.market.sol_price_usd()
                     before_sol = self.rpc.sol_balance_lamports(self.wallet_address)
                 except Exception as exc:
                     logger.error("Cannot read SOL balance before trending sell %s: %s", mint[:8], type(exc).__name__)
@@ -1826,7 +1827,7 @@ class PumpFunBot:
                     )
                     return False
                 tx_sig = self.store.get_state(f"unresolved_trade_signature:{mint}", "") or "JUPITER_CONFIRMED"
-                proceeds = (sol_delta_lamports / 1_000_000_000) * self.market.sol_price_usd()
+                proceeds = (sol_delta_lamports / 1_000_000_000) * sell_sol_price_usd
                 units_sold = raw_to_units(sold_raw, decimals)
             else:
                 available = self.executor.token_balance_raw(self.wallet_address, mint)
