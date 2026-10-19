@@ -9,7 +9,11 @@ from jupiter_ultra import (
     JupiterUltraExecutor,
     WSOL_MINT,
 )
-from native_pump import TransactionBuildFailed
+from native_pump import (
+    TransactionBuildFailed,
+    TransactionFailedOnChain,
+    TransactionOutcomeUncertain,
+)
 
 
 class JupiterOrderValidationTests(unittest.TestCase):
@@ -78,6 +82,43 @@ class JupiterOrderValidationTests(unittest.TestCase):
     def test_order_requires_transaction_and_request_id(self):
         with self.assertRaisesRegex(TransactionBuildFailed, "transaction or request ID"):
             self._validate(self._order(transaction=""))
+
+
+class JupiterExecuteResponseTests(unittest.TestCase):
+    def test_documented_success_status_signature_and_zero_code_are_accepted(self):
+        JupiterUltraExecutor._validate_execute_response(
+            {"status": "Success", "signature": "sig-1", "code": 0},
+            signature="sig-1",
+            action="buy",
+            mint_for_error="token-mint",
+        )
+
+    def test_execute_response_must_return_the_exact_transaction_signature(self):
+        with self.assertRaisesRegex(TransactionOutcomeUncertain, "status/signature"):
+            JupiterUltraExecutor._validate_execute_response(
+                {"status": "Success", "signature": "different-sig", "code": 0},
+                signature="sig-1",
+                action="buy",
+                mint_for_error="token-mint",
+            )
+
+    def test_execute_success_requires_code_zero(self):
+        with self.assertRaisesRegex(TransactionOutcomeUncertain, "missing or nonzero code"):
+            JupiterUltraExecutor._validate_execute_response(
+                {"status": "Success", "signature": "sig-1"},
+                signature="sig-1",
+                action="buy",
+                mint_for_error="token-mint",
+            )
+
+    def test_execute_failed_status_is_reported_as_failed_transaction(self):
+        with self.assertRaises(TransactionFailedOnChain):
+            JupiterUltraExecutor._validate_execute_response(
+                {"status": "Failed", "signature": "sig-1", "code": -1000, "error": "failed"},
+                signature="sig-1",
+                action="sell",
+                mint_for_error="token-mint",
+            )
 
 
 class TransactionInstructionPolicyTests(unittest.TestCase):
