@@ -493,6 +493,8 @@ class LossExitGracePeriodTests(unittest.TestCase):
         )
         bot.store = self.FakeStore(position)
         bot.market = self.FakeMarket()
+        # The sale behavior is under test; avoid exercising the unrelated feed-subscription loop.
+        bot._refresh_feed_subscriptions = lambda: None
         return bot
 
     def test_automatic_marked_loss_stop_attempts_exit_immediately(self):
