@@ -88,7 +88,8 @@ class AddressLookupResolutionTests(unittest.TestCase):
 
         class FakeRPC:
             def call(self, method, params):
-                self.assertEqual(method, "getAccountInfo")
+                if method != "getAccountInfo":
+                    raise AssertionError(f"Unexpected RPC method: {method}")
                 return {
                     "value": {
                         "owner": ADDRESS_LOOKUP_TABLE_PROGRAM_ID,
