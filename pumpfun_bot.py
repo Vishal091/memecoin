@@ -507,6 +507,14 @@ class PumpFunBot:
             # must not hide it or terminate the monitor.
             logger.exception("Could not refresh dashboard state after loop error")
 
+    def _runtime_discovery_flag(self, tracker_name: str, flag_name: str, settings_name: str) -> bool:
+        """Prefer an explicit runtime boolean, while supporting legacy/mock objects."""
+        tracker = getattr(self, tracker_name, None)
+        runtime_value = getattr(tracker, flag_name, None) if tracker is not None else None
+        if isinstance(runtime_value, bool):
+            return runtime_value
+        return bool(getattr(self.s, settings_name, False))
+
     def _discovery_live_toggle_block_reason(self, strategy: str) -> str:
         """Fail closed before enabling either dashboard live-buy switch."""
         if self.s.mode != "live":
@@ -521,7 +529,7 @@ class PumpFunBot:
             if not (0.10 <= float(self.s.token_discovery_max_entry_usd) <= 0.50):
                 return "TOKEN_DISCOVERY_MAX_ENTRY_USD must be between $0.10 and $0.50."
             if not self.s.pumpfun_auth_token or not self.s.pumpportal_api_key:
-                return "Live mode requires Pump.fun and PumpPortal credentials."
+                return "New-token live buys require Pump.fun and PumpPortal credentials."
         elif strategy == "trending_discovery":
             if not self.trending_scanner.enabled:
                 return "Enable the trending scanner before enabling its live buys."
@@ -529,8 +537,6 @@ class PumpFunBot:
                 return "TRENDING_DISCOVERY_MAX_ENTRY_USD must be between $0.10 and $0.50."
             if not self.s.jupiter_api_key or not getattr(self.trending_executor, "api_key", ""):
                 return "JUPITER_API_KEY is required for trending live buys."
-            if not self.s.pumpfun_auth_token or not self.s.pumpportal_api_key:
-                return "Live mode requires Pump.fun and PumpPortal credentials."
         else:
             return "Unknown discovery strategy."
         return ""
@@ -1283,8 +1289,8 @@ class PumpFunBot:
         mint = str(signal.get("mint") or "")
         if (
             self.s.mode != "live"
-            or not self.s.trending_discovery_enabled
-            or not self.trending_scanner.live_enabled
+            or not self._runtime_discovery_flag("trending_scanner", "enabled", "trending_discovery_enabled")
+            or not self._runtime_discovery_flag("trending_scanner", "live_enabled", "trending_discovery_live_enabled")
             or signal.get("source") != "trending_discovery"
         ):
             self.trending_scanner.set_live_status(
@@ -1546,8 +1552,8 @@ class PumpFunBot:
         if strategy == "token_discovery":
             if (
                 self.s.mode != "live"
-                or not self.s.token_discovery_enabled
-                or not self.token_discovery.live_enabled
+                or not self._runtime_discovery_flag("token_discovery", "enabled", "token_discovery_enabled")
+                or not self._runtime_discovery_flag("token_discovery", "live_enabled", "token_discovery_live_enabled")
                 or signal.get("source") != "token_discovery"
                 or signal.get("fresh_security_verified") is not True
             ):
@@ -2238,8 +2244,8 @@ class PumpFunBot:
         """Consider only freshly screened trending candidates; each mint gets one live attempt."""
         if (
             self.s.mode != "live"
-            or not self.s.trending_discovery_enabled
-            or not self.trending_scanner.live_enabled
+            or not self._runtime_discovery_flag("trending_scanner", "enabled", "trending_discovery_enabled")
+            or not self._runtime_discovery_flag("trending_scanner", "live_enabled", "trending_discovery_live_enabled")
         ):
             return
 
@@ -2472,8 +2478,8 @@ class PumpFunBot:
         """Turn only fresh, newly-qualified shadow entries into small opt-in live buys."""
         if (
             self.s.mode != "live"
-            or not self.s.token_discovery_enabled
-            or not self.token_discovery.live_enabled
+            or not self._runtime_discovery_flag("token_discovery", "enabled", "token_discovery_enabled")
+            or not self._runtime_discovery_flag("token_discovery", "live_enabled", "token_discovery_live_enabled")
         ):
             return
 
