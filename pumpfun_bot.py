@@ -1765,7 +1765,7 @@ class PumpFunBot:
                     logger.error("Cannot read SOL balance before trending sell %s: %s", mint[:8], type(exc).__name__)
                     return False
                 try:
-                    self.trending_executor.swap(
+                    jupiter_result = self.trending_executor.swap(
                         owner=self.wallet_address,
                         keypair=self.keypair,
                         input_mint=mint,
@@ -1774,6 +1774,12 @@ class PumpFunBot:
                         action="sell",
                         output_decimals=9,
                     )
+                    tx_sig = str(jupiter_result.get("signature") or "")
+                    if not tx_sig:
+                        raise TransactionOutcomeUncertain(
+                            "signature-unavailable", "sell", mint,
+                            "Jupiter reported success but did not provide a transaction signature",
+                        )
                 except TransactionOutcomeUncertain as exc:
                     self._handle_uncertain_trade(
                         exc, source_wallet=source_wallet, source_signature=source_signature,
@@ -1801,7 +1807,7 @@ class PumpFunBot:
                     after_sol = self.rpc.sol_balance_lamports(self.wallet_address)
                 except Exception as exc:
                     uncertain = TransactionOutcomeUncertain(
-                        "confirmed-signature-unavailable", "sell", mint,
+                        tx_sig or "signature-unavailable", "sell", mint,
                         f"Jupiter reported success but balance reconciliation failed ({type(exc).__name__})",
                     )
                     self._handle_uncertain_trade(
@@ -1812,7 +1818,7 @@ class PumpFunBot:
                 sol_delta_lamports = int(after_sol) - int(before_sol)
                 if sold_raw <= 0 or sold_raw > requested_raw or sol_delta_lamports <= 0:
                     uncertain = TransactionOutcomeUncertain(
-                        "confirmed-signature-unavailable", "sell", mint,
+                        tx_sig or "signature-unavailable", "sell", mint,
                         "Jupiter reported success but token reduction/native SOL proceeds did not reconcile",
                     )
                     self._handle_uncertain_trade(
@@ -1988,6 +1994,11 @@ class PumpFunBot:
                         f"Live position fully exited via {reason}; realized P&L ${realized_pnl:+.4f}"
                     )
                     discovery._save(candidate)
+            elif strategy == "trending_discovery":
+                self.trending_scanner.set_live_status(
+                    mint, "closed",
+                    f"Trending live position fully exited via {reason}; realized P&L ${realized_pnl:+.4f}",
+                )
         else:
             self.price_cache[mint] = mark_price
             self.price_cache_at[mint] = time.time()
@@ -2055,6 +2066,14 @@ class PumpFunBot:
         ):
             return
 
+        # Do not burn candidate one-shot state while another discovery strategy
+        # already owns the single discovery slot. Re-evaluate after it exits.
+        if any(
+            p.get("strategy", "leader_copy") in {"token_discovery", "trending_discovery"}
+            for p in self.store.list_positions()
+        ):
+            return
+
         now = time.time()
         freshness_seconds = max(90, min(180, self.s.trending_discovery_poll_seconds + 30))
         candidates = self.trending_scanner.dashboard_snapshot().get("candidates", [])
@@ -2065,9 +2084,16 @@ class PumpFunBot:
             if not mint:
                 continue
             prior_status = self.store.get_state(f"trending_live_status:{mint}", "")
-            # Submitted, uncertain, blocked or closed candidates are one-shot. Never
-            # replay a buy after a restart or after a delayed API/RPC response.
+            # Submitted/checking candidates surviving a process restart are ambiguous;
+            # reconcile rather than leaving the UI stuck or accidentally replaying.
             if prior_status:
+                if prior_status in {"checking", "submitting"}:
+                    _, _, prior_at = self.trending_scanner._stored_live_status(mint)
+                    if prior_at < self.run_started_at:
+                        self.trending_scanner.set_live_status(
+                            mint, "needs_reconciliation",
+                            "Previous process ended during a live entry attempt; inspect wallet balances and transaction history. No retry.",
+                        )
                 continue
             try:
                 updated_at = float(original.get("updated_at") or 0)
@@ -2240,13 +2266,27 @@ class PumpFunBot:
                 "onchain_status": fresh_candidate.get("onchain_status"),
                 "market_cap_usd": fresh_candidate.get("market_cap_usd"),
             }
-            self.buy(
-                signal,
-                strategy="trending_discovery",
-                entry_cap_usd=min(0.50, float(self.s.trending_discovery_max_entry_usd)),
-            )
-            # At most one candidate can submit per bot loop. A successful fill or
-            # ambiguous outcome is tracked through persistent live_entry_status.
+            try:
+                self.buy(
+                    signal,
+                    strategy="trending_discovery",
+                    entry_cap_usd=min(0.50, float(self.s.trending_discovery_max_entry_usd)),
+                )
+            except Exception as exc:
+                # A failure after an external order call may be ambiguous. Never
+                # auto-retry a candidate that has been marked checking/submitting.
+                if self.store.get_state(f"unresolved_trade:{mint}", ""):
+                    status = "uncertain"
+                    reason = "Live submission remains unresolved; reconcile signature and wallet balance before any retry"
+                elif self.store.get_position(mint):
+                    status = "opened"
+                    reason = "Position exists in the ledger after the live call; inspect the confirmed transaction"
+                else:
+                    status = "failed"
+                    reason = f"Unexpected live-entry error ({type(exc).__name__}); candidate consumed with no automatic retry"
+                self.trending_scanner.set_live_status(mint, status, reason)
+                logger.exception("Trending live entry failed mint=%s status=%s", mint[:8], status)
+            # At most one candidate can initiate execution per bot loop.
             return
 
     def _process_discovery_live_entries(self) -> None:
