@@ -2710,6 +2710,7 @@ class PumpFunBot:
                     self._consume_solana_log_events()
                     self.token_discovery.tick()
                     self._process_discovery_live_entries()
+                    self._process_trending_live_entries()
                     now = time.time()
 
                     if self.leaderboard_client.ready and now - self.last_leaderboard_refresh >= self.s.leaderboard_refresh_seconds:
