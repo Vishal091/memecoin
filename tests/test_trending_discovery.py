@@ -302,6 +302,81 @@ class TrendingScannerIntegrationTests(unittest.TestCase):
         )
 
 
+class TrendingLiveQueueTests(unittest.TestCase):
+    @staticmethod
+    def _settings():
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            mode="live",
+            trending_discovery_enabled=True,
+            trending_discovery_live_enabled=True,
+            trending_discovery_poll_seconds=60,
+            trending_discovery_max_candidates=8,
+            trending_min_liquidity_usd=15000.0,
+            trending_min_volume_1h_usd=10000.0,
+            trending_min_score=75,
+        )
+
+    @staticmethod
+    def _gecko_payload(mint="TrendMint11111111111111111111111111111111",
+                       pool="TrendPool11111111111111111111111111111"):
+        wsol = "So11111111111111111111111111111111111111112"
+        return {
+            "data": [{
+                "id": "solana_" + pool,
+                "attributes": {
+                    "reserve_in_usd": "1000000",
+                    "volume_usd": {"h1": "1000000", "h24": "1000000000"},
+                    "price_change_percentage": {"m5": "20", "h1": "30", "h6": "40", "h24": "35"},
+                    "transactions": {"h1": {"buys": 200, "sells": 5}},
+                },
+                "relationships": {
+                    "base_token": {"data": {"id": "solana_" + mint}},
+                    "quote_token": {"data": {"id": "solana_" + wsol}},
+                },
+            }],
+            "included": [
+                {"id": "solana_" + mint, "attributes": {"address": mint, "name": "Trend", "symbol": "TRND"}},
+                {"id": "solana_" + wsol, "attributes": {"address": wsol, "name": "Wrapped SOL", "symbol": "SOL"}},
+            ],
+        }
+
+    def test_live_candidates_are_queued_once_after_screening(self):
+        from trending_scanner import TrendingTokenScanner
+
+        class MemoryStore:
+            def __init__(self):
+                self.state = {}
+            def get_state(self, key, default=""):
+                return self.state.get(key, default)
+            def set_state(self, key, value):
+                self.state[key] = str(value)
+
+        store, queued = MemoryStore(), []
+        scanner = TrendingTokenScanner(
+            self._settings(), rpc=object(), store=store, on_screened=queued.append
+        )
+        scanner._get_json = lambda url, gecko=False: self._gecko_payload()
+        scanner._dexscreener_enrich = lambda rows: None
+        scanner._evaluate = lambda row: dict(row, status="SCREENED", momentum_score=95)
+        scanner.scan_once()
+        scanner.scan_once()
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(store.get_state("trending_live_status:TrendMint11111111111111111111111111111111"), "queued")
+
+    def test_live_recheck_fails_closed_when_exact_pool_disappears(self):
+        from trending_scanner import TrendingTokenScanner
+
+        scanner = TrendingTokenScanner(self._settings(), rpc=object())
+        scanner._get_json = lambda url, gecko=False: {"data": []}
+        with self.assertRaisesRegex(ValueError, "Exact pool"):
+            scanner.verify_live_candidate({
+                "mint": "TrendMint11111111111111111111111111111111",
+                "pool_address": "TrendPool11111111111111111111111111111",
+                "dexscreener_pair_address": "TrendPool11111111111111111111111111111",
+            })
+
+
 class TrendingScannerConfigTests(unittest.TestCase):
     def test_scanner_is_opt_in_and_thresholds_cannot_be_lowered(self):
         env = {
