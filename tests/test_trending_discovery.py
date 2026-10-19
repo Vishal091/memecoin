@@ -189,6 +189,101 @@ class TrendingScannerSafetyTests(unittest.TestCase):
         self.assertIn("extension list is missing", " ".join(flags))
 
 
+class TrendingScannerIntegrationTests(unittest.TestCase):
+    def _settings(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            trending_discovery_enabled=True,
+            trending_discovery_poll_seconds=60,
+            trending_discovery_max_candidates=8,
+            trending_min_liquidity_usd=15000.0,
+            trending_min_volume_1h_usd=10000.0,
+        )
+
+    def test_scan_requests_gecko_token_metadata_and_publishes_candidates(self):
+        from trending_scanner import TrendingTokenScanner
+
+        mint = "TrendMint11111111111111111111111111111111"
+        wsol = "So11111111111111111111111111111111111111112"
+        payload = {
+            "data": [{
+                "id": "solana_poolTrend111111111111111111111111111",
+                "attributes": {
+                    "name": "TREND / SOL",
+                    "reserve_in_usd": "24000",
+                    "volume_usd": {"h1": "18000", "h24": "90000"},
+                    "price_change_percentage": {"m5": "2", "h1": "8", "h6": "12", "h24": "25"},
+                    "transactions": {"h1": {"buys": 80, "sells": 40}},
+                },
+                "relationships": {
+                    "base_token": {"data": {"id": "solana_" + mint}},
+                    "quote_token": {"data": {"id": "solana_" + wsol}},
+                },
+            }],
+            "included": [
+                {"id": "solana_" + mint, "attributes": {"address": mint, "name": "Trend", "symbol": "TRND"}},
+                {"id": "solana_" + wsol, "attributes": {"address": wsol, "name": "Wrapped SOL", "symbol": "SOL"}},
+            ],
+        }
+        scanner = TrendingTokenScanner(self._settings(), rpc=object())
+        requests_made = []
+
+        def fake_get(url, gecko=False):
+            requests_made.append((url, gecko))
+            return payload
+
+        scanner._get_json = fake_get
+        scanner._dexscreener_enrich = lambda candidates: None
+        scanner._evaluate = lambda candidate: dict(candidate, status="REVIEW", decision="fixture only")
+        scanner.scan_once()
+
+        self.assertEqual(len(requests_made), 1)
+        self.assertTrue(requests_made[0][1])
+        self.assertIn("include=base_token,quote_token", requests_made[0][0])
+        snapshot = scanner.dashboard_snapshot()
+        self.assertEqual(snapshot["scan_count"], 1)
+        self.assertEqual(snapshot["checked_count"], 1)
+        self.assertEqual(snapshot["candidates"][0]["mint"], mint)
+        self.assertFalse(snapshot["candidates"][0]["trade_eligible"])
+        self.assertTrue(snapshot["analysis_only"])
+
+    def test_dexscreener_cross_check_adds_name_liquidity_and_discrepancy_flags(self):
+        from trending_scanner import TrendingTokenScanner
+
+        mint = "TrendMint44444444444444444444444444444444"
+        scanner = TrendingTokenScanner(self._settings(), rpc=object())
+        pair = {
+            "chainId": "solana",
+            "pairAddress": "VerifiedPair111111111111111111111111111",
+            "url": "https://dexscreener.com/solana/VerifiedPair111111111111111111111111111",
+            "baseToken": {"address": mint, "name": "Crosschecked Trend", "symbol": "CTREND"},
+            "quoteToken": {"address": "So11111111111111111111111111111111111111112", "name": "Wrapped SOL", "symbol": "SOL"},
+            "liquidity": {"usd": 5000},
+            "volume": {"h1": 90000, "h24": 150000},
+            "priceChange": {"h1": -50, "h24": -30},
+        }
+        scanner._get_json = lambda url: [pair]
+        candidate = {
+            "mint": mint,
+            "name": "Unknown token",
+            "symbol": "—",
+            "liquidity_usd": 20000,
+            "volume_1h_usd": 12000,
+            "change_1h_pct": 5,
+            "risk_flags": [],
+        }
+
+        scanner._dexscreener_enrich([candidate])
+
+        self.assertEqual(candidate["name"], "Crosschecked Trend")
+        self.assertEqual(candidate["symbol"], "CTREND")
+        self.assertEqual(candidate["liquidity_usd"], 5000)
+        self.assertEqual(candidate["dexscreener_pair_address"], pair["pairAddress"])
+        self.assertTrue(candidate["dexscreener_confirmed"])
+        self.assertTrue(candidate["market_data_discrepancy"])
+        self.assertGreaterEqual(len(candidate["risk_flags"]), 3)
+
+
 class TrendingScannerConfigTests(unittest.TestCase):
     def test_scanner_is_opt_in_and_thresholds_cannot_be_lowered(self):
         env = {
