@@ -100,7 +100,9 @@ class TokenDiscoveryShadow:
         self.shadow_window_seconds = max(60, int(getattr(settings, "token_discovery_shadow_window_seconds", 900)))
         self.max_token_age_hours = max(1, min(24, int(getattr(settings, "token_discovery_max_token_age_hours", 24))))
         self.max_token_age_seconds = self.max_token_age_hours * 3600
-        self.max_queue_size = 100
+        self.max_queue_size = max(100, min(5000, int(getattr(settings, "token_discovery_queue_size", 1000))))
+        self.max_queue_age_seconds = max(60, min(900, int(getattr(settings, "token_discovery_max_queue_age_seconds", 180))))
+        self.max_entry_age_seconds = max(60, min(600, int(getattr(settings, "token_discovery_max_entry_age_seconds", 300))))
         self.backfill_auth_token = str(getattr(settings, "pumpfun_auth_token", "") or "").strip()
         self.backfill_url = "https://frontend-api-v3.pump.fun/coins"
         self.backfill_page_size = 100
@@ -230,27 +232,28 @@ class TokenDiscoveryShadow:
         return candidates[:limit]
 
     def dashboard_snapshot(self) -> dict:
-        rows = self.candidates(300)
+        all_candidates = self.candidates(10000)
+        rows = all_candidates[:300]
         now = time.time()
-        queued = sum(1 for c in rows if c.get("status") == "queued")
-        safety_passed = sum(1 for c in rows if c.get("security_passed") is True)
-        qualified = sum(1 for c in rows if c.get("would_buy"))
+        queued = sum(1 for c in all_candidates if c.get("status") == "queued")
+        safety_passed = sum(1 for c in all_candidates if c.get("security_passed") is True)
+        qualified = sum(1 for c in all_candidates if c.get("would_buy"))
         attempted_states = {
             "submitting", "opened", "closed", "failed", "blocked",
             "retryable", "uncertain", "needs_reconciliation", "skipped_stale",
         }
-        live_attempted = sum(1 for c in rows if c.get("live_entry_status") in attempted_states)
+        live_attempted = sum(1 for c in all_candidates if c.get("live_entry_status") in attempted_states)
         live_confirmed = sum(
-            1 for c in rows
+            1 for c in all_candidates
             if c.get("live_entry_status") in {"opened", "closed"}
             or c.get("live_entry_confirmed") is True
         )
         live_failed = sum(
-            1 for c in rows
+            1 for c in all_candidates
             if c.get("live_entry_status") in {"failed", "blocked", "skipped_stale"}
         )
         unfilled_peak_20 = sum(
-            1 for c in rows
+            1 for c in all_candidates
             if float(c.get("max_return_pct") or 0) >= 20.0
             and c.get("live_entry_status") not in {"opened", "closed"}
         )
@@ -276,17 +279,19 @@ class TokenDiscoveryShadow:
             "backfill_offset": self._backfill_offset,
             "queue_count": queued,
             "queue_limit": self.max_queue_size,
+            "max_queue_age_seconds": self.max_queue_age_seconds,
+            "max_entry_age_seconds": self.max_entry_age_seconds,
             "max_token_age_hours": self.max_token_age_hours,
-            "tracked_candidates": len(rows),
+            "tracked_candidates": len(all_candidates),
             "safety_passed_count": safety_passed,
             "qualified_count": qualified,
             "live_attempted_count": live_attempted,
             "live_confirmed_count": live_confirmed,
             "live_failed_count": live_failed,
             "unfilled_peak_20_count": unfilled_peak_20,
-            "shadow_entries": sum(1 for c in rows if c.get("shadow_entry_price_usd")),
+            "shadow_entries": sum(1 for c in all_candidates if c.get("shadow_entry_price_usd")),
             "active_watch_count": sum(
-                1 for c in rows
+                1 for c in all_candidates
                 if c.get("subscribed") and float(c.get("subscription_expires_at", 0)) > now
             ),
             "candidates": rows[:50],
@@ -300,7 +305,7 @@ class TokenDiscoveryShadow:
         if not self.feed:
             return
         now = time.time()
-        rows = self.candidates(500)
+        rows = self.candidates(10000)
         live_position_mints = set()
         if hasattr(self.store, "list_positions"):
             live_position_mints = {
@@ -334,7 +339,7 @@ class TokenDiscoveryShadow:
 
     def _active_watch_count(self, now: float) -> int:
         return sum(
-            1 for c in self.candidates(500)
+            1 for c in self.candidates(10000)
             if c.get("subscribed")
             and float(c.get("subscription_expires_at", 0)) > now
             and c.get("status") in {"watching", "shadow_open"}
@@ -532,14 +537,31 @@ class TokenDiscoveryShadow:
             self.store.set_state("token_discovery_backfill_offset", str(next_offset))
 
     def _queue_launch_event(self, mint: str, event: dict, reason: str, now: float) -> bool:
-        queued = [c for c in self.candidates(1000) if c.get("status") == "queued"]
+        queued = [c for c in self.candidates(10000) if c.get("status") == "queued"]
         if len(queued) >= self.max_queue_size:
+            # Preserve the latest opportunity: evict the oldest pending launch,
+            # rather than discarding the new event that just arrived.
+            oldest = min(
+                queued,
+                key=lambda c: (
+                    float(c.get("created_at") or c.get("queued_at") or 0),
+                    float(c.get("queued_at") or c.get("last_updated_at") or 0),
+                ),
+            )
+            old_mint = str(oldest.get("mint") or "")
+            oldest["status"] = "dropped_overflow"
+            oldest["reason"] = (
+                f"Queue capacity {self.max_queue_size} reached; oldest pending launch "
+                "evicted to prioritize fresher opportunities"
+            )
+            oldest["queued_event"] = {}
+            oldest["subscribed"] = False
+            self._save(oldest)
             self.stats["queue_dropped"] += 1
             logger.warning(
-                "Opportunity queue full (%d); dropping unscanned launch %s",
-                self.max_queue_size, mint[:8],
+                "Opportunity queue full (%d); evicted oldest queued launch %s to retain fresher launch %s",
+                self.max_queue_size, old_mint[:8], mint[:8],
             )
-            return False
         creator = str(event.get("traderPublicKey") or event.get("creator") or "")[:64]
         # PumpPortal's new-token stream is a launch-event stream. Store when this
         # bot observed that event so persisted queue entries can be age-limited across restarts.
@@ -559,7 +581,7 @@ class TokenDiscoveryShadow:
             "creator": creator,
             "created_at": observed_at,
             "queued_at": now,
-            "queue_expires_at": observed_at + self.max_token_age_seconds,
+            "queue_expires_at": now + self.max_queue_age_seconds,
             "queued_event": safe_event,
             "status": "queued",
             "reason": "Waiting for scan/watch capacity; " + reason,
@@ -604,16 +626,28 @@ class TokenDiscoveryShadow:
         c = self._new_candidate(mint, event, inspected)
         real_liquidity = float(inspected.get("liquidity_usd") or 0)
         if real_liquidity < self.min_liquidity_usd:
-            c["status"] = "rejected"
+            created_at = float(c.get("created_at") or now)
+            c["status"] = "waiting_liquidity"
             c["subscribed"] = False
-            c["reason"] = (
-                f"Verified real bonding-curve liquidity ${real_liquidity:.0f} "
-                f"below required ${self.min_liquidity_usd:.0f}; not subscribed"
-            )
             c["liquidity_eligible"] = False
-            self.stats["liquidity_rejected"] += 1
+            c["liquidity_wait_started_at"] = now
+            c["liquidity_wait_expires_at"] = min(
+                now + self.max_entry_age_seconds,
+                created_at + self.max_entry_age_seconds,
+            )
+            c["last_chain_check"] = now
+            c["last_liquidity_check"] = now
+            c["next_liquidity_check_at"] = now + max(
+                2, min(10, int(getattr(self.settings, "poll_seconds", 4)))
+            )
+            c["reason"] = (
+                f"On-chain safety checks passed; verified real curve liquidity "
+                f"${real_liquidity:.0f} is below ${self.min_liquidity_usd:.0f}; "
+                "waiting for a verified liquidity event before trade-flow screening"
+            )
             self._save(c)
-            logger.info("Shadow discovery rejected %s: %s", mint[:8], c["reason"])
+            logger.info("Discovery waiting for liquidity mint=%s real_curve_liquidity=$%.0f floor=$%.0f",
+                        mint[:8], real_liquidity, self.min_liquidity_usd)
             return
         c["liquidity_eligible"] = True
         c["status"] = "watching"
@@ -684,26 +718,37 @@ class TokenDiscoveryShadow:
         self._scan_and_register(mint, event, now)
 
     def _process_queued_launches(self, now: float) -> None:
-        rows = [c for c in self.candidates(1000) if c.get("status") == "queued"]
+        rows = [c for c in self.candidates(10000) if c.get("status") == "queued"]
         if not rows:
             return
         for candidate in rows:
             try:
                 created_at = float(candidate.get("created_at") or candidate.get("queued_at") or now)
+                queued_at = float(candidate.get("queued_at") or created_at)
             except (TypeError, ValueError):
-                created_at = now
-            if now - created_at > self.max_token_age_seconds:
-                candidate["status"] = "expired"
-                candidate["reason"] = (
-                    f"Launch event observed more than {self.max_token_age_hours} hours ago; "
-                    "removed from the opportunity queue"
+                created_at = queued_at = now
+            expired_reason = ""
+            if now - queued_at > self.max_queue_age_seconds:
+                expired_reason = (
+                    f"Queue wait exceeded {self.max_queue_age_seconds}s sniper freshness limit"
                 )
+            elif now - created_at > self.max_entry_age_seconds:
+                expired_reason = (
+                    f"Launch exceeded {self.max_entry_age_seconds}s sniper entry-age limit"
+                )
+            elif now - created_at > self.max_token_age_seconds:
+                expired_reason = (
+                    f"Launch exceeded the maximum {self.max_token_age_hours}-hour age window"
+                )
+            if expired_reason:
+                candidate["status"] = "expired"
+                candidate["reason"] = expired_reason + "; removed from the opportunity queue"
                 candidate["queued_event"] = {}
                 candidate["subscribed"] = False
                 self.stats["queue_expired"] += 1
                 self._save(candidate)
 
-        rows = [c for c in self.candidates(1000) if c.get("status") == "queued"]
+        rows = [c for c in self.candidates(10000) if c.get("status") == "queued"]
         if not rows or self._active_watch_count(now) >= self.max_watched:
             return
         while self._recent_scans and now - self._recent_scans[0] >= 60:
@@ -711,7 +756,7 @@ class TokenDiscoveryShadow:
         if len(self._recent_scans) >= self.max_scans_per_minute:
             return
 
-        # Favor the freshest queued launches; stale ones expire and are visibly counted.
+        # Prioritize the newest queued launches; stale entries are expired above.
         candidate = max(
             rows,
             key=lambda c: float(c.get("created_at") or c.get("queued_at") or 0),
@@ -1168,6 +1213,102 @@ class TokenDiscoveryShadow:
             c["shadow_return_pct"] = round(current, 3)
             c["reason"] = "Shadow observation window completed; no real transaction was submitted"
 
+    def _process_waiting_liquidity(self, now: float) -> bool:
+        """Recheck one pending launch per tick; buy eligibility still requires fresh checks."""
+        rows = [c for c in self.candidates(10000) if c.get("status") == "waiting_liquidity"]
+        if not rows:
+            return False
+        changed = False
+        for candidate in rows:
+            try:
+                expires_at = float(candidate.get("liquidity_wait_expires_at") or 0)
+            except (TypeError, ValueError):
+                expires_at = 0.0
+            if expires_at and now >= expires_at:
+                candidate["status"] = "liquidity_wait_expired"
+                candidate["subscribed"] = False
+                candidate["reason"] = (
+                    f"Verified curve liquidity did not reach ${self.min_liquidity_usd:.0f} "
+                    f"within the {self.max_entry_age_seconds}s sniper entry window"
+                )
+                self._save(candidate)
+                changed = True
+
+        due = []
+        for candidate in rows:
+            if candidate.get("status") != "waiting_liquidity":
+                continue
+            try:
+                next_check = float(candidate.get("next_liquidity_check_at") or 0)
+            except (TypeError, ValueError):
+                next_check = 0.0
+            if now >= next_check:
+                due.append(candidate)
+        if not due:
+            return changed
+
+        candidate = min(
+            due,
+            key=lambda c: float(
+                c.get("last_liquidity_check")
+                or c.get("last_chain_check")
+                or c.get("last_updated_at")
+                or 0
+            ),
+        )
+        try:
+            candidate = self._refresh_curve(candidate)
+        except Exception as exc:
+            candidate["last_liquidity_check"] = now
+            candidate["next_liquidity_check_at"] = now + max(
+                2, min(10, int(getattr(self.settings, "poll_seconds", 4)))
+            )
+            candidate["reason"] = (
+                f"Liquidity recheck unavailable ({type(exc).__name__}); waiting for a "
+                "confirmed on-chain curve read; no buy submitted"
+            )
+            self._save(candidate)
+            return True
+
+        if candidate.get("status") != "waiting_liquidity":
+            # For example, a completed curve is explicitly marked graduated_unverified.
+            self._save(candidate)
+            return True
+
+        candidate["last_liquidity_check"] = now
+        liquidity = float(candidate.get("real_liquidity_usd") or 0)
+        if liquidity >= self.min_liquidity_usd:
+            if self._active_watch_count(now) >= self.max_watched:
+                candidate["next_liquidity_check_at"] = now + 5
+                candidate["reason"] = (
+                    f"Verified real curve liquidity reached ${liquidity:.0f}, but all "
+                    "trade-watch slots are occupied; waiting for a slot before monitoring flow"
+                )
+            else:
+                candidate["status"] = "watching"
+                candidate["subscribed"] = True
+                candidate["liquidity_eligible"] = True
+                candidate["subscription_expires_at"] = now + self.watch_seconds
+                candidate["next_liquidity_check_at"] = 0
+                candidate["reason"] = (
+                    f"Verified real curve liquidity reached ${liquidity:.0f}; "
+                    "subscribed for rapid buyer-flow qualification"
+                )
+                logger.info(
+                    "Discovery liquidity event mint=%s real_curve_liquidity=$%.0f; trade-flow watch started",
+                    str(candidate.get("mint") or "")[:8], liquidity,
+                )
+        else:
+            candidate["next_liquidity_check_at"] = now + max(
+                2, min(10, int(getattr(self.settings, "poll_seconds", 4)))
+            )
+            candidate["reason"] = (
+                f"Safe curve verified; waiting for real liquidity to reach "
+                f"${self.min_liquidity_usd:.0f} (current ${liquidity:.0f})"
+            )
+        self._save(candidate)
+        return True
+
     def tick(self) -> None:
         if not self.enabled:
             return
@@ -1176,7 +1317,7 @@ class TokenDiscoveryShadow:
         self._drain_recent_launch_backfill(now)
         self._start_recent_launch_backfill(now)
         changed = False
-        rows = self.candidates(500)
+        rows = self.candidates(10000)
         # Only a bounded number of active tokens are polled. Candidates from the free
         # creation stream are capped before any RPC checks; no per-launch RPC storm.
         for c in rows:
@@ -1226,6 +1367,7 @@ class TokenDiscoveryShadow:
                         c["reason"] = f"Shadow mark unavailable ({type(exc).__name__}); retaining last mark"
                 self._save(c)
                 changed = True
+        changed = self._process_waiting_liquidity(now) or changed
         # Refresh subscriptions periodically so a live held token remains streamed
         # and completed shadow-only candidates are eventually unsubscribed.
         if changed or now - self._last_subscription_refresh >= 30:
@@ -1240,14 +1382,30 @@ class TokenDiscoveryShadow:
         rows = self.store.list_state_prefix(STATE_PREFIX, limit=10000)
         if len(rows) <= 300:
             return
-        enriched = []
+        protected_statuses = {"queued", "waiting_liquidity", "watching", "shadow_open"}
+        protected_live_states = {
+            "checking", "submitting", "opened", "retryable", "uncertain",
+            "needs_reconciliation",
+        }
+        protected = []
+        history = []
         for key, raw in rows:
             try:
-                c = json.loads(raw)
+                candidate = json.loads(raw)
             except (TypeError, ValueError):
+                history.append((0.0, key))
                 continue
-            enriched.append((float(c.get("last_updated_at", 0)), key))
-        enriched.sort(reverse=True)
-        for _updated_at, key in enriched[250:]:
+            updated = float(candidate.get("last_updated_at", 0))
+            if (
+                candidate.get("status") in protected_statuses
+                or candidate.get("live_entry_status") in protected_live_states
+            ):
+                protected.append((updated, key))
+            else:
+                history.append((updated, key))
+        # Keep active queue and all open/reconciling work, even when this exceeds
+        # the historical display target. Only terminal history may be pruned.
+        history.sort(reverse=True)
+        keep_history = max(0, 300 - len(protected))
+        for _updated_at, key in history[keep_history:]:
             self.store.delete_state(key)
-

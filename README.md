@@ -11,7 +11,7 @@ A local Windows/Python experiment for watching Pump.fun's trader leaderboard and
 - Copies buys and sells from the selected top 10 and keeps watching a leader while a position copied from them remains open. Partial leader sells are approximated proportionally; full exits are attempted when the leader's observed token balance goes to zero.
 - Runs Pump.fun/PumpSwap-only transaction building through PumpPortal's Local Transaction API, signing locally and submitting through your configured RPC.
 - Provides a local dashboard: period selector, top-10 copy button, stop-copy button, position-by-position manual exit, manual exit all, recent trades, and estimated P&L.
-- Tracks positions in a local SQLite ledger; staged take-profits, trailing exits, downside stops, daily pause, total-loss halt, a three-consecutive-loss daily entry circuit breaker, and the seven-day experiment limit are included. After three non-positive realized exits in a row, new entries pause until the next UTC day while existing positions remain managed. The 2-minute losing-exit grace period can be overridden by an explicit manual exit, portfolio emergency/experiment liquidation, or a catastrophic price drop (default 50% below entry).
+- Tracks positions in a local SQLite ledger with staged take-profits, trailing exits, per-position downside stops, and explicit operator exit controls. The configured daily-loss and total-loss limits block new entries at the threshold; consecutive losing exits pause new entries for the rest of the UTC day after the configured streak. These entry circuit breakers do not automatically liquidate existing holdings, which remain under position management. An uncertain submitted transaction blocks duplicate attempts for that mint until reconciled. Watched-wallet signatures older than `MAX_COPY_SIGNAL_AGE_SECONDS` (default 30 seconds) are consumed without copying, preventing delayed RPC recovery from replaying stale trades. Manual dashboard stop controls, per-entry sizing, daily entry limits, and open-position/exposure caps remain active. Marked-loss and trailing stops now attempt an exit immediately when triggered; the 2-minute grace remains for losing leader-triggered sells. Explicit manual exits and catastrophic drawdowns can also bypass that grace.
 
 - Optional independent token discovery runs alongside leader copying in **shadow-only mode by default**. Live discovery remains separately opted in, with a $0.50 maximum swap input and at most one open discovery position.
 - Entry filters now enforce at least $5,000 verified real bonding-curve liquidity, a score of 80/100, at least eight unique buyers, creator/top-holder concentration checks, and fresh on-chain rechecks before live entry. Regular leader-copy entries also require indexed market data and the hard $5,000 liquidity floor.
@@ -66,7 +66,7 @@ TOKEN_DISCOVERY_ENABLED=true
 TOKEN_DISCOVERY_LIVE_ENABLED=false
 # Hard code ceiling: $0.50 swap input per discovery buy; total wallet debit can be higher due to rent/fees.
 TOKEN_DISCOVERY_MAX_ENTRY_USD=0.50
-TOKEN_DISCOVERY_MAX_WATCHED_TOKENS=5
+TOKEN_DISCOVERY_MAX_WATCHED_TOKENS=8
 TOKEN_DISCOVERY_WATCH_SECONDS=300
 TOKEN_DISCOVERY_MAX_LAUNCHES_PER_MINUTE=12
 TOKEN_DISCOVERY_MIN_LIQUIDITY_USD=5000
@@ -84,7 +84,58 @@ The minimum discovery liquidity is enforced at no less than $5,000, the score fl
 
 This initial version only enters ungraduated SOL-quoted Pump bonding curves. It does not enter migrated PumpSwap pools whose reserves have not been independently verified. Token screens and score thresholds are hypotheses, not claims of profitability. Keep `TOKEN_DISCOVERY_LIVE_ENABLED=false` until you specifically choose to begin this live trial.
 
+### Trending Solana tokens (research with separate live opt-in)
+
+Trending scans are separate from new-launch scans. The trending panel ranks Solana pools, compares the same pool's market data between GeckoTerminal and DEX Screener, checks mint controls directly over RPC, and requests RugCheck. The dashboard reports momentum, liquidity, volume, price movement, holder/LP-risk data, live-entry status, and reasons for rejection or manual review.
+
+Research is enabled separately:
+
+```text
+TRENDING_DISCOVERY_ENABLED=true
+TRENDING_DISCOVERY_POLL_SECONDS=60
+TRENDING_DISCOVERY_MAX_CANDIDATES=20
+TRENDING_MIN_LIQUIDITY_USD=15000
+TRENDING_MIN_VOLUME_1H_USD=10000
+TRENDING_MIN_SCORE=75
+```
+
+**Live trending entries are still disabled by default.** After you have tested the scanner and are ready to authorize real-money trading, configure these additional settings locally in `.env`:
+
+```text
+TRENDING_DISCOVERY_LIVE_ENABLED=true
+TRENDING_DISCOVERY_MAX_ENTRY_USD=0.50
+TRENDING_MAX_PRICE_IMPACT_PCT=5.0
+TRENDING_MAX_POOL_AGE_HOURS=720
+JUPITER_API_KEY=your_jupiter_api_key
+```
+
+Live execution also requires the repo's existing live prerequisites: `BOT_MODE=live`, the exact `LIVE_CONFIRMATION` string, a valid local keypair, and the existing live provider credentials. The executor uses Jupiter Swap API V2's Order & Execute flow, excludes RFQ router transactions requiring another signer, validates the transaction program allowlist and any v0 address lookup tables before signing, simulates the signed transaction, then requires a successful execute response and fresh wallet-balance reconciliation. Buy input is capped at $0.50 (network fees and new-token-account rent can make total wallet debit higher); at most one position across the new-token and trending discovery strategies can be open. The same position manager can sell trending positions back to SOL through Jupiter, subject to route availability and fresh balances.
+
+The scanner enforces at least $15,000 reported liquidity and $10,000 one-hour volume, plus a 75/100 momentum floor for live entries. Immediately before a buy it repeats the same-pool check, mint/authority checks, RugCheck, price/volume/flow screens, and portfolio budget checks. Missing or mismatched data is not treated as safe. A `SCREENED` result is not proof that a token cannot rug, that insider activity is absent, that the price feed is accurate, or that an exit will fill. Swap routes can disappear, prices can move, APIs can be rate-limited, and sold-token balance changes must be reconciled. The live path must pass CI and a local no-funds/API smoke test before using the live flags.
+
 The first RPC fallback sync records each watch wallet's latest signature instead of replaying its historical trades. The WebSocket path follows new events after its subscription is active.
+
+## Aggressive overnight tuning (still bounded)
+
+For broader candidate coverage and faster trade management, merge these overrides into the existing local `.env` file rather than replacing it:
+
+```text
+TOKEN_DISCOVERY_MAX_WATCHED_TOKENS=8
+TRENDING_DISCOVERY_POLL_SECONDS=60
+TRENDING_DISCOVERY_MAX_CANDIDATES=20
+
+MAX_MARKED_LOSS_PCT=0.18
+TRAILING_STOP_PCT=0.12
+TAKE_PROFIT_1_PCT=0.20
+TAKE_PROFIT_2_PCT=0.45
+TAKE_PROFIT_1_SELL_FRACTION=0.40
+TAKE_PROFIT_2_SELL_FRACTION=0.30
+MAX_ENTRIES_PER_DAY=4
+```
+
+This profile scans more trending candidates, watches more new tokens, starts taking partial profit sooner, tightens the downside trigger to 18%, and attempts algorithmic stop exits immediately rather than waiting out the hold grace period. Existing portfolio controls remain in force: keep a hard entry cap, exposure cap, maximum position count, and daily/total loss limits. The example configuration retains a $0.50 discovery swap-input ceiling and $1.00 total exposure cap; swap fees/rent can make the actual wallet debit higher. Do not interpret a stop trigger as a guaranteed fill: a rug pull, missing route, failed transaction, or insufficient exit liquidity can prevent a timely sale.
+
+The live execution switches reset to OFF each time the process restarts, so explicitly re-enable the relevant live-buy controls in the dashboard after restarting. This tuning is more active, not a reliable way to make a fixed dollar target overnight.
 
 ## About the leaderboard API settings
 

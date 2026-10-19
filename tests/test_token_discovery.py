@@ -130,7 +130,10 @@ def settings(**overrides):
         "token_discovery_enabled": True,
         "token_discovery_max_watched_tokens": 5,
         "token_discovery_watch_seconds": 300,
-        "token_discovery_max_launches_per_minute": 12,
+        "token_discovery_max_launches_per_minute": 30,
+        "token_discovery_queue_size": 1000,
+        "token_discovery_max_queue_age_seconds": 180,
+        "token_discovery_max_entry_age_seconds": 300,
         "token_discovery_min_liquidity_usd": 5000.0,
         "token_discovery_min_score": 80,
         "token_discovery_min_unique_buyers": 8,
@@ -274,7 +277,7 @@ class TokenDiscoveryMarketCapTests(unittest.TestCase):
 
 
 class TokenDiscoveryShadowTests(unittest.TestCase):
-    def test_low_real_curve_liquidity_is_rejected_without_using_watch_slot(self):
+    def test_low_real_curve_liquidity_waits_for_liquidity_without_using_watch_slot(self):
         store = FakeStore()
         feed = FakeFeed()
         # 1 SOL real curve reserve => approximately $300 two-sided value at $150/SOL.
@@ -282,17 +285,70 @@ class TokenDiscoveryShadowTests(unittest.TestCase):
         scanner = TokenDiscoveryShadow(settings(), rpc, FakeMarket(), store, feed)
 
         scanner.on_new_token_event({
-            "mint": MINT, "name": "TooThin", "symbol": "THIN",
+            "mint": MINT, "name": "EarlyLaunch", "symbol": "EARLY",
             "traderPublicKey": "Creator111111111111111111111111111111111111",
             "txType": "create",
         })
 
         candidate = json.loads(store.get_state("token_discovery_candidate:" + MINT))
-        self.assertEqual(candidate["status"], "rejected")
+        self.assertEqual(candidate["status"], "waiting_liquidity")
         self.assertFalse(candidate["subscribed"])
-        self.assertIn("below required $5000", candidate["reason"])
-        self.assertEqual(scanner.stats["liquidity_rejected"], 1)
+        self.assertIn("waiting for a verified liquidity event", candidate["reason"])
+        self.assertEqual(scanner.stats["liquidity_rejected"], 0)
         self.assertEqual(feed.discovery_tokens, ())
+
+        # Simulate the curve growing past $5,000 real liquidity.
+        rpc.curve_data = curve_account_data(real_sol=20_000_000_000)
+        candidate["last_liquidity_check"] = time.time() - 10
+        candidate["next_liquidity_check_at"] = time.time() - 1
+        scanner._save(candidate)
+        scanner.tick()
+
+        candidate = json.loads(store.get_state("token_discovery_candidate:" + MINT))
+        self.assertEqual(candidate["status"], "watching")
+        self.assertTrue(candidate["subscribed"])
+        self.assertTrue(candidate["liquidity_eligible"])
+        self.assertEqual(feed.discovery_tokens, (MINT,))
+
+    def test_full_queue_evicts_oldest_launch_to_keep_newer_opportunity(self):
+        store = FakeStore()
+        scanner = TokenDiscoveryShadow(settings(), FakeRPC(), FakeMarket(), store)
+        scanner.max_queue_size = 2
+        now = time.time()
+        mints = [str(Pubkey.new_unique()) for _ in range(3)]
+        for mint, created, name in ((mints[0], now - 20, "old"), (mints[1], now - 10, "middle")):
+            self.assertTrue(scanner._queue_launch_event(
+                mint,
+                {"mint": mint, "name": name, "_bot_observed_created_at": created},
+                "test burst",
+                now,
+            ))
+        self.assertTrue(scanner._queue_launch_event(
+            mints[2],
+            {"mint": mints[2], "name": "newest", "_bot_observed_created_at": now},
+            "test burst",
+            now,
+        ))
+        self.assertEqual(scanner._load(mints[0])["status"], "dropped_overflow")
+        self.assertEqual(scanner._load(mints[1])["status"], "queued")
+        self.assertEqual(scanner._load(mints[2])["status"], "queued")
+        self.assertEqual(scanner.dashboard_snapshot()["queue_count"], 2)
+        self.assertEqual(scanner.stats["queue_dropped"], 1)
+
+    def test_candidate_trim_preserves_pending_queue_even_above_history_target(self):
+        store = FakeStore()
+        scanner = TokenDiscoveryShadow(settings(), FakeRPC(), FakeMarket(), store)
+        queued_mints = [str(Pubkey.new_unique()) for _ in range(320)]
+        for mint in queued_mints:
+            scanner._save({
+                "mint": mint, "status": "queued", "created_at": time.time(),
+                "queued_at": time.time(), "queued_event": {"mint": mint},
+            })
+        terminal_mint = str(Pubkey.new_unique())
+        scanner._save({"mint": terminal_mint, "status": "rejected", "created_at": time.time()})
+        scanner._trim_candidates()
+        self.assertTrue(all(scanner._load(mint)["status"] == "queued" for mint in queued_mints))
+        self.assertIsNone(scanner._load(terminal_mint))
 
     def test_new_token_is_verified_and_only_subscribed_for_shadow_observation(self):
         store = FakeStore()

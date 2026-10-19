@@ -77,11 +77,25 @@ class PumpFunSettings:
     token_discovery_max_watched_tokens: int
     token_discovery_watch_seconds: int
     token_discovery_max_launches_per_minute: int
+    token_discovery_queue_size: int
+    token_discovery_max_queue_age_seconds: int
+    token_discovery_max_entry_age_seconds: int
     token_discovery_min_liquidity_usd: float
     token_discovery_min_score: int
     token_discovery_min_unique_buyers: int
     token_discovery_shadow_window_seconds: int
     token_discovery_max_token_age_hours: int
+    trending_discovery_enabled: bool
+    trending_discovery_live_enabled: bool
+    trending_discovery_max_entry_usd: float
+    trending_discovery_poll_seconds: int
+    trending_discovery_max_candidates: int
+    trending_min_liquidity_usd: float
+    trending_min_volume_1h_usd: float
+    trending_min_score: int
+    trending_max_price_impact_pct: float
+    trending_max_pool_age_hours: int
+    jupiter_api_key: str
     database_path: Path
     log_level: str
 
@@ -120,14 +134,14 @@ class PumpFunSettings:
             min_liquidity_usd=max(5000.0, _float("MIN_LIQUIDITY_USD", 5000.0)),
             min_pair_age_seconds=max(90, _int("MIN_PAIR_AGE_SECONDS", 90)),
             slippage_bps=_int("SLIPPAGE_BPS", 300),
-            max_marked_loss_pct=_float("MAX_MARKED_LOSS_PCT", 0.25),
-            # Extreme price collapses can bypass the grace period; keep the threshold between 40% and 90%.
+            max_marked_loss_pct=_float("MAX_MARKED_LOSS_PCT", 0.18),
+            # Leader-follow loss exits can bypass their grace period after an extreme price collapse; keep the threshold between 40% and 90%.
             emergency_loss_bypass_pct=max(0.40, min(0.90, _float("EMERGENCY_LOSS_BYPASS_PCT", 0.50))),
-            # Loss exits are held for at least two minutes; local configuration may only increase this.
+            # The two-minute grace applies to loss-making leader-follow exits; algorithmic stops are immediate.
             min_hold_before_loss_exit_seconds=max(120, _int("MIN_HOLD_BEFORE_LOSS_EXIT_SECONDS", 120)),
-            trailing_stop_pct=_float("TRAILING_STOP_PCT", 0.20),
-            take_profit_1_pct=_float("TAKE_PROFIT_1_PCT", 0.30),
-            take_profit_2_pct=_float("TAKE_PROFIT_2_PCT", 0.60),
+            trailing_stop_pct=_float("TRAILING_STOP_PCT", 0.12),
+            take_profit_1_pct=_float("TAKE_PROFIT_1_PCT", 0.20),
+            take_profit_2_pct=_float("TAKE_PROFIT_2_PCT", 0.45),
             take_profit_1_sell_fraction=_float("TAKE_PROFIT_1_SELL_FRACTION", 0.40),
             take_profit_2_sell_fraction=_float("TAKE_PROFIT_2_SELL_FRACTION", 0.30),
             poll_seconds=max(2, _int("POLL_SECONDS", 4)),
@@ -140,10 +154,14 @@ class PumpFunSettings:
             token_discovery_live_enabled=os.getenv("TOKEN_DISCOVERY_LIVE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
             # Hard ceiling: configuration can reduce this but never raise it above $0.50.
             token_discovery_max_entry_usd=min(0.50, _float("TOKEN_DISCOVERY_MAX_ENTRY_USD", 0.50)),
-            token_discovery_max_watched_tokens=max(1, min(10, _int("TOKEN_DISCOVERY_MAX_WATCHED_TOKENS", 5))),
+            token_discovery_max_watched_tokens=max(1, min(10, _int("TOKEN_DISCOVERY_MAX_WATCHED_TOKENS", 8))),
             # Observe flow for at least five minutes even if an older local .env says 180 seconds.
             token_discovery_watch_seconds=max(300, min(600, _int("TOKEN_DISCOVERY_WATCH_SECONDS", 300))),
-            token_discovery_max_launches_per_minute=max(1, min(60, _int("TOKEN_DISCOVERY_MAX_LAUNCHES_PER_MINUTE", 12))),
+            token_discovery_max_launches_per_minute=max(1, min(60, _int("TOKEN_DISCOVERY_MAX_LAUNCHES_PER_MINUTE", 30))),
+            # Keep the persisted opportunity queue large but strictly bounded.
+            token_discovery_queue_size=max(100, min(5000, _int("TOKEN_DISCOVERY_QUEUE_SIZE", 1000))),
+            token_discovery_max_queue_age_seconds=max(60, min(900, _int("TOKEN_DISCOVERY_MAX_QUEUE_AGE_SECONDS", 180))),
+            token_discovery_max_entry_age_seconds=max(60, min(600, _int("TOKEN_DISCOVERY_MAX_ENTRY_AGE_SECONDS", 300))),
             # Conservative discovery floors cannot be lowered by local config.
             token_discovery_min_liquidity_usd=max(5000.0, _float("TOKEN_DISCOVERY_MIN_LIQUIDITY_USD", 5000.0)),
             token_discovery_min_score=max(80, min(100, _int("TOKEN_DISCOVERY_MIN_SCORE", 80))),
@@ -151,6 +169,18 @@ class PumpFunSettings:
             token_discovery_shadow_window_seconds=max(60, min(3600, _int("TOKEN_DISCOVERY_SHADOW_WINDOW_SECONDS", 900))),
             # The scanner only queues launches observed inside this rolling age limit; never allow >24h.
             token_discovery_max_token_age_hours=max(1, min(24, _int("TOKEN_DISCOVERY_MAX_TOKEN_AGE_HOURS", 24))),
+            # Trending discovery has independent scanning and live-execution opt-ins.
+            trending_discovery_enabled=os.getenv("TRENDING_DISCOVERY_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
+            trending_discovery_live_enabled=os.getenv("TRENDING_DISCOVERY_LIVE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
+            trending_discovery_max_entry_usd=min(0.50, _float("TRENDING_DISCOVERY_MAX_ENTRY_USD", 0.50)),
+            trending_discovery_poll_seconds=max(60, min(900, _int("TRENDING_DISCOVERY_POLL_SECONDS", 60))),
+            trending_discovery_max_candidates=max(1, min(20, _int("TRENDING_DISCOVERY_MAX_CANDIDATES", 20))),
+            trending_min_liquidity_usd=max(15000.0, _float("TRENDING_MIN_LIQUIDITY_USD", 15000.0)),
+            trending_min_volume_1h_usd=max(10000.0, _float("TRENDING_MIN_VOLUME_1H_USD", 10000.0)),
+            trending_min_score=max(75, min(100, _int("TRENDING_MIN_SCORE", 75))),
+            trending_max_price_impact_pct=max(1.0, min(5.0, _float("TRENDING_MAX_PRICE_IMPACT_PCT", 5.0))),
+            trending_max_pool_age_hours=max(1, min(720, _int("TRENDING_MAX_POOL_AGE_HOURS", 720))),
+            jupiter_api_key=os.getenv("JUPITER_API_KEY", "").strip(),
             database_path=Path(os.getenv("DATABASE_PATH", "memecoin-pumpfun.db")),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )
@@ -177,6 +207,15 @@ class PumpFunSettings:
                 raise ValueError("TOKEN_DISCOVERY_LIVE_ENABLED requires BOT_MODE=live")
             if not (0.10 <= self.token_discovery_max_entry_usd <= 0.50):
                 raise ValueError("TOKEN_DISCOVERY_MAX_ENTRY_USD must be between $0.10 and the $0.50 hard cap")
+        if self.trending_discovery_live_enabled:
+            if not self.trending_discovery_enabled:
+                raise ValueError("TRENDING_DISCOVERY_LIVE_ENABLED requires TRENDING_DISCOVERY_ENABLED=true")
+            if self.mode != "live":
+                raise ValueError("TRENDING_DISCOVERY_LIVE_ENABLED requires BOT_MODE=live")
+            if not self.jupiter_api_key:
+                raise ValueError("TRENDING_DISCOVERY_LIVE_ENABLED requires JUPITER_API_KEY in the local .env")
+            if not (0.10 <= self.trending_discovery_max_entry_usd <= 0.50):
+                raise ValueError("TRENDING_DISCOVERY_MAX_ENTRY_USD must be between $0.10 and the $0.50 hard cap")
         if self.mode == "live":
             if self.live_confirmation != "I_ACCEPT_THE_RISK_AND_UNDERSTAND_LIVE_TRADING":
                 raise ValueError("Live mode not armed. Review risks and set LIVE_CONFIRMATION locally.")

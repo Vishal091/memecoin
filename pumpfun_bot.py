@@ -38,6 +38,8 @@ from solana_rpc import SolanaRPC, SolanaRPCRateLimited, SolanaTransactionNotRead
 from pump_curve import fetch_pump_curve
 from storage import Store
 from token_discovery import TokenDiscoveryShadow
+from trending_scanner import TrendingTokenScanner
+from jupiter_ultra import JupiterUltraExecutor
 
 logger = logging.getLogger("pumpfun")
 
@@ -58,8 +60,14 @@ def loss_exit_hold_remaining_seconds(
     """Seconds remaining in the minimum holding period for a loss-making exit."""
     entry_price = float(position.get("entry_price_usd") or 0)
     normalized_reason = str(reason or "").strip().lower()
-    # Portfolio emergencies, experiment shutdown and an explicit human exit override the grace period.
-    if normalized_reason.startswith(("total loss limit", "experiment expiry", "manual exit")):
+    # A triggered algorithmic stop must attempt an exit immediately. Deferring it
+    # for the minimum-hold grace period can turn a defined stop into a much larger
+    # loss during a fast dump. Leader-triggered sells still use the grace period
+    # unless there is a portfolio emergency or explicit human exit.
+    if normalized_reason.startswith((
+        "total loss limit", "experiment expiry", "manual exit",
+        "marked loss stop", "trailing stop",
+    )):
         return 0.0
     if entry_price <= 0 or mark_price <= 0 or mark_price >= entry_price:
         return 0.0
@@ -88,6 +96,31 @@ def native_build_retry_delay_seconds(detail: str) -> int:
     # ATA/account metadata can be temporarily stale on an RPC; retry slowly, not
     # every 1.5 seconds. The position and pending exit stay recorded in the ledger.
     return 60
+
+
+def verified_curve_fallback_allowed(
+    signal: dict,
+    *,
+    strategy: str,
+    venue: str,
+    curve_liquidity_usd: float,
+    minimum_liquidity_usd: float,
+) -> bool:
+    """Permit pre-indexed DEX fallback only for freshly certified Pump discovery signals."""
+    try:
+        liquidity = float(curve_liquidity_usd)
+        floor = float(minimum_liquidity_usd)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (
+        strategy == "token_discovery"
+        and isinstance(signal, dict)
+        and signal.get("source") == "token_discovery"
+        and signal.get("fresh_security_verified") is True
+        and signal.get("curve_state_verified") is True
+        and venue == "pump"
+        and liquidity >= floor > 0
+    )
 
 
 def _pubkey_string(value) -> str:
@@ -125,11 +158,34 @@ class PumpFunBot:
                 self.s.min_sol_reserve,
             )
         self._validate_addresses()
+        self.trending_executor = JupiterUltraExecutor(
+            self.rpc, self.s.jupiter_api_key, timeout=self.s.request_timeout_seconds
+        )
 
         self.leaderboard_client = PumpFunLeaderboard(timeout=self.s.request_timeout_seconds)
         self.leaderboards = {}
         self.selected_window = self.store.get_state("leaderboard_window", self.s.default_leaderboard_window)
         saved_auto = self.store.get_state("auto_copy_enabled", "1" if self.s.auto_copy_on_start else "0")
+        # Migrate old automatic safety-halt flags. Do not clear the persisted
+        # consecutive-loss circuit breaker: a same-day pause must survive restarts.
+        # Explicit user stop-copy state remains respected unless coupled to an old
+        # automatic halt latch.
+        legacy_auto_halt = any(
+            self.store.get_state(key, "0") == "1"
+            for key in ("manual_review_halt", "halted", "experiment_expired")
+        )
+        if legacy_auto_halt:
+            self.store.set_state("manual_review_halt", "0")
+            self.store.set_state("halted", "0")
+            self.store.set_state("experiment_expired", "0")
+            if saved_auto == "0" and self.store.get_state("copy_paused", "0") == "1":
+                # These flags were also written by automatic halt handlers; restore
+                # the prior default running state while leaving normal dashboard stop
+                # controls available afterward.
+                saved_auto = "1"
+                self.store.set_state("auto_copy_enabled", "1")
+                self.store.set_state("copy_paused", "0")
+            logger.warning("Cleared legacy automatic halt flags; diagnostic reason is retained.")
         self.auto_copy_enabled = saved_auto == "1"
         self.active_wallets = set(self.s.watch_wallets)
         self.last_leaderboard_refresh = 0.0
@@ -150,8 +206,27 @@ class PumpFunBot:
         self.token_discovery = TokenDiscoveryShadow(
             self.s, self.rpc, self.market, self.store, self.feed
         )
+        self.trending_scanner = TrendingTokenScanner(
+            self.s, self.rpc, timeout=self.s.request_timeout_seconds, store=self.store,
+            on_screened=self._queue_trending_candidate,
+        )
+        # Dashboard scanner state is persistent, but live-buy authorization is
+        # intentionally session-only: every process restart requires an explicit
+        # operator click on each live-buy switch.
+        self.token_discovery.enabled = self.store.get_state(
+            "dashboard_token_discovery_enabled",
+            "1" if self.s.token_discovery_enabled else "0",
+        ) == "1"
+        self.trending_scanner.enabled = self.store.get_state(
+            "dashboard_trending_discovery_enabled",
+            "1" if self.s.trending_discovery_enabled else "0",
+        ) == "1"
+        self.token_discovery.live_enabled = False
+        self.trending_scanner.live_enabled = False
+        self.store.set_state("dashboard_token_discovery_live_enabled", "0")
+        self.store.set_state("dashboard_trending_discovery_live_enabled", "0")
         if self.feed:
-            self.feed.set_discovery_subscriptions(self.token_discovery.enabled, [])
+            self.token_discovery._update_feed_subscriptions()
         self.solana_log_events = queue.Queue()
         self.logs_feed = (
             SolanaLogsFeed(self.s.rpc_url, self.solana_log_events, self.s.request_timeout_seconds)
@@ -184,84 +259,61 @@ class PumpFunBot:
             }), default=str))
 
     def _activate_manual_review_halt(self, reason: str, *, append_reason: bool = False) -> None:
-        """Latch a manual-review halt without losing the first actionable diagnosis."""
-        already_halted = self.store.get_state("manual_review_halt", "0") == "1"
-        existing = self.store.get_state("manual_review_reason", "").strip()
+        """Record an operational warning; automatic global entry halts are disabled."""
         incoming = " ".join(str(reason or "").split()).strip()
-        if already_halted and existing:
-            if append_reason and incoming and incoming not in existing:
-                combined = f"{existing}; additionally: {incoming}"
-            else:
-                combined = existing
-                if incoming and incoming not in existing:
-                    logger.warning(
-                        "Preserving existing manual-review reason while recording another issue: %s",
-                        incoming[:240],
-                    )
+        existing = self.store.get_state("manual_review_reason", "").strip()
+        if existing and incoming and incoming not in existing and append_reason:
+            combined = f"{existing}; additionally: {incoming}"
         else:
-            combined = incoming
-        self.store.set_state("manual_review_halt", "1")
+            # Preserve the first diagnosis unless an explicitly appended transaction
+            # outcome provides additional detail.
+            combined = existing or incoming
+        # Keep the reason for diagnosis, but never latch a global trading halt.
+        self.store.set_state("manual_review_halt", "0")
         self.store.set_state("manual_review_reason", combined)
+        if incoming:
+            logger.error("Operational warning (automatic global halts disabled): %s", incoming[:500])
 
     def _loss_streak_pause_reason(self) -> str:
-        """Pause new entries for the remainder of the UTC day after a loss streak."""
+        """Persist a same-UTC-day entry pause after the configured consecutive-loss threshold."""
         today = datetime.now(timezone.utc).date().isoformat()
-        pause_day = self.store.get_state("consecutive_loss_pause_day", "")
+        pause_day = str(self.store.get_state("consecutive_loss_pause_day", "") or "")
         if pause_day and pause_day != today:
             self.store.set_state("consecutive_loss_pause_day", "")
             self.store.set_state("consecutive_losing_exits", "0")
-            return ""
+            self.store.set_state("consecutive_loss_warning_day", "")
+            pause_day = ""
         if pause_day == today:
-            try:
-                streak = int(self.store.get_state("consecutive_losing_exits", "0") or 0)
-            except (TypeError, ValueError):
-                streak = 0
-            threshold = max(2, int(getattr(self.s, "max_consecutive_losses", 3)))
-            return (
-                f"Consecutive-loss pause active after {streak} losing exits; "
-                f"new entries blocked until the next UTC day (threshold {threshold})."
-            )
+            return f"Consecutive losing-exit limit reached; new entries paused until the next UTC day ({today})"
         return ""
 
     def _record_realized_exit_risk(self, realized_pnl: float) -> None:
-        """Update the persisted loss streak after each confirmed sell."""
-        # This also clears a pause that belonged to a previous UTC day.
-        # Once today's pause is latched, later exits must not rewrite its displayed count.
-        if self._loss_streak_pause_reason():
-            return
+        """Track losing exits and pause new entries for the UTC day at the threshold."""
         try:
             streak = int(self.store.get_state("consecutive_losing_exits", "0") or 0)
         except (TypeError, ValueError):
             streak = 0
-        streak = streak + 1 if float(realized_pnl) <= 0 else 0
+        streak = streak + 1 if float(realized_pnl) < 0 else 0
         self.store.set_state("consecutive_losing_exits", str(streak))
         threshold = max(2, int(getattr(self.s, "max_consecutive_losses", 3)))
         today = datetime.now(timezone.utc).date().isoformat()
-        pause_day = self.store.get_state("consecutive_loss_pause_day", "")
-        if streak >= threshold and pause_day != today:
+        if streak >= threshold:
             self.store.set_state("consecutive_loss_pause_day", today)
-            logger.error(
-                "Consecutive-loss circuit breaker activated after %d exits with non-positive realized P&L; "
-                "new entries paused until the next UTC day",
-                streak,
-            )
+            if self.store.get_state("consecutive_loss_warning_day", "") != today:
+                self.store.set_state("consecutive_loss_warning_day", today)
+                logger.warning(
+                    "Consecutive losing exits reached %d (threshold %d); pausing new entries until the next UTC day",
+                    streak, threshold,
+                )
+        elif streak == 0:
+            self.store.set_state("consecutive_loss_pause_day", "")
+            self.store.set_state("consecutive_loss_warning_day", "")
 
     def _copy_block_reason(self) -> str:
-        """Explain durable safety gates that must be cleared before new copy entries."""
-        if self.store.get_state("halted", "0") == "1":
-            return "Overall loss halt active: " + self.store.get_state("halt_reason", "reconcile the account before resuming")
-        if self.store.get_state("manual_review_halt", "0") == "1":
-            return "Manual-review halt active: " + self.store.get_state(
-                "manual_review_reason", "reconcile wallet and transactions before resuming"
-            )
-        if self.store.get_state("experiment_expired", "0") == "1":
-            return "The seven-day experiment has expired."
+        """Report persisted entry circuit breakers to dashboard/feed logic."""
         if self.store.get_state("daily_paused", "0") == "1":
-            return "Daily loss pause is active until the UTC day resets."
-        streak_reason = self._loss_streak_pause_reason()
-        if streak_reason:
-            return streak_reason
-        return ""
+            return "Daily-loss circuit breaker is active; new entries resume after the next UTC day"
+        return self._loss_streak_pause_reason()
 
     def _refresh_feed_subscriptions(self) -> None:
         held_leaders = {
@@ -408,7 +460,7 @@ class PumpFunBot:
         paused = self.store.get_state("copy_paused", "0") == "1"
         token_discovery_state = self.token_discovery.dashboard_snapshot()
         token_discovery_state.update({
-            "live_enabled": bool(self.s.mode == "live" and self.s.token_discovery_live_enabled),
+            "live_enabled": bool(self.s.mode == "live" and self.token_discovery.live_enabled),
             "live_entry_cap_usd": min(0.50, float(self.s.token_discovery_max_entry_usd)),
             "live_open_positions": sum(
                 1 for p in self.store.list_positions()
@@ -430,6 +482,7 @@ class PumpFunBot:
             "positions": positions,
             "trades": trades,
             "token_discovery": token_discovery_state,
+            "trending_discovery": self.trending_scanner.dashboard_snapshot(),
             "feed_connected": bool(self.feed and self.feed.connected.is_set()),
             "feed_error": self.feed.last_error if self.feed else "",
             "feed_stats": ({
@@ -485,6 +538,40 @@ class PumpFunBot:
             # must not hide it or terminate the monitor.
             logger.exception("Could not refresh dashboard state after loop error")
 
+    def _runtime_discovery_flag(self, tracker_name: str, flag_name: str, settings_name: str) -> bool:
+        """Prefer an explicit runtime boolean, while supporting legacy/mock objects."""
+        tracker = getattr(self, tracker_name, None)
+        runtime_value = getattr(tracker, flag_name, None) if tracker is not None else None
+        if isinstance(runtime_value, bool):
+            return runtime_value
+        return bool(getattr(self.s, settings_name, False))
+
+    def _discovery_live_toggle_block_reason(self, strategy: str) -> str:
+        """Fail closed before enabling either dashboard live-buy switch."""
+        if self.s.mode != "live":
+            return "BOT_MODE must be live before enabling real-money discovery buys."
+        if self.s.live_confirmation != "I_ACCEPT_THE_RISK_AND_UNDERSTAND_LIVE_TRADING":
+            return "LIVE_CONFIRMATION is missing or invalid."
+        if not getattr(self, "wallet_address", "") or not getattr(self, "keypair", None):
+            return "A loaded live wallet/keypair is required."
+        if strategy == "token_discovery":
+            if not self.token_discovery.enabled:
+                return "Enable the new-token scanner before enabling its live buys."
+            if not (0.10 <= float(self.s.token_discovery_max_entry_usd) <= 0.50):
+                return "TOKEN_DISCOVERY_MAX_ENTRY_USD must be between $0.10 and $0.50."
+            if not self.s.pumpfun_auth_token or not self.s.pumpportal_api_key:
+                return "New-token live buys require Pump.fun and PumpPortal credentials."
+        elif strategy == "trending_discovery":
+            if not self.trending_scanner.enabled:
+                return "Enable the trending scanner before enabling its live buys."
+            if not (0.10 <= float(self.s.trending_discovery_max_entry_usd) <= 0.50):
+                return "TRENDING_DISCOVERY_MAX_ENTRY_USD must be between $0.10 and $0.50."
+            if not self.s.jupiter_api_key or not getattr(self.trending_executor, "api_key", ""):
+                return "JUPITER_API_KEY is required for trending live buys."
+        else:
+            return "Unknown discovery strategy."
+        return ""
+
     def _process_dashboard_commands(self) -> None:
         while True:
             try:
@@ -492,6 +579,69 @@ class PumpFunBot:
             except queue.Empty:
                 break
             action = command.get("action")
+            discovery_actions = {
+                "set_token_discovery_enabled", "set_token_discovery_live_enabled",
+                "set_trending_discovery_enabled", "set_trending_discovery_live_enabled",
+            }
+            if action in discovery_actions:
+                requested = command.get("enabled")
+                if not isinstance(requested, bool):
+                    self.message = "Invalid discovery toggle value; expected a boolean."
+                    continue
+
+                if action == "set_token_discovery_enabled":
+                    self.token_discovery.enabled = requested
+                    self.store.set_state("dashboard_token_discovery_enabled", "1" if requested else "0")
+                    if not requested:
+                        self.token_discovery.live_enabled = False
+                        self.store.set_state("dashboard_token_discovery_live_enabled", "0")
+                    self.token_discovery._update_feed_subscriptions()
+                    self.message = (
+                        "New-token discovery scanner enabled. Live buys remain off until separately enabled."
+                        if requested else
+                        "New-token discovery scanner disabled; new-token live buys are also off. Existing positions remain managed."
+                    )
+                    logger.warning("%s", self.message)
+                elif action == "set_trending_discovery_enabled":
+                    self.trending_scanner.enabled = requested
+                    self.store.set_state("dashboard_trending_discovery_enabled", "1" if requested else "0")
+                    if not requested:
+                        self.trending_scanner.live_enabled = False
+                        self.store.set_state("dashboard_trending_discovery_live_enabled", "0")
+                        self.trending_scanner.stop()
+                    else:
+                        self.trending_scanner.start()
+                    self.message = (
+                        "Trending-token scanner enabled. Live buys remain off until separately enabled."
+                        if requested else
+                        "Trending-token scanner disabled; trending live buys are also off. Existing positions remain managed."
+                    )
+                    logger.warning("%s", self.message)
+                else:
+                    strategy = "token_discovery" if action == "set_token_discovery_live_enabled" else "trending_discovery"
+                    tracker = self.token_discovery if strategy == "token_discovery" else self.trending_scanner
+                    if requested:
+                        block_reason = self._discovery_live_toggle_block_reason(strategy)
+                        if block_reason:
+                            self.message = "Live buys NOT enabled: " + block_reason
+                            logger.warning("%s", self.message)
+                            continue
+                    tracker.live_enabled = requested
+                    state_key = (
+                        "dashboard_token_discovery_live_enabled"
+                        if strategy == "token_discovery"
+                        else "dashboard_trending_discovery_live_enabled"
+                    )
+                    # This marker is diagnostic only; live authorization itself resets
+                    # to OFF during startup regardless of any stale state value.
+                    self.store.set_state(state_key, "1" if requested else "0")
+                    self.message = (
+                        ("LIVE BUYS ENABLED for " if requested else "Live buys disabled for ")
+                        + strategy + ". Existing positions remain managed."
+                    )
+                    logger.warning("%s", self.message)
+                continue
+
             if action == "copy_top10":
                 window = str(command.get("window", "day")).lower()
                 if window not in {"overall", "day", "week", "month"}:
@@ -656,6 +806,16 @@ class PumpFunBot:
         # Deduplicate per wallet so one recipient cannot suppress a signer actual trade.
         return f"{wallet}|{signature}"
 
+    def _queue_trending_candidate(self, candidate: dict) -> None:
+        """Move scanner results onto the main bot loop; scanner threads never trade."""
+        signal = dict(candidate)
+        signal["source"] = "trending_discovery"
+        signal["fresh_security_verified"] = False
+        self.trade_events.put({
+            "source": "trending_discovery_candidate",
+            "signal": signal,
+        })
+
     def _consume_feed_events(self) -> None:
         while True:
             try:
@@ -664,6 +824,11 @@ class PumpFunBot:
                 break
             self.signal_stats["queued_events"] += 1
             source = str(event.get("source") or "")
+            if source == "trending_discovery_candidate":
+                signal = event.get("signal")
+                if isinstance(signal, dict):
+                    self._buy_trending_discovery(signal)
+                continue
             if source == "token_discovery_new":
                 self.token_discovery.on_new_token_event(event)
                 continue
@@ -933,52 +1098,79 @@ class PumpFunBot:
         logger.warning("Recorded live starting equity baseline %.4f USD", value)
 
     def _refresh_risk_state(self, equity: float):
+        """Refresh drawdown baselines and warn when an entry circuit breaker is active."""
         self.store.reset_day_if_needed(equity)
-        if self.store.get_state("halted", "0") == "1":
-            return
         initial = float(self.store.get_state("initial_equity", str(self.s.starting_paper_cash_usd)))
-        total_loss = initial - equity
+        total_loss = max(0.0, initial - equity)
+        today = datetime.now(timezone.utc).date().isoformat()
         if total_loss >= self.s.total_loss_limit_usd:
-            self.store.set_state("halted", "1")
-            self.store.set_state("liquidate_all_pending", "1")
-            self.store.set_state("halt_reason", f"Total loss limit reached: drawdown {total_loss:.2f} USD")
-            logger.critical("%s; new entries blocked and liquidation will be attempted", self.store.get_state("halt_reason"))
-            return
-        daily_loss = float(self.store.get_state("day_start_equity", str(equity))) - equity
-        if daily_loss >= self.s.daily_loss_limit_usd and self.store.get_state("daily_paused", "0") != "1":
+            if self.store.get_state("total_loss_warning_day", "") != today:
+                self.store.set_state("total_loss_warning_day", today)
+                logger.warning(
+                    "Configured total-loss limit reached (drawdown %.2f USD); new entries are blocked. "
+                    "Existing positions remain managed; no automatic mass liquidation is performed.",
+                    total_loss,
+                )
+        daily_start = float(self.store.get_state("day_start_equity", str(equity)))
+        daily_loss = max(0.0, daily_start - equity)
+        if daily_loss >= self.s.daily_loss_limit_usd:
             self.store.set_state("daily_paused", "1")
-            logger.error("Daily drawdown limit reached (%.2f USD); entries paused until next UTC day", daily_loss)
+            if self.store.get_state("daily_loss_warning_day", "") != today:
+                self.store.set_state("daily_loss_warning_day", today)
+                logger.warning(
+                    "Configured daily-loss limit reached (drawdown %.2f USD); new entries are blocked "
+                    "until the next UTC day. Existing positions remain managed.",
+                    daily_loss,
+                )
 
     def _can_enter(
         self, equity: float, *, strategy: str = "leader_copy",
         entry_cap_usd: float | None = None,
     ) -> tuple[bool, str]:
-        if self.store.get_state("experiment_expired", "0") == "1":
-            return False, "Seven-day experiment is over"
-        if strategy != "token_discovery" and self.store.get_state("copy_paused", "0") == "1":
+        if strategy not in {"token_discovery", "trending_discovery"} and self.store.get_state("copy_paused", "0") == "1":
             return False, "Copying is paused from the dashboard"
-        if self.store.get_state("manual_review_halt", "0") == "1":
-            return False, "Manual review halt active: " + self.store.get_state("manual_review_reason", "")
-        if self.store.get_state("halted", "0") == "1":
-            return False, "Overall loss halt active: " + self.store.get_state("halt_reason")
-        if self.store.get_state("daily_paused", "0") == "1":
-            return False, "Daily loss pause active"
-        streak_reason = self._loss_streak_pause_reason()
-        if streak_reason:
-            return False, streak_reason
         if self.store.daily_entries() >= self.s.max_entries_per_day:
             return False, "Daily entry cap reached"
         if len(self.store.list_positions()) >= self.s.max_open_positions:
             return False, "Open position cap reached"
         if equity <= 0:
             return False, "Equity is zero or less"
+        # Make UTC-day rollover deterministic even when an event arrives before the
+        # next periodic heartbeat refreshes the risk baselines.
+        if hasattr(self.store, "reset_day_if_needed"):
+            self.store.reset_day_if_needed(equity)
+        if self.store.get_state("daily_paused", "0") == "1":
+            return False, "Daily-loss limit was reached; new entries are paused until the next UTC day"
+        loss_streak_reason = self._loss_streak_pause_reason()
+        if loss_streak_reason:
+            return False, loss_streak_reason
+        try:
+            initial_equity = float(self.store.get_state("initial_equity", str(self.s.starting_paper_cash_usd)))
+            day_start_equity = float(self.store.get_state("day_start_equity", str(equity)))
+        except (TypeError, ValueError, OverflowError):
+            return False, "Risk baseline is invalid; refusing new entry until reconciled"
+        total_drawdown = max(0.0, initial_equity - equity)
+        if total_drawdown >= float(self.s.total_loss_limit_usd):
+            return False, (
+                f"Total-loss limit reached: drawdown ${total_drawdown:.2f} >= "
+                f"${float(self.s.total_loss_limit_usd):.2f}; new entries blocked"
+            )
+        daily_drawdown = max(0.0, day_start_equity - equity)
+        if daily_drawdown >= float(self.s.daily_loss_limit_usd):
+            self.store.set_state("daily_paused", "1")
+            return False, (
+                f"Daily-loss limit reached: drawdown ${daily_drawdown:.2f} >= "
+                f"${float(self.s.daily_loss_limit_usd):.2f}; new entries blocked until next UTC day"
+            )
         exposure = self._current_positions_value()
         room = self.s.max_total_exposure_usd - exposure
         configured_cap = self.s.max_entry_usd if entry_cap_usd is None else float(entry_cap_usd)
         if strategy == "token_discovery":
             configured_cap = min(0.50, configured_cap, float(self.s.token_discovery_max_entry_usd))
+        elif strategy == "trending_discovery":
+            configured_cap = min(0.50, configured_cap, float(self.s.trending_discovery_max_entry_usd))
         spend = min(self.s.max_entry_usd, configured_cap, room)
-        minimum_practical_spend = 0.10 if strategy == "token_discovery" else 0.50
+        minimum_practical_spend = 0.10 if strategy in {"token_discovery", "trending_discovery"} else 0.50
         if spend < minimum_practical_spend:
             return False, "Too little exposure headroom for a practical trade"
         if self.s.mode == "paper":
@@ -1102,12 +1294,9 @@ class PumpFunBot:
             f"signature {exc.signature}; reconcile wallet/transaction before resuming",
             append_reason=True,
         )
-        self.auto_copy_enabled = False
-        self.store.set_state("auto_copy_enabled", "0")
-        self.store.set_state("copy_paused", "1")
-
-        # Consume the triggering leader event so clearing the halt later cannot
-        # replay the same stale signal. poll_wallet also advances its cursor.
+        # Do not pause unrelated mints or disable the whole bot. The unresolved
+        # trade record above continues to block duplicate submissions for this mint.
+        # Consume the triggering leader event so it cannot be replayed as a stale signal.
         if source_wallet and source_signature:
             self.store.mark_signature_seen(
                 self._dedupe_key(source_wallet, source_signature), source_wallet
@@ -1124,16 +1313,278 @@ class PumpFunBot:
             exc.action, exc.mint, exc.signature,
         )
 
+    def _buy_trending_discovery(
+        self, signal: dict, *, entry_cap_usd: float | None = None,
+    ) -> None:
+        """Execute one freshly re-screened trending-token entry through Jupiter Ultra."""
+        mint = str(signal.get("mint") or "")
+        if (
+            self.s.mode != "live"
+            or not self._runtime_discovery_flag("trending_scanner", "enabled", "trending_discovery_enabled")
+            or not self._runtime_discovery_flag("trending_scanner", "live_enabled", "trending_discovery_live_enabled")
+            or signal.get("source") != "trending_discovery"
+        ):
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "Trending live opt-in is off or candidate source is invalid"
+            )
+            return
+        try:
+            signal = self.trending_scanner.verify_live_candidate(signal)
+            signal["source"] = "trending_discovery"
+            signal["fresh_security_verified"] = True
+        except Exception as exc:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", f"Fresh pre-trade security/market recheck failed ({type(exc).__name__}): {str(exc)[:300]}"
+            )
+            logger.warning("Trending live entry blocked by fresh recheck mint=%s: %s", mint[:8], exc)
+            return
+        if not mint or self.store.get_state(f"unresolved_trade:{mint}", ""):
+            self.trending_scanner.set_live_status(
+                mint, "uncertain", "An unresolved transaction exists for this mint; no repeat order was sent"
+            )
+            return
+        if self.store.get_position(mint):
+            self.trending_scanner.set_live_status(mint, "blocked", "A tracked position already exists for this mint")
+            return
+        discovery_positions = [
+            p for p in self.store.list_positions()
+            if p.get("strategy", "leader_copy") in {"token_discovery", "trending_discovery"}
+        ]
+        if discovery_positions:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "One other discovery position is already open"
+            )
+            return
+
+        # Use the exact DEX Screener pool that was cross-checked by the scanner;
+        # if the best pair changed, require a new full scan instead of guessing.
+        try:
+            market = self.market.token_market(mint)
+        except Exception as exc:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", f"Fresh market-data request failed ({type(exc).__name__})"
+            )
+            return
+        if not market:
+            self.trending_scanner.set_live_status(mint, "blocked", "Fresh DEX market pair is unavailable")
+            return
+        if str(market.get("pair_address") or "") != str(signal.get("dexscreener_pair_address") or ""):
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "Best DEX Screener pool changed since the security scan; rescan required"
+            )
+            return
+        raw_market = market.get("raw") or {}
+        liquidity = float(market.get("liquidity_usd") or 0)
+        price = float(market.get("price_usd") or 0)
+        try:
+            pair_age = int(market.get("pair_age_seconds") or 0)
+        except (TypeError, ValueError):
+            pair_age = 0
+        volume1 = float((raw_market.get("volume") or {}).get("h1") or 0)
+        if liquidity < self.s.trending_min_liquidity_usd:
+            self.trending_scanner.set_live_status(
+                mint, "blocked",
+                f"Fresh same-pool liquidity ${liquidity:,.0f} is below ${self.s.trending_min_liquidity_usd:,.0f}",
+            )
+            return
+        if volume1 < self.s.trending_min_volume_1h_usd:
+            self.trending_scanner.set_live_status(
+                mint, "blocked",
+                f"Fresh same-pool 1h volume ${volume1:,.0f} is below ${self.s.trending_min_volume_1h_usd:,.0f}",
+            )
+            return
+        max_pair_age = max(1, int(self.s.trending_max_pool_age_hours)) * 3600
+        if pair_age < self.s.min_pair_age_seconds or pair_age > max_pair_age or price <= 0:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "Fresh DEX pair is too young/old or has no reliable USD price"
+            )
+            return
+        if bool(signal.get("market_data_discrepancy")) or signal.get("same_pool_crosscheck") is not True:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "Independent market sources did not pass the same-pool consistency check"
+            )
+            return
+        try:
+            decimals = int(signal.get("decimals") or -1)
+        except (TypeError, ValueError):
+            decimals = -1
+        if decimals < 0 or decimals > 18:
+            self.trending_scanner.set_live_status(mint, "blocked", "Token decimals are invalid")
+            return
+        if int(signal.get("momentum_score") or 0) < self.s.trending_min_score:
+            self.trending_scanner.set_live_status(
+                mint, "blocked",
+                f"Fresh momentum score is below configured floor {self.s.trending_min_score}/100",
+            )
+            return
+        try:
+            fresh_txns = (raw_market.get("txns") or {}).get("h1") or {}
+            buys = int(fresh_txns["buys"])
+            sells = int(fresh_txns["sells"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "Fresh DEX market response has no usable one-hour buy/sell counts"
+            )
+            return
+        if buys <= sells:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "Fresh one-hour trade flow does not show more buys than sells"
+            )
+            return
+
+        sol_price = self.market.sol_price_usd()
+        hard_cap = min(
+            0.50,
+            float(self.s.trending_discovery_max_entry_usd),
+            float(entry_cap_usd if entry_cap_usd is not None else self.s.trending_discovery_max_entry_usd),
+            float(self.s.max_entry_usd),
+        )
+        equity = self.equity()
+        self._refresh_risk_state(equity)
+        allowed, gate_reason = self._can_enter(
+            equity, strategy="trending_discovery", entry_cap_usd=hard_cap
+        )
+        if not allowed:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "Portfolio risk gate blocked trending entry: " + gate_reason
+            )
+            return
+        room = max(0.0, float(self.s.max_total_exposure_usd) - self._current_positions_value())
+        spend = min(hard_cap, room)
+        if spend < 0.10:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "Less than $0.10 portfolio exposure headroom remains"
+            )
+            return
+        amount_lamports = int(spend / sol_price * 1_000_000_000)
+        if amount_lamports <= 0:
+            self.trending_scanner.set_live_status(mint, "blocked", "SOL input rounds to zero")
+            return
+
+        self.trending_scanner.set_live_status(
+            mint, "submitting", f"Submitting Jupiter Ultra buy with swap input capped at ${spend:.2f}"
+        )
+        source_signature = str(signal.get("signature") or f"trending-discovery-{mint}-{int(time.time())}")
+        try:
+            before_token = self.executor.token_balance_raw(self.wallet_address, mint)
+            before_sol = self.rpc.sol_balance_lamports(self.wallet_address)
+        except Exception as exc:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", f"Could not establish pre-trade wallet balances ({type(exc).__name__})"
+            )
+            return
+        try:
+            result = self.trending_executor.swap(
+                owner=self.wallet_address,
+                keypair=self.keypair,
+                input_mint="So11111111111111111111111111111111111111112",
+                output_mint=mint,
+                amount_raw=amount_lamports,
+                action="buy",
+                output_decimals=decimals,
+                expected_price_usd=price,
+                input_value_usd=spend,
+                max_price_impact_pct=float(self.s.trending_max_price_impact_pct),
+            )
+        except TransactionOutcomeUncertain as exc:
+            self._handle_uncertain_trade(exc, source_wallet=None, source_signature=source_signature)
+            self.trending_scanner.set_live_status(
+                mint, "uncertain", "Jupiter submission outcome is uncertain; verify signature and wallet balances before any retry"
+            )
+            return
+        except TransactionFailedOnChain as exc:
+            self.trending_scanner.set_live_status(
+                mint, "failed", f"Jupiter confirmed on-chain failure: {str(exc.detail)[:350]}"
+            )
+            logger.warning("Trending live buy failed on-chain mint=%s signature=%s", mint[:8], exc.signature)
+            return
+        except (TransactionBuildFailed, TransactionSimulationFailed) as exc:
+            self.trending_scanner.set_live_status(
+                mint, "failed", f"Jupiter pre-submit checks blocked the order: {str(exc)[:350]}"
+            )
+            logger.warning("Trending live buy blocked before submission mint=%s: %s", mint[:8], exc)
+            return
+
+        tx_sig = str(result.get("signature") or "")
+        try:
+            after_token = self.executor.token_balance_raw(self.wallet_address, mint)
+            after_sol = self.rpc.sol_balance_lamports(self.wallet_address)
+        except Exception as exc:
+            uncertain = TransactionOutcomeUncertain(
+                tx_sig, "buy", mint,
+                f"Swap reported success but wallet balance delta could not be verified ({type(exc).__name__})",
+            )
+            self._handle_uncertain_trade(uncertain, source_wallet=None, source_signature=source_signature)
+            self.trending_scanner.set_live_status(
+                mint, "uncertain", "Jupiter reported success, but actual output balance could not be reconciled"
+            )
+            return
+        raw_out = int(after_token) - int(before_token)
+        sol_delta_lamports = int(after_sol) - int(before_sol)
+        if raw_out <= 0 or sol_delta_lamports >= 0 or not tx_sig:
+            uncertain = TransactionOutcomeUncertain(
+                tx_sig or "signature-unavailable", "buy", mint,
+                "Jupiter reported success but token output/SOL debit did not reconcile to the wallet",
+            )
+            self._handle_uncertain_trade(uncertain, source_wallet=None, source_signature=source_signature)
+            self.trending_scanner.set_live_status(
+                mint, "uncertain", "Reported swap did not reconcile to a positive token balance and SOL debit"
+            )
+            return
+
+        total_supply_tokens = float(signal.get("total_supply_tokens") or self._read_total_supply_tokens(mint) or 0)
+        effective_price = spend / raw_to_units(raw_out, decimals)
+        cost_basis = abs(sol_delta_lamports) / 1_000_000_000 * sol_price
+        timestamp = datetime.now(timezone.utc).isoformat()
+        position = {
+            "mint": mint, "decimals": decimals, "amount_raw": str(raw_out),
+            "entry_price_usd": effective_price, "initial_amount_raw": str(raw_out),
+            "peak_price_usd": effective_price, "tp1_done": 0, "tp2_done": 0,
+            "opened_at": timestamp, "last_price_usd": effective_price,
+            "invested_usd": cost_basis, "source_wallet": None,
+            "source_signature": source_signature, "strategy": "trending_discovery",
+            "total_supply_tokens": total_supply_tokens,
+            "entry_market_cap_usd": effective_price * total_supply_tokens if total_supply_tokens > 0 else 0.0,
+            "entry_market_cap_source": (
+                "Estimated: actual Jupiter swap notional per token × total supply (FDV-style)"
+                if total_supply_tokens > 0 else ""
+            ),
+        }
+        self.store.upsert_position(position)
+        self.store.set_state(f"pool:{mint}", "jupiter")
+        self.store.increment_daily_entries()
+        self.store.add_trade(
+            mode=self.s.mode, action="BUY", mint=mint, amount_raw=str(raw_out),
+            price_usd=effective_price, value_usd=cost_basis,
+            reason="trending-token Jupiter Ultra buy",
+            source_wallet=None, source_signature=source_signature,
+            tx_signature=tx_sig, strategy="trending_discovery",
+        )
+        self.price_cache[mint] = effective_price
+        self.price_cache_at[mint] = time.time()
+        self.store.set_state(f"exit_blocked_balance_zero:{mint}", "")
+        self.trending_scanner.set_live_status(
+            mint, "opened", f"Jupiter Ultra buy confirmed and reconciled; swap input cap ${spend:.2f}"
+        )
+        self._refresh_feed_subscriptions()
+        logger.warning(
+            "TRENDING LIVE BUY confirmed mint=%s input_cap=$%.2f actual_wallet_debit=$%.4f",
+            mint[:8], spend, cost_basis,
+        )
+        logger.warning("Live transaction confirmed: https://solscan.io/tx/%s", tx_sig)
+
     def buy(
         self, signal: dict, *, strategy: str = "leader_copy",
         entry_cap_usd: float | None = None,
     ):
+        if strategy == "trending_discovery":
+            return self._buy_trending_discovery(signal, entry_cap_usd=entry_cap_usd)
         mint = signal["mint"]
         if strategy == "token_discovery":
             if (
                 self.s.mode != "live"
-                or not self.s.token_discovery_enabled
-                or not self.s.token_discovery_live_enabled
+                or not self._runtime_discovery_flag("token_discovery", "enabled", "token_discovery_enabled")
+                or not self._runtime_discovery_flag("token_discovery", "live_enabled", "token_discovery_live_enabled")
                 or signal.get("source") != "token_discovery"
                 or signal.get("fresh_security_verified") is not True
             ):
@@ -1198,12 +1649,16 @@ class PumpFunBot:
         # Do not allow a websocket signal to bypass the minimum liquidity floor.
         # Discovery can use the canonical on-chain curve only after its fresh
         # security/liquidity checks; regular leader-copy entries need indexed market data.
-        allow_verified_curve_age_bypass = (
-            strategy == "token_discovery"
-            and self.s.allow_unindexed_pump_curve
-            and curve_state_verified
-            and curve_liquidity >= self.s.min_liquidity_usd
-            and venue == "pump"
+        # A scanner-certified discovery candidate may use its verified on-chain
+        # bonding curve as the market source before DEX Screener indexes the pair.
+        # This does not apply to leader-copy buys and never bypasses security,
+        # real-curve liquidity, price, portfolio-risk, or transaction checks.
+        allow_verified_curve_age_bypass = verified_curve_fallback_allowed(
+            signal,
+            strategy=strategy,
+            venue=venue,
+            curve_liquidity_usd=curve_liquidity,
+            minimum_liquidity_usd=max(self.s.min_liquidity_usd, portfolio_liquidity_floor),
         )
         unindexed_pump_entry = (
             allow_verified_curve_age_bypass
@@ -1211,7 +1666,7 @@ class PumpFunBot:
         )
         if market is None and not allow_verified_curve_age_bypass:
             logger.info(
-                "Reject buy %s: indexed market pair unavailable and unindexed-entry bypass is disabled",
+                "Reject buy %s: indexed market pair unavailable and fresh verified on-chain curve fallback criteria were not met",
                 mint[:8],
             )
             return
@@ -1224,8 +1679,8 @@ class PumpFunBot:
             return
         if unindexed_pump_entry:
             logger.warning(
-                "HIGH-RISK unindexed Pump launch entry for %s: no verified indexed liquidity; "
-                "fixed entry/exposure caps apply, but exit liquidity is not assured",
+                "Verified-curve Pump launch entry for %s without a DEX-indexed pair: "
+                "on-chain curve liquidity passed; fixed entry/exposure caps apply, but exit liquidity is not assured",
                 mint,
             )
 
@@ -1498,134 +1953,229 @@ class PumpFunBot:
             tx_sig = "PAPER-SELL"
         else:
             assert self.keypair is not None and self.wallet_address is not None
-            available = self.executor.token_balance_raw(self.wallet_address, mint)
-            requested_raw = min(requested_raw, available)
-            if requested_raw <= 0:
-                # Before pausing, look for an on-chain full Pump/PumpSwap sale after
-                # this position opened. Only an exact quantity match, wallet signature,
-                # successful execution and zero post-balance can reconcile the ledger.
-                # This is read-only chain inspection; it never retries/submits a sale.
-                evidence = None
-                if available <= 0:
-                    finder = getattr(self.executor, "find_confirmed_full_sale", None)
-                    if callable(finder):
-                        try:
-                            evidence = finder(
-                                owner=self.wallet_address,
-                                mint=mint,
-                                expected_raw=int(position.get("amount_raw") or 0),
-                                opened_at=str(position.get("opened_at") or ""),
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "Could not inspect prior full-sale history for %s: %s",
-                                mint[:8], " ".join(str(exc).split())[:220],
-                            )
-                if evidence:
-                    tx_signature = str(evidence.get("signature") or "")
-                    try:
-                        exited_at = datetime.fromtimestamp(
-                            int(evidence.get("block_time") or 0), timezone.utc
-                        ).isoformat(timespec="seconds")
-                    except (TypeError, ValueError, OverflowError, OSError):
-                        exited_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                    reconcile_reason = (
-                        "Verified on-chain full Pump/PumpSwap sell; stale position reconciled "
-                        f"from confirmed signature {tx_signature}. Historical USD proceeds and "
-                        "realized P&L were not recorded and are intentionally left unestimated."
+            if position.get("strategy", "leader_copy") == "trending_discovery":
+                try:
+                    available = self.executor.token_balance_raw(self.wallet_address, mint)
+                except Exception as exc:
+                    logger.error("Cannot confirm trending-token balance for %s: %s", mint[:8], type(exc).__name__)
+                    return False
+                requested_raw = min(requested_raw, available)
+                if requested_raw <= 0:
+                    self.store.set_state(
+                        f"exit_blocked_balance_zero:{mint}",
+                        "Wallet reports zero trending-token balance; inspect Jupiter transaction history before reconciling.",
                     )
-                    reconciled = self.store.reconcile_confirmed_full_exit(
-                        position,
-                        mode=self.s.mode,
-                        tx_signature=tx_signature,
-                        ts=exited_at,
-                        reason=reconcile_reason,
-                    )
-                    if reconciled:
-                        self.price_cache.pop(mint, None)
-                        self.price_cache_at.pop(mint, None)
+                    self.store.set_state(pending_key, "")
+                    self.store.set_state(pending_amount_key, "")
+                    self.store.set_state(pending_wallet_key, "")
+                    self.store.set_state(pending_signature_key, "")
+                    if manual_exit:
                         self.message = (
-                            f"Reconciled confirmed on-chain full exit for {mint[:8]}; no new sell "
-                            "was submitted. Historical USD proceeds/P&L are unavailable in the ledger."
+                            f"Manual exit for {mint[:8]} paused: token balance is zero and no "
+                            "confirmed Jupiter sale has been reconciled."
                         )
-                        logger.warning(
-                            "Reconciled stale position mint=%s from confirmed full-sale signature=%s; "
-                            "no transaction submitted and no historical P&L inferred",
-                            mint[:8], tx_signature,
+                    return False
+                before_raw = available
+                try:
+                    sell_sol_price_usd = self.market.sol_price_usd()
+                    before_sol = self.rpc.sol_balance_lamports(self.wallet_address)
+                except Exception as exc:
+                    logger.error("Cannot read SOL balance before trending sell %s: %s", mint[:8], type(exc).__name__)
+                    return False
+                try:
+                    jupiter_result = self.trending_executor.swap(
+                        owner=self.wallet_address,
+                        keypair=self.keypair,
+                        input_mint=mint,
+                        output_mint="So11111111111111111111111111111111111111112",
+                        amount_raw=requested_raw,
+                        action="sell",
+                        output_decimals=9,
+                    )
+                    tx_sig = str(jupiter_result.get("signature") or "")
+                    if not tx_sig:
+                        raise TransactionOutcomeUncertain(
+                            "signature-unavailable", "sell", mint,
+                            "Jupiter reported success but did not provide a transaction signature",
                         )
+                except TransactionOutcomeUncertain as exc:
+                    self._handle_uncertain_trade(
+                        exc, source_wallet=source_wallet, source_signature=source_signature,
+                    )
+                    return False
+                except TransactionFailedOnChain as exc:
+                    delay = self._defer_native_build_retry(mint, str(exc))
+                    logger.warning(
+                        "Jupiter trending sell failed on-chain mint=%s; retry deferred %ds: %s",
+                        mint[:8], delay, str(exc)[:250],
+                    )
+                    return False
+                except (TransactionBuildFailed, TransactionSimulationFailed) as exc:
+                    detail = " ".join(str(exc).split())[:300]
+                    delay = self._defer_native_build_retry(mint, detail)
+                    if manual_exit:
+                        self.message = (
+                            f"Manual trending exit for {mint[:8]} was not submitted; "
+                            f"retry deferred {delay}s. {detail}"
+                        )
+                    logger.warning("Jupiter trending sell not submitted mint=%s: %s", mint[:8], detail)
+                    return False
+                try:
+                    after_raw = self.executor.token_balance_raw(self.wallet_address, mint)
+                    after_sol = self.rpc.sol_balance_lamports(self.wallet_address)
+                except Exception as exc:
+                    uncertain = TransactionOutcomeUncertain(
+                        tx_sig or "signature-unavailable", "sell", mint,
+                        f"Jupiter reported success but balance reconciliation failed ({type(exc).__name__})",
+                    )
+                    self._handle_uncertain_trade(
+                        uncertain, source_wallet=source_wallet, source_signature=source_signature,
+                    )
+                    return False
+                sold_raw = before_raw - int(after_raw)
+                sol_delta_lamports = int(after_sol) - int(before_sol)
+                if sold_raw <= 0 or sold_raw > requested_raw or sol_delta_lamports <= 0:
+                    uncertain = TransactionOutcomeUncertain(
+                        tx_sig or "signature-unavailable", "sell", mint,
+                        "Jupiter reported success but token reduction/native SOL proceeds did not reconcile",
+                    )
+                    self._handle_uncertain_trade(
+                        uncertain, source_wallet=source_wallet, source_signature=source_signature,
+                    )
+                    return False
+                tx_sig = self.store.get_state(f"unresolved_trade_signature:{mint}", "") or "JUPITER_CONFIRMED"
+                proceeds = (sol_delta_lamports / 1_000_000_000) * sell_sol_price_usd
+                units_sold = raw_to_units(sold_raw, decimals)
+            else:
+                available = self.executor.token_balance_raw(self.wallet_address, mint)
+                requested_raw = min(requested_raw, available)
+                if requested_raw <= 0:
+                    # Before pausing, look for an on-chain full Pump/PumpSwap sale after
+                    # this position opened. Only an exact quantity match, wallet signature,
+                    # successful execution and zero post-balance can reconcile the ledger.
+                    # This is read-only chain inspection; it never retries/submits a sale.
+                    evidence = None
+                    if available <= 0:
+                        finder = getattr(self.executor, "find_confirmed_full_sale", None)
+                        if callable(finder):
+                            try:
+                                evidence = finder(
+                                    owner=self.wallet_address,
+                                    mint=mint,
+                                    expected_raw=int(position.get("amount_raw") or 0),
+                                    opened_at=str(position.get("opened_at") or ""),
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "Could not inspect prior full-sale history for %s: %s",
+                                    mint[:8], " ".join(str(exc).split())[:220],
+                                )
+                    if evidence:
+                        tx_signature = str(evidence.get("signature") or "")
                         try:
-                            self._refresh_feed_subscriptions()
-                        except Exception:
-                            logger.exception("Could not refresh subscriptions after exit reconciliation")
-                        return True
-
-                detail = (
-                    "Configured wallet reports zero token balance; no matching full Pump/PumpSwap "
-                    "sale was verified after the position opened."
-                )
-                self.store.set_state(f"exit_blocked_balance_zero:{mint}", detail)
-                # Stop repeated attempts. Keep the ledger position visible until a
-                # human can reconcile it or a later fresh history check succeeds.
-                self.store.set_state(f"exit_pending:{mint}", "")
-                self.store.set_state(f"exit_pending_amount_raw:{mint}", "")
-                self.store.set_state(f"exit_pending_source_wallet:{mint}", "")
-                self.store.set_state(f"exit_pending_source_signature:{mint}", "")
-                if manual_exit:
-                    self.message = (
-                        f"Manual exit for {mint[:8]} paused: zero wallet balance and no matching full-sale "
-                        "transaction could be verified. Position retained for reconciliation."
+                            exited_at = datetime.fromtimestamp(
+                                int(evidence.get("block_time") or 0), timezone.utc
+                            ).isoformat(timespec="seconds")
+                        except (TypeError, ValueError, OverflowError, OSError):
+                            exited_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                        reconcile_reason = (
+                            "Verified on-chain full Pump/PumpSwap sell; stale position reconciled "
+                            f"from confirmed signature {tx_signature}. Historical USD proceeds and "
+                            "realized P&L were not recorded and are intentionally left unestimated."
+                        )
+                        reconciled = self.store.reconcile_confirmed_full_exit(
+                            position,
+                            mode=self.s.mode,
+                            tx_signature=tx_signature,
+                            ts=exited_at,
+                            reason=reconcile_reason,
+                        )
+                        if reconciled:
+                            self.price_cache.pop(mint, None)
+                            self.price_cache_at.pop(mint, None)
+                            self.message = (
+                                f"Reconciled confirmed on-chain full exit for {mint[:8]}; no new sell "
+                                "was submitted. Historical USD proceeds/P&L are unavailable in the ledger."
+                            )
+                            logger.warning(
+                                "Reconciled stale position mint=%s from confirmed full-sale signature=%s; "
+                                "no transaction submitted and no historical P&L inferred",
+                                mint[:8], tx_signature,
+                            )
+                            try:
+                                self._refresh_feed_subscriptions()
+                            except Exception:
+                                logger.exception("Could not refresh subscriptions after exit reconciliation")
+                            return True
+    
+                    detail = (
+                        "Configured wallet reports zero token balance; no matching full Pump/PumpSwap "
+                        "sale was verified after the position opened."
                     )
-                logger.error(
-                    "Sell paused for %s: zero token balance and no verified matching full-sale transaction; "
-                    "position retained and automatic retry suppressed",
-                    mint,
-                )
-                return False
-            units_requested = raw_to_units(requested_raw, decimals)
-            preferred = self.store.get_state(f"pool:{mint}", "pump")
-            try:
-                result = self.executor.trade(
-                    owner=self.wallet_address, keypair=self.keypair, mint=mint, action="sell",
-                    amount=units_requested, denominated_in_sol=False,
-                    slippage_bps=self.s.slippage_bps, preferred_pool=preferred,
-                    amount_raw=requested_raw,
-                )
-            except TransactionExpiredNotLanded as exc:
-                self._handle_expired_not_landed_trade(
-                    exc,
-                    source_wallet=source_wallet,
-                    source_signature=source_signature,
-                    reason=reason,
-                )
-                return False
-            except TransactionOutcomeUncertain as exc:
-                self._handle_uncertain_trade(
-                    exc,
-                    source_wallet=source_wallet,
-                    source_signature=source_signature,
-                )
-                return False
-            except TransactionBuildFailed as exc:
-                detail = " ".join(str(exc).split())[:220]
-                delay = self._defer_native_build_retry(mint, detail)
-                if manual_exit:
-                    self.message = (
-                        f"Manual exit for {mint[:8]} was not submitted: builder failed before signing; "
-                        f"retry deferred {delay}s. {detail}"
+                    self.store.set_state(f"exit_blocked_balance_zero:{mint}", detail)
+                    # Stop repeated attempts. Keep the ledger position visible until a
+                    # human can reconcile it or a later fresh history check succeeds.
+                    self.store.set_state(f"exit_pending:{mint}", "")
+                    self.store.set_state(f"exit_pending_amount_raw:{mint}", "")
+                    self.store.set_state(f"exit_pending_source_wallet:{mint}", "")
+                    self.store.set_state(f"exit_pending_source_signature:{mint}", "")
+                    if manual_exit:
+                        self.message = (
+                            f"Manual exit for {mint[:8]} paused: zero wallet balance and no matching full-sale "
+                            "transaction could be verified. Position retained for reconciliation."
+                        )
+                    logger.error(
+                        "Sell paused for %s: zero token balance and no verified matching full-sale transaction; "
+                        "position retained and automatic retry suppressed",
+                        mint,
                     )
-                logger.error(
-                    "Could not build sell for %s; no transaction was signed or submitted. "
-                    "Tracked position and pending exit are retained; retry deferred %ds: %s",
-                    mint[:8], delay, detail,
-                )
-                return False
-            tx_sig = result["signature"]
-            sold_raw = abs(int(result["token_delta_raw"]))
-            sol_received = max(0, int(result["sol_delta_lamports"])) / 1_000_000_000
-            proceeds = sol_received * self.market.sol_price_usd()
-            units_sold = raw_to_units(sold_raw, decimals)
-            if sold_raw <= 0:
-                raise RuntimeError("PumpPortal confirmed sell without a token balance decrease")
+                    return False
+                units_requested = raw_to_units(requested_raw, decimals)
+                preferred = self.store.get_state(f"pool:{mint}", "pump")
+                try:
+                    result = self.executor.trade(
+                        owner=self.wallet_address, keypair=self.keypair, mint=mint, action="sell",
+                        amount=units_requested, denominated_in_sol=False,
+                        slippage_bps=self.s.slippage_bps, preferred_pool=preferred,
+                        amount_raw=requested_raw,
+                    )
+                except TransactionExpiredNotLanded as exc:
+                    self._handle_expired_not_landed_trade(
+                        exc,
+                        source_wallet=source_wallet,
+                        source_signature=source_signature,
+                        reason=reason,
+                    )
+                    return False
+                except TransactionOutcomeUncertain as exc:
+                    self._handle_uncertain_trade(
+                        exc,
+                        source_wallet=source_wallet,
+                        source_signature=source_signature,
+                    )
+                    return False
+                except TransactionBuildFailed as exc:
+                    detail = " ".join(str(exc).split())[:220]
+                    delay = self._defer_native_build_retry(mint, detail)
+                    if manual_exit:
+                        self.message = (
+                            f"Manual exit for {mint[:8]} was not submitted: builder failed before signing; "
+                            f"retry deferred {delay}s. {detail}"
+                        )
+                    logger.error(
+                        "Could not build sell for %s; no transaction was signed or submitted. "
+                        "Tracked position and pending exit are retained; retry deferred %ds: %s",
+                        mint[:8], delay, detail,
+                    )
+                    return False
+                tx_sig = result["signature"]
+                sold_raw = abs(int(result["token_delta_raw"]))
+                sol_received = max(0, int(result["sol_delta_lamports"])) / 1_000_000_000
+                proceeds = sol_received * self.market.sol_price_usd()
+                units_sold = raw_to_units(sold_raw, decimals)
+                if sold_raw <= 0:
+                    raise RuntimeError("PumpPortal confirmed sell without a token balance decrease")
+    
 
         basis = float(position["invested_usd"]) * (sold_raw / current_raw)
         realized_pnl = proceeds - basis
@@ -1662,6 +2212,11 @@ class PumpFunBot:
                         f"Live position fully exited via {reason}; realized P&L ${realized_pnl:+.4f}"
                     )
                     discovery._save(candidate)
+            elif strategy == "trending_discovery":
+                self.trending_scanner.set_live_status(
+                    mint, "closed",
+                    f"Trending live position fully exited via {reason}; realized P&L ${realized_pnl:+.4f}",
+                )
         else:
             self.price_cache[mint] = mark_price
             self.price_cache_at[mint] = time.time()
@@ -1720,18 +2275,252 @@ class PumpFunBot:
             detail += "; transient preflight retry limit reached, no buy submitted"
         self._set_discovery_live_status(candidate, status, detail)
 
+    def _process_trending_live_entries(self) -> None:
+        """Consider only freshly screened trending candidates; each mint gets one live attempt."""
+        if (
+            self.s.mode != "live"
+            or not self._runtime_discovery_flag("trending_scanner", "enabled", "trending_discovery_enabled")
+            or not self._runtime_discovery_flag("trending_scanner", "live_enabled", "trending_discovery_live_enabled")
+        ):
+            return
+
+        # Do not burn candidate one-shot state while another discovery strategy
+        # already owns the single discovery slot. Re-evaluate after it exits.
+        if any(
+            p.get("strategy", "leader_copy") in {"token_discovery", "trending_discovery"}
+            for p in self.store.list_positions()
+        ):
+            return
+
+        now = time.time()
+        freshness_seconds = max(90, min(180, self.s.trending_discovery_poll_seconds + 30))
+        candidates = self.trending_scanner.dashboard_snapshot().get("candidates", [])
+        for original in candidates:
+            if str(original.get("status") or "") != "SCREENED":
+                continue
+            mint = str(original.get("mint") or "")
+            if not mint:
+                continue
+            prior_status = self.store.get_state(f"trending_live_status:{mint}", "")
+            # Submitted/checking candidates surviving a process restart are ambiguous;
+            # reconcile rather than leaving the UI stuck or accidentally replaying.
+            if prior_status:
+                if prior_status in {"checking", "submitting"}:
+                    _, _, prior_at = self.trending_scanner._stored_live_status(mint)
+                    if prior_at < self.run_started_at:
+                        self.trending_scanner.set_live_status(
+                            mint, "needs_reconciliation",
+                            "Previous process ended during a live entry attempt; inspect wallet balances and transaction history. No retry.",
+                        )
+                continue
+            try:
+                updated_at = float(original.get("updated_at") or 0)
+                pool_created_at = float(original.get("pool_created_at") or 0)
+            except (TypeError, ValueError):
+                updated_at, pool_created_at = 0.0, 0.0
+            if updated_at <= 0 or now - updated_at > freshness_seconds or updated_at > now + 5:
+                self.trending_scanner.set_live_status(
+                    mint, "skipped_stale", "Trending/risk screen is stale; a fresh scan is required"
+                )
+                continue
+            if (
+                pool_created_at <= 0
+                or pool_created_at > now
+                or now - pool_created_at > self.s.trending_max_pool_age_hours * 3600
+            ):
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", "Pool creation time is missing or outside the configured age window"
+                )
+                continue
+            if (
+                not original.get("dexscreener_confirmed")
+                or original.get("same_pool_crosscheck") is not True
+                or original.get("market_data_discrepancy")
+                or original.get("onchain_status") != "PASS"
+                or original.get("rugcheck_status") != "SAFE_CANDIDATE"
+            ):
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", "Independent market, on-chain mint or RugCheck result is not trade-qualified"
+                )
+                continue
+
+            # Verify the same DEX pool again just before order construction.
+            try:
+                market = self.market.token_market(mint)
+            except Exception as exc:
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", f"Fresh market recheck failed ({type(exc).__name__})"
+                )
+                continue
+            if not market:
+                self.trending_scanner.set_live_status(mint, "blocked", "Fresh DEX pool is unavailable")
+                continue
+            if str(market.get("pair_address") or "") != str(original.get("dexscreener_pair_address") or ""):
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", "Highest-liquidity DEX pair changed since screening"
+                )
+                continue
+            raw_market = market.get("raw") or {}
+            liquidity = float(market.get("liquidity_usd") or 0)
+            price = float(market.get("price_usd") or 0)
+            volume = raw_market.get("volume") or {}
+            txns = raw_market.get("txns") or {}
+            changes = raw_market.get("priceChange") or {}
+            buys = int(float(((txns.get("h1") or {}).get("buys")) or 0))
+            sells = int(float(((txns.get("h1") or {}).get("sells")) or 0))
+            volume1 = float(volume.get("h1") or 0)
+            pair_age = int(market.get("pair_age_seconds") or 0)
+            if (
+                liquidity < self.s.trending_min_liquidity_usd
+                or volume1 < self.s.trending_min_volume_1h_usd
+                or price <= 0
+                or pair_age < self.s.min_pair_age_seconds
+            ):
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", "Fresh same-pool price/liquidity/volume/age requirements no longer pass"
+                )
+                continue
+            if buys <= sells:
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", "Fresh DEX one-hour trade flow no longer favors buys"
+                )
+                continue
+
+            gecko_liquidity = float(original.get("gecko_liquidity_usd") or original.get("liquidity_usd") or 0)
+            gecko_volume = float(original.get("volume_1h_usd") or 0)
+            dex_liquidity = liquidity
+            if gecko_liquidity > 0 and max(gecko_liquidity, dex_liquidity) / min(gecko_liquidity, dex_liquidity) > 3:
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", "Fresh DEX and GeckoTerminal liquidity now disagree by more than 3x"
+                )
+                continue
+            if gecko_volume > 0 and volume1 > 0 and max(gecko_volume, volume1) / min(gecko_volume, volume1) > 5:
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", "Fresh DEX and GeckoTerminal one-hour volume now disagree by more than 5x"
+                )
+                continue
+            if (
+                changes.get("h1") is not None
+                and abs(float(original.get("change_1h_pct") or 0) - float(changes.get("h1") or 0)) > 40
+            ):
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", "Fresh DEX and GeckoTerminal one-hour price changes disagree by more than 40 points"
+                )
+                continue
+
+            fresh_candidate = dict(original)
+            fresh_candidate.update({
+                "liquidity_usd": min(gecko_liquidity, dex_liquidity) if gecko_liquidity > 0 else dex_liquidity,
+                "volume_1h_usd": volume1,
+                "volume_24h_usd": float(volume.get("h24") or 0),
+                "change_1h_pct": float(changes.get("h1") or 0),
+                "change_24h_pct": float(changes.get("h24") or 0),
+                "buys_1h": buys,
+                "sells_1h": sells,
+                "dexscreener_buys_1h": buys,
+                "dexscreener_sells_1h": sells,
+                "risk_flags": list(original.get("risk_flags") or []),
+            })
+            # Refresh on-chain mint controls and RugCheck again immediately before trading.
+            try:
+                fresh_candidate = self.trending_scanner._evaluate(fresh_candidate)
+            except Exception as exc:
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", f"Fresh mint/RugCheck recheck failed ({type(exc).__name__})"
+                )
+                continue
+            if fresh_candidate.get("status") != "SCREENED":
+                self.trending_scanner.set_live_status(
+                    mint, "blocked",
+                    "Fresh security recheck did not pass: " + str(fresh_candidate.get("decision") or "unknown"),
+                )
+                continue
+            if int(fresh_candidate.get("momentum_score") or 0) < self.s.trending_min_score:
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", f"Fresh momentum score is below {self.s.trending_min_score}/100"
+                )
+                continue
+
+            try:
+                mint_account = self.rpc.call(
+                    "getAccountInfo", [mint, {"encoding": "jsonParsed", "commitment": "confirmed"}]
+                ) or {}
+                account = mint_account.get("value") or {}
+                info = ((((account.get("data") or {}).get("parsed") or {}).get("info")) or {})
+                decimals = int(info.get("decimals", -1))
+                supply_raw = int(info.get("supply") or 0)
+                if decimals < 0 or decimals > 18 or supply_raw <= 0:
+                    raise ValueError("invalid token decimals/supply")
+                total_supply_tokens = supply_raw / (10 ** decimals)
+            except Exception as exc:
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", f"Could not verify fresh mint decimals/supply ({type(exc).__name__})"
+                )
+                continue
+
+            # Every candidate is recorded as checked before the one-shot buy path begins.
+            self.trending_scanner.set_live_status(
+                mint, "checking", "Fresh same-pool, mint, holder-risk and RugCheck gates passed; verifying portfolio budget"
+            )
+            signal = {
+                "mint": mint,
+                "wallet": "",
+                "signature": f"trending-discovery-{mint}-{int(updated_at * 1000)}",
+                "side": "buy",
+                "amount_ui": 0.0,
+                "decimals": decimals,
+                "total_supply_tokens": total_supply_tokens,
+                "observed_price_usd": price,
+                "source": "trending_discovery",
+                "fresh_security_verified": True,
+                "status": "SCREENED",
+                "momentum_score": int(fresh_candidate.get("momentum_score") or 0),
+                "real_liquidity_usd": liquidity,
+                "volume_1h_usd": volume1,
+                "dexscreener_buys_1h": buys,
+                "dexscreener_sells_1h": sells,
+                "dexscreener_pair_address": str(market.get("pair_address") or ""),
+                "same_pool_crosscheck": True,
+                "market_data_discrepancy": False,
+                "rugcheck_status": fresh_candidate.get("rugcheck_status"),
+                "onchain_status": fresh_candidate.get("onchain_status"),
+                "market_cap_usd": fresh_candidate.get("market_cap_usd"),
+            }
+            try:
+                self.buy(
+                    signal,
+                    strategy="trending_discovery",
+                    entry_cap_usd=min(0.50, float(self.s.trending_discovery_max_entry_usd)),
+                )
+            except Exception as exc:
+                # A failure after an external order call may be ambiguous. Never
+                # auto-retry a candidate that has been marked checking/submitting.
+                if self.store.get_state(f"unresolved_trade:{mint}", ""):
+                    status = "uncertain"
+                    reason = "Live submission remains unresolved; reconcile signature and wallet balance before any retry"
+                elif self.store.get_position(mint):
+                    status = "opened"
+                    reason = "Position exists in the ledger after the live call; inspect the confirmed transaction"
+                else:
+                    status = "failed"
+                    reason = f"Unexpected live-entry error ({type(exc).__name__}); candidate consumed with no automatic retry"
+                self.trending_scanner.set_live_status(mint, status, reason)
+                logger.exception("Trending live entry failed mint=%s status=%s", mint[:8], status)
+            # At most one candidate can initiate execution per bot loop.
+            return
+
     def _process_discovery_live_entries(self) -> None:
         """Turn only fresh, newly-qualified shadow entries into small opt-in live buys."""
         if (
             self.s.mode != "live"
-            or not self.s.token_discovery_enabled
-            or not self.s.token_discovery_live_enabled
+            or not self._runtime_discovery_flag("token_discovery", "enabled", "token_discovery_enabled")
+            or not self._runtime_discovery_flag("token_discovery", "live_enabled", "token_discovery_live_enabled")
         ):
             return
 
         now = time.time()
         hard_cap = min(0.50, float(self.s.token_discovery_max_entry_usd))
-        for candidate in self.token_discovery.candidates(300):
+        for candidate in self.token_discovery.candidates(10000):
             if candidate.get("status") != "shadow_open" or not candidate.get("would_buy"):
                 continue
             live_status = str(candidate.get("live_entry_status") or "")
@@ -1770,10 +2559,17 @@ class PumpFunBot:
                 observed_launch_at = float(candidate.get("created_at") or entry_at)
             except (TypeError, ValueError):
                 observed_launch_at = entry_at
-            if observed_launch_at > now or now - observed_launch_at > max_age_hours * 3600:
+            max_entry_age_seconds = max(
+                60, min(600, int(getattr(self.s, "token_discovery_max_entry_age_seconds", 300)))
+            )
+            if (
+                observed_launch_at > now
+                or now - observed_launch_at > max_age_hours * 3600
+                or now - observed_launch_at > max_entry_age_seconds
+            ):
                 self._set_discovery_live_status(
                     candidate, "skipped_stale",
-                    f"Launch event is outside the maximum {max_age_hours}-hour age window; no live buy",
+                    f"Launch is older than the {max_entry_age_seconds}s sniper entry window; no live buy",
                 )
                 continue
 
@@ -2043,7 +2839,13 @@ class PumpFunBot:
             if price <= entry * (1 - self.s.max_marked_loss_pct):
                 self.sell(mint, current_raw, "marked loss stop")
                 continue
-            if peak > entry and price <= peak * (1 - self.s.trailing_stop_pct):
+            # Do not trail a small unbanked bounce into an early full exit. Arm
+            # the trailing stop only after TP1 has actually sold part of the position.
+            if (
+                int(position["tp1_done"])
+                and peak > entry
+                and price <= peak * (1 - self.s.trailing_stop_pct)
+            ):
                 self.sell(mint, current_raw, "trailing stop")
                 continue
             if not int(position["tp1_done"]) and price >= entry * (1 + self.s.take_profit_1_pct):
@@ -2131,6 +2933,32 @@ class PumpFunBot:
             if self.store.signature_seen(dedupe_key):
                 cursor_candidate = signature
                 continue
+            # Never replay an old leader trade after an RPC outage. A stale
+            # signature is marked consumed and advances the cursor, but no buy/sell
+            # is generated from it. Unknown timestamps are skipped rather than guessed fresh.
+            try:
+                max_signal_age = max(
+                    5,
+                    min(300, int(__import__("os").getenv("MAX_COPY_SIGNAL_AGE_SECONDS", "30"))),
+                )
+            except (TypeError, ValueError):
+                max_signal_age = 30
+            block_time = row.get("blockTime")
+            try:
+                signal_age = time.time() - float(block_time) if block_time is not None else float("inf")
+            except (TypeError, ValueError, OverflowError):
+                signal_age = float("inf")
+            if signal_age < 0 or signal_age > max_signal_age:
+                logger.info(
+                    "Skipping stale/undated watched-wallet signature %s (age=%s); "
+                    "marking consumed without copying",
+                    signature[:12],
+                    "unknown" if signal_age == float("inf") else f"{signal_age:.1f}s",
+                )
+                self.store.mark_signature_seen(dedupe_key, wallet)
+                cursor_candidate = signature
+                handled += 1
+                continue
             try:
                 signals = self.detect_pump_signal(wallet, signature)
             except SolanaRPCRateLimited:
@@ -2156,7 +2984,7 @@ class PumpFunBot:
 
     def status(self):
         equity = self.equity()
-        logger.warning("MODE=%s wallet=%s equity=%.4f USD initial=%.4f halted=%s reason=%s",
+        logger.warning("MODE=%s wallet=%s equity=%.4f USD initial=%.4f automatic_global_halts=disabled legacy_halt_state=%s reason=%s",
                        self.s.mode, self.wallet_address or "(paper)", equity,
                        float(self.store.get_state("initial_equity", "10")),
                        self.store.get_state("halted", "0"), self.store.get_state("halt_reason", ""))
@@ -2192,12 +3020,8 @@ class PumpFunBot:
                 logger.error("RPC fallback monitor failed for %s: %s", wallet[:8], exc)
                 if self.s.mode == "live":
                     self._activate_manual_review_halt(
-                        f"RPC wallet monitoring error for {wallet}; reconcile transactions before resuming"
+                        f"RPC wallet monitoring error for {wallet}; polling will retry without a global halt"
                     )
-                    self.auto_copy_enabled = False
-                    self.store.set_state("auto_copy_enabled", "0")
-                    self.store.set_state("copy_paused", "1")
-                    self._refresh_feed_subscriptions()
 
     def run(self, once=False):
         logger.warning("Pump.fun bot mode=%s; automatic leaderboard discovery=%s",
@@ -2211,6 +3035,7 @@ class PumpFunBot:
         if not once:
             self.dashboard = DashboardServer(self.s.dashboard_port, self.dashboard_snapshot, self.commands)
             self.dashboard.start()
+            self.trending_scanner.start()
         if self.feed and not self.feed.is_alive() and not once:
             self.feed.start()
         if self.logs_feed and not self.logs_feed.is_alive() and not once:
@@ -2233,6 +3058,7 @@ class PumpFunBot:
                     self._consume_solana_log_events()
                     self.token_discovery.tick()
                     self._process_discovery_live_entries()
+                    self._process_trending_live_entries()
                     now = time.time()
 
                     if self.leaderboard_client.ready and now - self.last_leaderboard_refresh >= self.s.leaderboard_refresh_seconds:
@@ -2268,56 +3094,34 @@ class PumpFunBot:
                             expired = False
                     if expired and self.store.get_state("experiment_expired", "0") != "1":
                         self.store.set_state("experiment_expired", "1")
-                        self.auto_copy_enabled = False
-                        self.store.set_state("auto_copy_enabled", "0")
-                        self.store.set_state("copy_paused", "1")
-                        self._refresh_feed_subscriptions()
-                        logger.warning("Seven-day experiment expired; new entries disabled.")
-                    if expired:
-                        for pos in self.store.list_positions():
-                            self.store.set_state(f"exit_pending:{pos['mint']}", "experiment expiry liquidation")
+                        logger.warning(
+                            "Configured experiment duration elapsed; automatic entry halt and "
+                            "experiment-expiry liquidation are disabled."
+                        )
 
                     if now >= next_position_check:
                         self.manage_positions()
                         equity = self.equity()
                         self.last_equity_usd = equity
                         self._refresh_risk_state(equity)
-                        if self.store.get_state("halted", "0") == "1":
-                            self.auto_copy_enabled = False
-                            self.store.set_state("auto_copy_enabled", "0")
-                            self.store.set_state("copy_paused", "1")
-                            self._refresh_feed_subscriptions()
-                            for pos in self.store.list_positions():
-                                self.store.set_state(f"exit_pending:{pos['mint']}", "total loss limit liquidation")
-                            self.manage_positions()
                         self._refresh_feed_subscriptions()
                         self._publish_dashboard_state(equity)
                         open_count = len(self.store.list_positions())
                         logger.info("Heartbeat equity=%.4f positions=%d auto_copy=%s active_wallets=%d",
                                     equity, open_count, self.auto_copy_enabled, len(self.active_wallets))
-                        if expired and open_count == 0:
-                            logger.warning("Seven-day experiment finished; no tracked positions remain.")
-                            break
                         next_position_check = now + 1.5
 
                     self._publish_dashboard_state(self.last_equity_usd)
                 except KeyboardInterrupt:
                     logger.warning("Stopped by user.")
                     break
-                except Exception:
-                    logger.exception("Loop error; inspect logs before re-arming after any ambiguous transaction")
+                except Exception as exc:
+                    logger.exception("Loop error; this cycle failed; next cycle will retry")
                     if self.s.mode == "live":
                         self._activate_manual_review_halt(
-                            "Runtime exception; reconcile wallet and transactions before resuming"
+                            f"Runtime exception: {exc}; logged for diagnosis without a global entry halt"
                         )
-                        self.auto_copy_enabled = False
-                        self.store.set_state("auto_copy_enabled", "0")
-                        self.store.set_state("copy_paused", "1")
-                        try:
-                            self._refresh_feed_subscriptions()
-                        except Exception:
-                            logger.exception("Could not refresh subscriptions after entering manual-review halt")
-                    self.message = "Runtime error; inspect console. Live entries are halted pending reconciliation."
+                    self.message = "Runtime error logged; the main loop will retry and automatic global halts are disabled."
                     # The normal refresh at the bottom of the loop is skipped when
                     # manage_positions() or another step raises. Publish directly from
                     # the ledger so confirmed buys do not remain invisible in the UI.
@@ -2327,6 +3131,7 @@ class PumpFunBot:
                     break
                 time.sleep(0.20)
         finally:
+            self.trending_scanner.stop()
             if self.feed and self.feed.is_alive():
                 self.feed.stop()
             if self.logs_feed and self.logs_feed.is_alive():

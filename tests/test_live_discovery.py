@@ -4,7 +4,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from pumpfun_bot import PumpFunBot
 from pumpfun_config import PumpFunSettings
@@ -464,6 +464,108 @@ class StrategyPersistenceTests(unittest.TestCase):
             self.assertEqual(stored_position["entry_market_cap_source"], "Estimated: executed average price × total supply (FDV-style)")
             self.assertEqual(store.recent_trades(1)[0]["strategy"], "token_discovery")
             store.close()
+
+
+
+class SniperQueueConfigTests(unittest.TestCase):
+    def test_queue_and_freshness_settings_are_bounded(self):
+        with patch.dict(os.environ, {
+            "BOT_MODE": "paper",
+            "TOKEN_DISCOVERY_ENABLED": "false",
+            "TOKEN_DISCOVERY_LIVE_ENABLED": "false",
+            "TOKEN_DISCOVERY_QUEUE_SIZE": "9000",
+            "TOKEN_DISCOVERY_MAX_QUEUE_AGE_SECONDS": "9999",
+            "TOKEN_DISCOVERY_MAX_ENTRY_AGE_SECONDS": "9999",
+            "TOKEN_DISCOVERY_MAX_LAUNCHES_PER_MINUTE": "999",
+        }):
+            config = PumpFunSettings.load()
+        self.assertEqual(config.token_discovery_queue_size, 5000)
+        self.assertEqual(config.token_discovery_max_queue_age_seconds, 900)
+        self.assertEqual(config.token_discovery_max_entry_age_seconds, 600)
+        self.assertEqual(config.token_discovery_max_launches_per_minute, 60)
+
+
+class TrendingLiveExecutionGateTests(unittest.TestCase):
+    def test_trending_live_entry_is_blocked_when_separate_live_opt_in_is_off(self):
+        bot = PumpFunBot.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(
+            mode="live",
+            trending_discovery_enabled=True,
+            trending_discovery_live_enabled=False,
+        )
+        bot.trending_scanner = Mock()
+        bot._buy_trending_discovery({
+            "mint": "TrendMint11111111111111111111111111111111",
+            "source": "trending_discovery",
+            "fresh_security_verified": True,
+        })
+        bot.trending_scanner.set_live_status.assert_called_once()
+        args = bot.trending_scanner.set_live_status.call_args.args
+        self.assertEqual(args[1], "blocked")
+        self.assertIn("live opt-in", args[2].lower())
+
+    def test_trending_live_entry_is_blocked_in_paper_mode(self):
+        bot = PumpFunBot.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(
+            mode="paper",
+            trending_discovery_enabled=True,
+            trending_discovery_live_enabled=True,
+        )
+        bot.trending_scanner = Mock()
+        bot._buy_trending_discovery({
+            "mint": "TrendMint22222222222222222222222222222222",
+            "source": "trending_discovery",
+            "fresh_security_verified": True,
+        })
+        args = bot.trending_scanner.set_live_status.call_args.args
+        self.assertEqual(args[1], "blocked")
+        self.assertIn("live opt-in", args[2].lower())
+
+
+class SniperExitPolicyTests(unittest.TestCase):
+    @staticmethod
+    def _make_bot(position, mark_price):
+        bot = PumpFunBot.__new__(PumpFunBot)
+        bot.store = FakeStore([position])
+        bot.s = SimpleNamespace(
+            max_marked_loss_pct=0.25,
+            trailing_stop_pct=0.20,
+            take_profit_1_pct=0.30,
+            take_profit_2_pct=0.60,
+            take_profit_1_sell_fraction=0.40,
+            take_profit_2_sell_fraction=0.30,
+            min_hold_before_loss_exit_seconds=120,
+            emergency_loss_bypass_pct=0.50,
+        )
+        bot._mark_price = Mock(return_value=mark_price)
+        bot.sell = Mock(return_value=False)
+        return bot
+
+    @staticmethod
+    def _position(tp1_done, peak_price):
+        return {
+            "mint": "TestMint11111111111111111111111111111111111",
+            "amount_raw": 1_000_000,
+            "initial_amount_raw": 1_000_000,
+            "decimals": 6,
+            "entry_price_usd": 1.0,
+            "last_price_usd": 1.1,
+            "peak_price_usd": peak_price,
+            "tp1_done": tp1_done,
+            "tp2_done": 0,
+            "strategy": "token_discovery",
+        }
+
+    def test_trailing_stop_does_not_exit_before_take_profit_one(self):
+        bot = self._make_bot(self._position(tp1_done=0, peak_price=1.10), 0.87)
+        bot.manage_positions()
+        bot.sell.assert_not_called()
+
+    def test_trailing_stop_protects_remaining_position_after_take_profit_one(self):
+        bot = self._make_bot(self._position(tp1_done=1, peak_price=1.50), 1.15)
+        bot.manage_positions()
+        bot.sell.assert_called_once()
+        self.assertEqual(bot.sell.call_args.args[2], "trailing stop")
 
 
 if __name__ == "__main__":

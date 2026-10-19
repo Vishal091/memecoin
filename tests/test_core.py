@@ -10,7 +10,9 @@ from pumpfun_bot import (
     PumpFunBot,
     loss_exit_hold_remaining_seconds,
     native_build_retry_delay_seconds,
+    verified_curve_fallback_allowed,
 )
+from trending_scanner import live_candidate_retry_allowed
 from native_pump import (
     NativePumpExecutor,
     TransactionBuildFailed,
@@ -81,9 +83,9 @@ class LossStreakCircuitBreakerTests(unittest.TestCase):
         bot.s = SimpleNamespace(max_consecutive_losses=3)
         return bot
 
-    def test_three_losing_exits_pause_new_entries_until_next_utc_day(self):
+    def test_three_losing_exits_pause_new_entries_for_utc_day(self):
         bot = self._bot()
-        with self.assertLogs("pumpfun", level="ERROR") as logs:
+        with self.assertLogs("pumpfun", level="WARNING") as logs:
             bot._record_realized_exit_risk(-0.10)
             bot._record_realized_exit_risk(-0.05)
             bot._record_realized_exit_risk(-0.02)
@@ -91,8 +93,8 @@ class LossStreakCircuitBreakerTests(unittest.TestCase):
         today = datetime.now(timezone.utc).date().isoformat()
         self.assertEqual(bot.store.get_state("consecutive_losing_exits"), "3")
         self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), today)
-        self.assertIn("Consecutive-loss circuit breaker activated", "\n".join(logs.output))
-        self.assertIn("Consecutive-loss pause active", bot._copy_block_reason())
+        self.assertIn("pausing new entries", "\n".join(logs.output))
+        self.assertIn("paused until the next UTC day", bot._copy_block_reason())
 
     def test_positive_realized_exit_resets_the_loss_streak(self):
         bot = self._bot()
@@ -102,17 +104,15 @@ class LossStreakCircuitBreakerTests(unittest.TestCase):
         self.assertEqual(bot.store.get_state("consecutive_losing_exits"), "0")
         self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), "")
 
-    def test_profitable_exit_does_not_release_a_daily_pause_once_latched(self):
+    def test_profitable_exit_resets_loss_streak_and_pause(self):
         bot = self._bot()
-        with self.assertLogs("pumpfun", level="ERROR"):
-            bot._record_realized_exit_risk(-0.10)
-            bot._record_realized_exit_risk(-0.05)
-            bot._record_realized_exit_risk(-0.02)
-        pause_day = bot.store.get_state("consecutive_loss_pause_day")
+        bot._record_realized_exit_risk(-0.10)
+        bot._record_realized_exit_risk(-0.05)
+        bot._record_realized_exit_risk(-0.02)
         bot._record_realized_exit_risk(0.50)
-        self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), pause_day)
-        self.assertEqual(bot.store.get_state("consecutive_losing_exits"), "3")
-        self.assertIn("Consecutive-loss pause active", bot._loss_streak_pause_reason())
+        self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), "")
+        self.assertEqual(bot.store.get_state("consecutive_losing_exits"), "0")
+        self.assertEqual(bot._loss_streak_pause_reason(), "")
 
     def test_stale_pause_is_cleared_on_a_later_utc_day(self):
         bot = self._bot({
@@ -314,7 +314,7 @@ class DiscoveryQueueTests(unittest.TestCase):
         self.assertEqual(discovery.dashboard_snapshot()["queue_count"], 0)
 
 
-    def test_low_real_curve_liquidity_is_rejected_at_five_thousand_floor(self):
+    def test_low_real_curve_liquidity_waits_for_liquidity_at_five_thousand_floor(self):
         from market_data import WSOL_MINT
         import time
 
@@ -331,14 +331,41 @@ class DiscoveryQueueTests(unittest.TestCase):
             now,
         )
         candidate = discovery._load(WSOL_MINT)
-        self.assertEqual(candidate["status"], "rejected")
-        self.assertIn("below required $5000", candidate["reason"])
-        self.assertEqual(discovery.stats["liquidity_rejected"], 1)
+        self.assertEqual(candidate["status"], "waiting_liquidity")
+        self.assertFalse(candidate["subscribed"])
+        self.assertIn("below $5000", candidate["reason"])
+        self.assertEqual(discovery.stats["liquidity_rejected"], 0)
 
 
 
 class LossExitGracePeriodTests(unittest.TestCase):
-    def test_losing_exit_waits_for_remaining_two_minute_window(self):
+    def test_marked_loss_stop_bypasses_minimum_hold_immediately(self):
+        now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
+        position = {
+            "entry_price_usd": 1.0,
+            "opened_at": (now - timedelta(seconds=5)).isoformat(timespec="seconds"),
+        }
+        self.assertEqual(
+            loss_exit_hold_remaining_seconds(
+                position, 0.82, "marked loss stop", 120, now=now.timestamp()
+            ),
+            0.0,
+        )
+
+    def test_trailing_stop_bypasses_minimum_hold_immediately(self):
+        now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
+        position = {
+            "entry_price_usd": 1.0,
+            "opened_at": (now - timedelta(seconds=5)).isoformat(timespec="seconds"),
+        }
+        self.assertEqual(
+            loss_exit_hold_remaining_seconds(
+                position, 0.95, "trailing stop", 120, now=now.timestamp()
+            ),
+            0.0,
+        )
+
+    def test_other_losing_exits_still_use_remaining_grace_period(self):
         now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
         position = {
             "entry_price_usd": 1.0,
@@ -346,7 +373,8 @@ class LossExitGracePeriodTests(unittest.TestCase):
         }
         self.assertEqual(
             loss_exit_hold_remaining_seconds(
-                position, 0.75, "marked loss stop", 120, now=now.timestamp()
+                position, 0.75, "followed wallet leader partial sell", 120,
+                now=now.timestamp()
             ),
             90.0,
         )
@@ -417,6 +445,7 @@ class LossExitGracePeriodTests(unittest.TestCase):
         def __init__(self, position):
             self.position = position
             self.state = {}
+            self.trades = []
 
         def get_state(self, key, default=""):
             return self.state.get(key, default)
@@ -425,7 +454,17 @@ class LossExitGracePeriodTests(unittest.TestCase):
             self.state[key] = str(value)
 
         def get_position(self, mint):
-            return self.position if self.position.get("mint") == mint else None
+            return self.position if self.position and self.position.get("mint") == mint else None
+
+        def add_trade(self, **trade):
+            self.trades.append(trade)
+
+        def delete_position(self, mint):
+            if self.position and self.position.get("mint") == mint:
+                self.position = None
+
+        def upsert_position(self, position):
+            self.position = position
 
     class FakeMarket:
         def token_market(self, mint):
@@ -454,13 +493,20 @@ class LossExitGracePeriodTests(unittest.TestCase):
         )
         bot.store = self.FakeStore(position)
         bot.market = self.FakeMarket()
+        # The sale behavior is under test; avoid exercising the unrelated feed-subscription loop.
+        bot._refresh_feed_subscriptions = lambda: None
         return bot
 
-    def test_automatic_stop_wait_does_not_persist_stale_pending_trigger(self):
+    def test_automatic_marked_loss_stop_attempts_exit_immediately(self):
         bot = self._bot_with_fresh_position()
-        self.assertFalse(bot.sell("test-mint", 1000, "marked loss stop"))
+        bot.price_cache = {}
+        bot.price_cache_at = {}
+        self.assertTrue(bot.sell("test-mint", 1000, "marked loss stop"))
+        self.assertIsNone(bot.store.get_position("test-mint"))
         self.assertEqual(bot.store.get_state("exit_pending:test-mint", ""), "")
         self.assertEqual(bot.store.get_state("exit_pending_amount_raw:test-mint", ""), "")
+        self.assertEqual(len(bot.store.trades), 1)
+        self.assertEqual(bot.store.trades[0]["action"], "SELL")
 
     def test_losing_leader_sell_preserves_its_partial_amount_while_deferred(self):
         bot = self._bot_with_fresh_position()
@@ -710,6 +756,226 @@ class NativeBuildFailureHandlingTests(unittest.TestCase):
 
 
 
+class EntryDrawdownCircuitBreakerTests(unittest.TestCase):
+    class FakeStore:
+        def __init__(self, state):
+            self.state = dict(state)
+        def get_state(self, key, default=""):
+            return self.state.get(key, default)
+        def set_state(self, key, value):
+            self.state[str(key)] = str(value)
+        def daily_entries(self):
+            return 0
+        def list_positions(self):
+            return []
+
+    def _bot(self, *, equity=10.0, initial=10.0, day_start=10.0):
+        bot = object.__new__(PumpFunBot)
+        bot.store = self.FakeStore({
+            "initial_equity": str(initial),
+            "day_start_equity": str(day_start),
+            "consecutive_losing_exits": "0",
+        })
+        bot.s = SimpleNamespace(
+            starting_paper_cash_usd=10.0,
+            max_entries_per_day=3,
+            max_open_positions=1,
+            max_entry_usd=0.50,
+            max_total_exposure_usd=1.0,
+            token_discovery_max_entry_usd=0.50,
+            trending_discovery_max_entry_usd=0.50,
+            daily_loss_limit_usd=0.50,
+            total_loss_limit_usd=1.00,
+            mode="paper",
+            paper_swap_cost_usd=0.02,
+        )
+        bot._current_positions_value = lambda: 0.0
+        bot.store.set_state("paper_cash", "10")
+        return bot
+
+    def test_daily_loss_limit_blocks_leader_and_discovery_entries(self):
+        bot = self._bot(equity=9.50)
+        for strategy in ("leader_copy", "token_discovery", "trending_discovery"):
+            allowed, reason = bot._can_enter(9.50, strategy=strategy)
+            self.assertFalse(allowed)
+            self.assertIn("Daily-loss limit", reason)
+
+    def test_daily_loss_pause_remains_after_equity_recovers_until_new_utc_day(self):
+        bot = self._bot(equity=9.50)
+        allowed, reason = bot._can_enter(9.50, strategy="leader_copy")
+        self.assertFalse(allowed)
+        self.assertIn("Daily-loss limit", reason)
+        self.assertEqual(bot.store.get_state("daily_paused"), "1")
+
+        allowed, reason = bot._can_enter(9.90, strategy="trending_discovery")
+        self.assertFalse(allowed)
+        self.assertIn("paused until the next UTC day", reason)
+
+    def test_total_loss_limit_blocks_entries_even_when_daily_loss_is_small(self):
+        bot = self._bot(equity=8.99, day_start=9.40)
+        allowed, reason = bot._can_enter(8.99, strategy="trending_discovery")
+        self.assertFalse(allowed)
+        self.assertIn("Total-loss limit", reason)
+
+    def test_entries_are_allowed_below_both_loss_limits(self):
+        bot = self._bot(equity=9.70, initial=10.0, day_start=9.80)
+        allowed, reason = bot._can_enter(9.70, strategy="trending_discovery")
+        self.assertTrue(allowed, reason)
+
+    def test_invalid_loss_baseline_fails_closed(self):
+        bot = self._bot(equity=10.0)
+        bot.store.set_state("initial_equity", "not-a-number")
+        allowed, reason = bot._can_enter(10.0, strategy="trending_discovery")
+        self.assertFalse(allowed)
+        self.assertIn("Risk baseline is invalid", reason)
+
+
+
+class DashboardDiscoveryToggleTests(unittest.TestCase):
+    class FakeStore:
+        def __init__(self):
+            self.state = {}
+        def get_state(self, key, default=""):
+            return self.state.get(key, default)
+        def set_state(self, key, value):
+            self.state[str(key)] = str(value)
+
+    class FakeTracker:
+        def __init__(self, enabled=False, live_enabled=False):
+            self.enabled = enabled
+            self.live_enabled = live_enabled
+            self.subscription_updates = 0
+            self.started = 0
+            self.stopped = 0
+        def _update_feed_subscriptions(self):
+            self.subscription_updates += 1
+        def start(self):
+            self.started += 1
+        def stop(self):
+            self.stopped += 1
+
+    def _bot(self, mode="paper"):
+        bot = PumpFunBot.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(
+            mode=mode,
+            live_confirmation="I_ACCEPT_THE_RISK_AND_UNDERSTAND_LIVE_TRADING",
+            token_discovery_enabled=False,
+            token_discovery_live_enabled=False,
+            token_discovery_max_entry_usd=0.50,
+            trending_discovery_enabled=False,
+            trending_discovery_live_enabled=False,
+            trending_discovery_max_entry_usd=0.50,
+            pumpfun_auth_token="test-auth",
+            pumpportal_api_key="test-pumpportal",
+            jupiter_api_key="test-jupiter",
+        )
+        bot.store = self.FakeStore()
+        bot.commands = queue.Queue()
+        bot.token_discovery = self.FakeTracker()
+        bot.trending_scanner = self.FakeTracker()
+        bot.trending_executor = SimpleNamespace(api_key="test-jupiter")
+        bot.wallet_address="TestWallet"
+        bot.keypair=object()
+        bot.message=""
+        return bot
+
+    def test_dashboard_exposes_separate_scan_and_live_buy_controls(self):
+        from dashboard import _PAGE
+        for control_id in (
+            "newScanToggle", "newLiveToggle",
+            "trendingScanToggle", "trendingLiveToggle",
+        ):
+            self.assertIn(control_id, _PAGE)
+        for action_name in (
+            "set_token_discovery_enabled",
+            "set_token_discovery_live_enabled",
+            "set_trending_discovery_enabled",
+            "set_trending_discovery_live_enabled",
+        ):
+            self.assertIn(action_name, _PAGE)
+
+    def test_enabling_scanner_does_not_enable_live_buys(self):
+        bot = self._bot()
+        bot.commands.put({"action": "set_token_discovery_enabled", "enabled": True})
+        bot._process_dashboard_commands()
+        self.assertTrue(bot.token_discovery.enabled)
+        self.assertFalse(bot.token_discovery.live_enabled)
+        self.assertEqual(bot.store.get_state("dashboard_token_discovery_enabled"), "1")
+        self.assertEqual(bot.token_discovery.subscription_updates, 1)
+
+        bot.commands.put({"action": "set_trending_discovery_enabled", "enabled": True})
+        bot._process_dashboard_commands()
+        self.assertTrue(bot.trending_scanner.enabled)
+        self.assertFalse(bot.trending_scanner.live_enabled)
+        self.assertEqual(bot.trending_scanner.started, 1)
+        self.assertEqual(bot.store.get_state("dashboard_trending_discovery_enabled"), "1")
+
+    def test_turning_off_scanner_also_turns_off_its_live_buy_switch(self):
+        bot = self._bot(mode="live")
+        bot.token_discovery.enabled = True
+        bot.token_discovery.live_enabled = True
+        bot.trending_scanner.enabled = True
+        bot.trending_scanner.live_enabled = True
+
+        bot.commands.put({"action": "set_token_discovery_enabled", "enabled": False})
+        bot.commands.put({"action": "set_trending_discovery_enabled", "enabled": False})
+        bot._process_dashboard_commands()
+
+        self.assertFalse(bot.token_discovery.enabled)
+        self.assertFalse(bot.token_discovery.live_enabled)
+        self.assertEqual(bot.store.get_state("dashboard_token_discovery_live_enabled"), "0")
+        self.assertFalse(bot.trending_scanner.enabled)
+        self.assertFalse(bot.trending_scanner.live_enabled)
+        self.assertEqual(bot.trending_scanner.stopped, 1)
+        self.assertEqual(bot.store.get_state("dashboard_trending_discovery_live_enabled"), "0")
+
+    def test_live_buy_switch_is_rejected_in_paper_mode(self):
+        bot = self._bot(mode="paper")
+        bot.token_discovery.enabled = True
+        bot.trending_scanner.enabled = True
+        bot.commands.put({"action": "set_token_discovery_live_enabled", "enabled": True})
+        bot.commands.put({"action": "set_trending_discovery_live_enabled", "enabled": True})
+        bot._process_dashboard_commands()
+
+        self.assertFalse(bot.token_discovery.live_enabled)
+        self.assertFalse(bot.trending_scanner.live_enabled)
+        self.assertIn("BOT_MODE must be live", bot.message)
+
+    def test_live_buy_switch_requires_scanner_and_credentials(self):
+        bot = self._bot(mode="live")
+        bot.keypair = None
+        bot.commands.put({"action": "set_trending_discovery_live_enabled", "enabled": True})
+        bot._process_dashboard_commands()
+        self.assertFalse(bot.trending_scanner.live_enabled)
+        self.assertIn("A loaded live wallet/keypair is required", bot.message)
+
+        bot.keypair = object()
+        bot.commands.put({"action": "set_trending_discovery_live_enabled", "enabled": True})
+        bot._process_dashboard_commands()
+        self.assertFalse(bot.trending_scanner.live_enabled)
+        self.assertIn("Enable the trending scanner", bot.message)
+
+    def test_trending_live_buy_can_be_enabled_after_all_gates_pass(self):
+        bot = self._bot(mode="live")
+        bot.trending_scanner.enabled = True
+        bot.commands.put({"action": "set_trending_discovery_live_enabled", "enabled": True})
+        bot._process_dashboard_commands()
+        self.assertTrue(bot.trending_scanner.live_enabled)
+        self.assertEqual(bot.store.get_state("dashboard_trending_discovery_live_enabled"), "1")
+        self.assertIn("LIVE BUYS ENABLED", bot.message)
+
+    def test_disabling_live_buy_switch_does_not_disable_scanner(self):
+        bot = self._bot(mode="live")
+        bot.token_discovery.enabled = True
+        bot.token_discovery.live_enabled = True
+        bot.commands.put({"action": "set_token_discovery_live_enabled", "enabled": False})
+        bot._process_dashboard_commands()
+        self.assertTrue(bot.token_discovery.enabled)
+        self.assertFalse(bot.token_discovery.live_enabled)
+        self.assertEqual(bot.store.get_state("dashboard_token_discovery_enabled"), "")
+        self.assertEqual(bot.store.get_state("dashboard_token_discovery_live_enabled"), "0")
+
+
 class CopySafetyGateTests(unittest.TestCase):
     class FakeStore:
         def __init__(self, state=None, positions=None):
@@ -740,39 +1006,80 @@ class CopySafetyGateTests(unittest.TestCase):
         bot.logs_feed = None
         return bot
 
-    def test_overall_loss_halt_has_clear_copy_block_reason(self):
+    def test_legacy_overall_loss_flag_does_not_block_copy_entries(self):
         bot = self._bot({"halted": "1", "halt_reason": "Total loss limit reached"})
-        self.assertEqual(
-            bot._copy_block_reason(),
-            "Overall loss halt active: Total loss limit reached",
-        )
+        self.assertEqual(bot._copy_block_reason(), "")
 
-    def test_manual_review_halt_has_clear_copy_block_reason(self):
+    def test_legacy_manual_review_flag_does_not_block_copy_entries(self):
         bot = self._bot({
             "manual_review_halt": "1",
             "manual_review_reason": "Reconcile wallet before resuming",
         })
-        self.assertEqual(
-            bot._copy_block_reason(),
-            "Manual-review halt active: Reconcile wallet before resuming",
-        )
+        self.assertEqual(bot._copy_block_reason(), "")
 
-    def test_blocked_copy_does_not_subscribe_to_new_leaders(self):
+    def test_rpc_manual_review_flag_does_not_block_new_leader_subscriptions(self):
         bot = self._bot({
             "manual_review_halt": "1",
-            "manual_review_reason": "Reconcile wallet before resuming",
+            "manual_review_reason": "RPC wallet monitoring error",
         })
         bot._refresh_feed_subscriptions()
-        self.assertEqual(bot.active_wallets, set())
+        self.assertEqual(bot.active_wallets, {"leader-wallet"})
 
-    def test_held_position_leader_remains_monitored_when_copy_is_blocked(self):
+    def test_legacy_manual_review_flag_keeps_held_and_leader_wallets_monitored(self):
         position = {"mint": "open-mint", "source_wallet": "held-leader"}
         bot = self._bot({
             "manual_review_halt": "1",
             "manual_review_reason": "Reconcile wallet before resuming",
         }, positions=[position])
         bot._refresh_feed_subscriptions()
-        self.assertEqual(bot.active_wallets, {"held-leader"})
+        self.assertEqual(bot.active_wallets, {"held-leader", "leader-wallet"})
+
+
+class StaleWalletSignalTests(unittest.TestCase):
+    def test_old_watched_wallet_signature_advances_cursor_without_copying(self):
+        import time
+        from unittest.mock import patch
+
+        now = int(time.time())
+        rows = [
+            {"signature": "stale-new-signature", "blockTime": now - 120},
+            {"signature": "stored-cursor", "blockTime": now - 240},
+        ]
+
+        class FakeStore:
+            def __init__(self):
+                self.cursor = "stored-cursor"
+                self.seen = []
+
+            def get_cursor(self, wallet):
+                return self.cursor
+
+            def set_cursor(self, wallet, signature):
+                self.cursor = signature
+
+            def signature_seen(self, key):
+                return any(item[0] == key for item in self.seen)
+
+            def mark_signature_seen(self, key, wallet):
+                self.seen.append((key, wallet))
+
+        bot = object.__new__(PumpFunBot)
+        bot.rpc = SimpleNamespace(signatures=lambda wallet, limit: rows)
+        bot.store = FakeStore()
+        detected = []
+        bot.detect_pump_signal = lambda wallet, signature: detected.append(signature) or []
+        bot.process_signal = lambda signal: None
+
+        with patch.dict("os.environ", {"MAX_COPY_SIGNAL_AGE_SECONDS": "30"}):
+            handled = bot.poll_wallet("leader-wallet")
+
+        self.assertEqual(handled, 1)
+        self.assertEqual(detected, [])
+        self.assertEqual(bot.store.cursor, "stale-new-signature")
+        self.assertEqual(
+            bot.store.seen,
+            [("leader-wallet|stale-new-signature", "leader-wallet")],
+        )
 
 
 class ParserTests(unittest.TestCase):
@@ -902,6 +1209,138 @@ class MarketTests(unittest.TestCase):
         ok, reason = m.is_entry_eligible({"liquidity_usd": 100, "pair_age_seconds": 999})
         self.assertFalse(ok)
         self.assertIn("Liquidity", reason)
+
+
+class VerifiedCurveFallbackTests(unittest.TestCase):
+    def test_only_fresh_security_verified_pump_discovery_can_use_curve_fallback(self):
+        signal = {
+            "source": "token_discovery",
+            "fresh_security_verified": True,
+            "curve_state_verified": True,
+        }
+        self.assertTrue(verified_curve_fallback_allowed(
+            signal, strategy="token_discovery", venue="pump",
+            curve_liquidity_usd=6690, minimum_liquidity_usd=5000,
+        ))
+
+    def test_curve_fallback_does_not_bypass_missing_security_or_liquidity(self):
+        valid = {
+            "source": "token_discovery",
+            "fresh_security_verified": True,
+            "curve_state_verified": True,
+        }
+        self.assertFalse(verified_curve_fallback_allowed(
+            valid, strategy="leader_copy", venue="pump",
+            curve_liquidity_usd=6690, minimum_liquidity_usd=5000,
+        ))
+        self.assertFalse(verified_curve_fallback_allowed(
+            {**valid, "fresh_security_verified": False},
+            strategy="token_discovery", venue="pump",
+            curve_liquidity_usd=6690, minimum_liquidity_usd=5000,
+        ))
+        self.assertFalse(verified_curve_fallback_allowed(
+            valid, strategy="token_discovery", venue="pump",
+            curve_liquidity_usd=4999, minimum_liquidity_usd=5000,
+        ))
+        self.assertFalse(verified_curve_fallback_allowed(
+            valid, strategy="token_discovery", venue="pump-amm",
+            curve_liquidity_usd=6690, minimum_liquidity_usd=5000,
+        ))
+
+
+class TrendingLiveRetryPolicyTests(unittest.TestCase):
+    def test_retryable_terminal_status_waits_for_five_minute_cooldown(self):
+        now = 10_000.0
+        self.assertFalse(live_candidate_retry_allowed("blocked", now - 299, now=now))
+        self.assertTrue(live_candidate_retry_allowed("blocked", now - 300, now=now))
+        self.assertTrue(live_candidate_retry_allowed("failed", now - 600, now=now))
+        self.assertTrue(live_candidate_retry_allowed("", 0, now=now))
+
+    def test_unknown_or_submitted_outcomes_are_never_auto_replayed(self):
+        now = 10_000.0
+        for status in ("queued", "submitting", "uncertain", "opened", "closed", "unknown"):
+            with self.subTest(status=status):
+                self.assertFalse(live_candidate_retry_allowed(status, now - 3600, now=now))
+
+
+class TrendingScannerRequeueIntegrationTests(unittest.TestCase):
+    class FakeStore:
+        def __init__(self, state=None):
+            self.state = dict(state or {})
+
+        def get_state(self, key, default=""):
+            return self.state.get(key, default)
+
+        def set_state(self, key, value):
+            self.state[str(key)] = str(value)
+
+        def list_positions(self):
+            return []
+
+        def list_state_prefix(self, prefix, limit=10000):
+            return [(key, value) for key, value in self.state.items()
+                    if key.startswith(prefix)][:limit]
+
+    def _scanner(self, previous_status, age_seconds=600):
+        import time
+        from trending_scanner import TrendingTokenScanner
+
+        now = time.time()
+        mint = "test-trending-mint"
+        store = self.FakeStore({
+            f"trending_live_status:{mint}": previous_status,
+            f"trending_live_reason:{mint}": "previous attempt",
+            f"trending_live_status_at:{mint}": str(now - age_seconds),
+        })
+        settings = SimpleNamespace(
+            mode="live",
+            trending_discovery_enabled=False,
+            trending_discovery_live_enabled=False,
+            trending_discovery_poll_seconds=60,
+            trending_discovery_max_candidates=8,
+            trending_min_liquidity_usd=15000,
+            trending_min_volume_1h_usd=10000,
+            trending_min_score=75,
+            trending_max_price_impact_pct=5.0,
+        )
+        queued = []
+        scanner = TrendingTokenScanner(
+            settings, object(), timeout=5, store=store, on_screened=queued.append
+        )
+        scanner.enabled = True
+        scanner.live_enabled = True
+        scanner._get_json = lambda *args, **kwargs: {}
+        scanner._dexscreener_enrich = lambda rows: None
+        scanner._evaluate = lambda row: {
+            **row, "status": "SCREENED", "momentum_score": 90,
+            "updated_at": time.time(),
+        }
+        return scanner, queued, mint
+
+    def test_old_blocked_candidate_is_rechecked_and_queued(self):
+        from unittest.mock import patch
+        scanner, queued, mint = self._scanner("blocked")
+        candidate = {
+            "mint": mint, "liquidity_usd": 20000, "volume_1h_usd": 15000,
+            "momentum_score": 90, "updated_at": 1,
+        }
+        with patch("trending_scanner.parse_gecko_trending", return_value=[candidate]):
+            scanner.scan_once()
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["mint"], mint)
+        self.assertEqual(scanner.store.get_state(f"trending_live_status:{mint}"), "queued")
+
+    def test_uncertain_candidate_is_never_queued_again(self):
+        from unittest.mock import patch
+        scanner, queued, mint = self._scanner("uncertain")
+        candidate = {
+            "mint": mint, "liquidity_usd": 20000, "volume_1h_usd": 15000,
+            "momentum_score": 90, "updated_at": 1,
+        }
+        with patch("trending_scanner.parse_gecko_trending", return_value=[candidate]):
+            scanner.scan_once()
+        self.assertEqual(queued, [])
+        self.assertEqual(scanner.store.get_state(f"trending_live_status:{mint}"), "uncertain")
 
 
 class StorageTests(unittest.TestCase):
@@ -1045,7 +1484,7 @@ class TransactionOutcomeHandlingTests(unittest.TestCase):
             "Runtime exception; reconcile wallet and transactions before resuming"
         )
 
-        self.assertEqual(bot.store.get_state("manual_review_halt"), "1")
+        self.assertEqual(bot.store.get_state("manual_review_halt"), "0")
         self.assertEqual(bot.store.get_state("manual_review_reason"), reason)
 
     def test_new_uncertain_trade_appends_signature_to_existing_manual_review_reason(self):
@@ -1060,6 +1499,7 @@ class TransactionOutcomeHandlingTests(unittest.TestCase):
         reason = bot.store.get_state("manual_review_reason")
         self.assertIn("RPC wallet monitoring error", reason)
         self.assertIn("important-signature", reason)
+        self.assertEqual(bot.store.get_state("manual_review_halt"), "0")
 
     def test_uncertain_buy_halts_copy_records_signature_and_consumes_source_signal(self):
         import json
@@ -1074,9 +1514,9 @@ class TransactionOutcomeHandlingTests(unittest.TestCase):
             source_signature="leader-signature",
         )
 
-        self.assertEqual(bot.store.get_state("manual_review_halt"), "1")
-        self.assertEqual(bot.store.get_state("auto_copy_enabled"), "0")
-        self.assertEqual(bot.store.get_state("copy_paused"), "1")
+        self.assertEqual(bot.store.get_state("manual_review_halt"), "0")
+        self.assertEqual(bot.store.get_state("auto_copy_enabled"), "1")
+        self.assertEqual(bot.store.get_state("copy_paused"), "0")
         self.assertIn("submitted-signature", bot.store.get_state("manual_review_reason"))
         record = json.loads(bot.store.get_state("unresolved_trade:test-mint"))
         self.assertEqual(record["signature"], "submitted-signature")
