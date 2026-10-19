@@ -485,6 +485,43 @@ class SniperQueueConfigTests(unittest.TestCase):
         self.assertEqual(config.token_discovery_max_launches_per_minute, 60)
 
 
+class TrendingLiveExecutionGateTests(unittest.TestCase):
+    def test_trending_live_entry_is_blocked_when_separate_live_opt_in_is_off(self):
+        bot = PumpFunBot.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(
+            mode="live",
+            trending_discovery_enabled=True,
+            trending_discovery_live_enabled=False,
+        )
+        bot.trending_scanner = Mock()
+        bot._buy_trending_discovery({
+            "mint": "TrendMint11111111111111111111111111111111",
+            "source": "trending_discovery",
+            "fresh_security_verified": True,
+        })
+        bot.trending_scanner.set_live_status.assert_called_once()
+        args = bot.trending_scanner.set_live_status.call_args.args
+        self.assertEqual(args[1], "blocked")
+        self.assertIn("live opt-in", args[2].lower())
+
+    def test_trending_live_entry_is_blocked_in_paper_mode(self):
+        bot = PumpFunBot.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(
+            mode="paper",
+            trending_discovery_enabled=True,
+            trending_discovery_live_enabled=True,
+        )
+        bot.trending_scanner = Mock()
+        bot._buy_trending_discovery({
+            "mint": "TrendMint22222222222222222222222222222222",
+            "source": "trending_discovery",
+            "fresh_security_verified": True,
+        })
+        args = bot.trending_scanner.set_live_status.call_args.args
+        self.assertEqual(args[1], "blocked")
+        self.assertIn("live opt-in", args[2].lower())
+
+
 class SniperExitPolicyTests(unittest.TestCase):
     @staticmethod
     def _make_bot(position, mark_price):
