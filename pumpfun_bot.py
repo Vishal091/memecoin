@@ -92,6 +92,31 @@ def native_build_retry_delay_seconds(detail: str) -> int:
     return 60
 
 
+def verified_curve_fallback_allowed(
+    signal: dict,
+    *,
+    strategy: str,
+    venue: str,
+    curve_liquidity_usd: float,
+    minimum_liquidity_usd: float,
+) -> bool:
+    """Permit pre-indexed DEX fallback only for freshly certified Pump discovery signals."""
+    try:
+        liquidity = float(curve_liquidity_usd)
+        floor = float(minimum_liquidity_usd)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (
+        strategy == "token_discovery"
+        and isinstance(signal, dict)
+        and signal.get("source") == "token_discovery"
+        and signal.get("fresh_security_verified") is True
+        and signal.get("curve_state_verified") is True
+        and venue == "pump"
+        and liquidity >= floor > 0
+    )
+
+
 def _pubkey_string(value) -> str:
     if isinstance(value, str):
         return value
@@ -1622,12 +1647,12 @@ class PumpFunBot:
         # bonding curve as the market source before DEX Screener indexes the pair.
         # This does not apply to leader-copy buys and never bypasses security,
         # real-curve liquidity, price, portfolio-risk, or transaction checks.
-        allow_verified_curve_age_bypass = (
-            strategy == "token_discovery"
-            and signal.get("fresh_security_verified") is True
-            and curve_state_verified
-            and curve_liquidity >= max(self.s.min_liquidity_usd, portfolio_liquidity_floor)
-            and venue == "pump"
+        allow_verified_curve_age_bypass = verified_curve_fallback_allowed(
+            signal,
+            strategy=strategy,
+            venue=venue,
+            curve_liquidity_usd=curve_liquidity,
+            minimum_liquidity_usd=max(self.s.min_liquidity_usd, portfolio_liquidity_floor),
         )
         unindexed_pump_entry = (
             allow_verified_curve_age_bypass
