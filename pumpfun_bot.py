@@ -1618,11 +1618,15 @@ class PumpFunBot:
         # Do not allow a websocket signal to bypass the minimum liquidity floor.
         # Discovery can use the canonical on-chain curve only after its fresh
         # security/liquidity checks; regular leader-copy entries need indexed market data.
+        # A scanner-certified discovery candidate may use its verified on-chain
+        # bonding curve as the market source before DEX Screener indexes the pair.
+        # This does not apply to leader-copy buys and never bypasses security,
+        # real-curve liquidity, price, portfolio-risk, or transaction checks.
         allow_verified_curve_age_bypass = (
             strategy == "token_discovery"
-            and self.s.allow_unindexed_pump_curve
+            and signal.get("fresh_security_verified") is True
             and curve_state_verified
-            and curve_liquidity >= self.s.min_liquidity_usd
+            and curve_liquidity >= max(self.s.min_liquidity_usd, portfolio_liquidity_floor)
             and venue == "pump"
         )
         unindexed_pump_entry = (
@@ -1631,7 +1635,7 @@ class PumpFunBot:
         )
         if market is None and not allow_verified_curve_age_bypass:
             logger.info(
-                "Reject buy %s: indexed market pair unavailable and unindexed-entry bypass is disabled",
+                "Reject buy %s: indexed market pair unavailable and fresh verified on-chain curve fallback criteria were not met",
                 mint[:8],
             )
             return
@@ -1644,8 +1648,8 @@ class PumpFunBot:
             return
         if unindexed_pump_entry:
             logger.warning(
-                "HIGH-RISK unindexed Pump launch entry for %s: no verified indexed liquidity; "
-                "fixed entry/exposure caps apply, but exit liquidity is not assured",
+                "Verified-curve Pump launch entry for %s without a DEX-indexed pair: "
+                "on-chain curve liquidity passed; fixed entry/exposure caps apply, but exit liquidity is not assured",
                 mint,
             )
 
