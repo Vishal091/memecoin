@@ -141,12 +141,11 @@ class PumpFunBot:
         # automatic halt latch.
         legacy_auto_halt = any(
             self.store.get_state(key, "0") == "1"
-            for key in ("manual_review_halt", "halted", "daily_paused", "experiment_expired")
+            for key in ("manual_review_halt", "halted", "experiment_expired")
         )
         if legacy_auto_halt:
             self.store.set_state("manual_review_halt", "0")
             self.store.set_state("halted", "0")
-            self.store.set_state("daily_paused", "0")
             self.store.set_state("experiment_expired", "0")
             if saved_auto == "0" and self.store.get_state("copy_paused", "0") == "1":
                 # These flags were also written by automatic halt handlers; restore
@@ -265,7 +264,9 @@ class PumpFunBot:
             self.store.set_state("consecutive_loss_warning_day", "")
 
     def _copy_block_reason(self) -> str:
-        """Report the persisted loss-streak circuit breaker to the dashboard and feed logic."""
+        """Report persisted entry circuit breakers to dashboard/feed logic."""
+        if self.store.get_state("daily_paused", "0") == "1":
+            return "Daily-loss circuit breaker is active; new entries resume after the next UTC day"
         return self._loss_streak_pause_reason()
 
     def _refresh_feed_subscriptions(self) -> None:
@@ -970,6 +971,7 @@ class PumpFunBot:
         daily_start = float(self.store.get_state("day_start_equity", str(equity)))
         daily_loss = max(0.0, daily_start - equity)
         if daily_loss >= self.s.daily_loss_limit_usd:
+            self.store.set_state("daily_paused", "1")
             if self.store.get_state("daily_loss_warning_day", "") != today:
                 self.store.set_state("daily_loss_warning_day", today)
                 logger.warning(
@@ -994,6 +996,8 @@ class PumpFunBot:
         # next periodic heartbeat refreshes the risk baselines.
         if hasattr(self.store, "reset_day_if_needed"):
             self.store.reset_day_if_needed(equity)
+        if self.store.get_state("daily_paused", "0") == "1":
+            return False, "Daily-loss limit was reached; new entries are paused until the next UTC day"
         loss_streak_reason = self._loss_streak_pause_reason()
         if loss_streak_reason:
             return False, loss_streak_reason
@@ -1010,6 +1014,7 @@ class PumpFunBot:
             )
         daily_drawdown = max(0.0, day_start_equity - equity)
         if daily_drawdown >= float(self.s.daily_loss_limit_usd):
+            self.store.set_state("daily_paused", "1")
             return False, (
                 f"Daily-loss limit reached: drawdown ${daily_drawdown:.2f} >= "
                 f"${float(self.s.daily_loss_limit_usd):.2f}; new entries blocked until next UTC day"
