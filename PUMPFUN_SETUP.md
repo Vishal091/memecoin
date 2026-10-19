@@ -80,11 +80,13 @@ If a live transaction or network error leaves its outcome ambiguous, the bot blo
 
 ## Default risk rules
 
-- Maximum initial entry: $2.
-- Maximum marked open exposure: $3.
-- Maximum three open positions and three entries per UTC day.
-- Daily drawdown pause: $1.50.
-- Total experiment drawdown halt: $3, with exit attempts for tracked holdings.
+- Maximum general initial entry: $0.50 (discovery strategies also have their own $0.50 code cap).
+- Maximum marked open exposure: $1.00.
+- Maximum one open position and one entry per UTC day in the sample configuration.
+- Daily drawdown limit: $0.50; new entries are blocked when reached until the next UTC day.
+- Total drawdown limit: $1.00; new entries are blocked when reached.
+- After three consecutive losing exits, new entries are paused until the next UTC day.
+- Loss limits pause new entries; they do not trigger automatic mass liquidation. Existing holdings remain managed by the exit logic.
 - First profit target: +30%, attempt to sell 40% of original quantity.
 - Second profit target: +60%, attempt to sell another 30% of original quantity.
 - Trailing exit: 20% below the observed peak; downside exit trigger at −25%.
