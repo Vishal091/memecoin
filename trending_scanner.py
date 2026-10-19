@@ -437,6 +437,79 @@ class TrendingTokenScanner:
             item.update({"status": "REVIEW", "decision": "; ".join(risk_flags) or "Risk report incomplete; manual review required"})
         return item
 
+    def verify_live_candidate(self, candidate: dict) -> dict:
+        """Fail closed if the exact pool or fresh on-chain/risk checks no longer pass."""
+        if str(getattr(self.settings, "mode", "paper")).lower() != "live" or not self.enabled or not bool(
+            getattr(self.settings, "trending_discovery_live_enabled", False)
+        ):
+            raise ValueError("Trending live opt-in is not active")
+        mint = str(candidate.get("mint") or "").strip()
+        pool = str(candidate.get("pool_address") or "").strip()
+        pair_address = str(candidate.get("dexscreener_pair_address") or "").strip()
+        if not mint or not pool or not pair_address:
+            raise ValueError("Mint or cross-checked pool address is missing")
+
+        payload = self._get_json(
+            f"{GECK}/networks/solana/trending_pools?include=base_token,quote_token&page=1",
+            gecko=True,
+        )
+        row = next((r for r in parse_gecko_trending(payload)
+                    if r.get("mint") == mint and str(r.get("pool_address") or "") == pool), None)
+        if row is None:
+            raise ValueError("Exact pool is no longer in the fresh trending feed")
+        self._dexscreener_enrich([row])
+        if (not row.get("dexscreener_confirmed") or row.get("same_pool_crosscheck") is not True
+                or str(row.get("dexscreener_pair_address") or "") != pair_address):
+            raise ValueError("Fresh DEX Screener response did not confirm the same pool")
+        if row.get("market_data_discrepancy"):
+            raise ValueError("Fresh market sources disagree")
+        liquidity = _num(row.get("liquidity_usd"))
+        volume = _num(row.get("dexscreener_volume_1h_usd"))
+        if liquidity < self.min_liquidity_usd or volume < self.min_volume_1h_usd:
+            raise ValueError("Fresh pool liquidity or volume is below the configured floor")
+
+        onchain, flags = self._check_mint(mint)
+        if onchain != "PASS":
+            raise ValueError("Fresh on-chain check failed: " + "; ".join(flags)[:250])
+        acct_result = self.rpc.call(
+            "getAccountInfo", [mint, {"encoding": "jsonParsed", "commitment": "confirmed"}]
+        ) or {}
+        info = (((((acct_result.get("value") or {}).get("data") or {}).get("parsed") or {}).get("info")) or {})
+        try:
+            decimals, supply_raw = int(info.get("decimals", -1)), int(info.get("supply") or 0)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Fresh token supply/decimals are invalid") from exc
+        if supply_raw <= 0 or not 0 <= decimals <= 12:
+            raise ValueError("Fresh token supply/decimals are outside the accepted range")
+
+        report = self._get_json(f"{RUGCHECK}/tokens/{mint}/report/summary")
+        rug_status, rug_flags = evaluate_rugcheck_report(report)
+        if rug_status != "SAFE_CANDIDATE":
+            raise ValueError("Fresh RugCheck did not pass: " + "; ".join(rug_flags)[:250])
+
+        row["decimals"] = decimals
+        row["total_supply_tokens"] = supply_raw / (10 ** decimals)
+        row["onchain_status"] = onchain
+        row["rugcheck_status"] = rug_status
+        row["top_holders_pct"] = _num(report.get("topHoldersPct"))
+        row["lp_locked_pct"] = _num(report.get("lpLockedPct"))
+        row["volume_1h_usd"] = volume
+        row["volume_24h_usd"] = _num(row.get("dexscreener_volume_24h_usd"))
+        row["buys_1h"] = int(_num(row.get("dexscreener_buys_1h")))
+        row["sells_1h"] = int(_num(row.get("dexscreener_sells_1h")))
+        row["change_5m_pct"] = _num(row.get("dexscreener_change_5m_pct"), _num(row.get("change_5m_pct")))
+        row["change_1h_pct"] = _num(row.get("dexscreener_change_1h_pct"), _num(row.get("change_1h_pct")))
+        row["change_24h_pct"] = _num(row.get("dexscreener_change_24h_pct"), _num(row.get("change_24h_pct")))
+        row["momentum_score"] = score_trending_candidate(row)
+        if row["momentum_score"] < int(getattr(self.settings, "trending_min_score", 75)):
+            raise ValueError("Fresh momentum score is below the configured floor")
+        if row["buys_1h"] <= row["sells_1h"]:
+            raise ValueError("Fresh one-hour trading flow no longer shows net buying")
+        row["fresh_security_verified"] = True
+        row["updated_at"] = time.time()
+        row["risk_flags"] = list(row.get("risk_flags") or []) + flags + rug_flags
+        return row
+
     def set_live_status(self, mint: str, status: str, reason: str) -> None:
         """Persist one-shot live-attempt state so restarts cannot replay a buy."""
         normalized = " ".join(str(reason or "").split())[:500]
