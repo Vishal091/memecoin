@@ -265,6 +265,7 @@ class TrendingScannerIntegrationTests(unittest.TestCase):
         scanner._get_json = lambda url: [pair]
         candidate = {
             "mint": mint,
+            "pool_address": pair["pairAddress"],
             "name": "Unknown token",
             "symbol": "—",
             "liquidity_usd": 20000,
@@ -281,7 +282,24 @@ class TrendingScannerIntegrationTests(unittest.TestCase):
         self.assertEqual(candidate["dexscreener_pair_address"], pair["pairAddress"])
         self.assertTrue(candidate["dexscreener_confirmed"])
         self.assertTrue(candidate["market_data_discrepancy"])
+        self.assertTrue(candidate["same_pool_crosscheck"])
         self.assertGreaterEqual(len(candidate["risk_flags"]), 3)
+
+        different_pool = {
+            "mint": mint,
+            "pool_address": "OtherPool11111111111111111111111111111",
+            "liquidity_usd": 20000,
+            "volume_1h_usd": 12000,
+            "change_1h_pct": 5,
+            "risk_flags": [],
+        }
+        scanner._dexscreener_enrich([different_pool])
+        self.assertFalse(different_pool["dexscreener_confirmed"])
+        self.assertFalse(different_pool["same_pool_crosscheck"])
+        self.assertIn(
+            "not directly comparable",
+            " ".join(different_pool["risk_flags"]),
+        )
 
 
 class TrendingScannerConfigTests(unittest.TestCase):
