@@ -287,7 +287,7 @@ class JupiterUltraExecutor:
                 raise TransactionBuildFailed(
                     f"Jupiter transaction contains unrecognized program {program_id}; no signature made"
                 )
-            if program_id == JUPITER_AGGREGATOR_PROGRAM_ID or program_id in allowed_dex_programs:
+            if program_id == JUPITER_AGGREGATOR_PROGRAM_ID or program_id in (allowed_programs - CORE_PROGRAMS):
                 saw_swap_route = True
 
             if program_id == COMPUTE_BUDGET_ID:
