@@ -293,6 +293,16 @@ class TrendingTokenScanner:
                 c["dexscreener_volume_24h_usd"] = _num(volume.get("h24"))
                 c["dexscreener_change_1h_pct"] = _num(change.get("h1"))
                 c["dexscreener_change_24h_pct"] = _num(change.get("h24"))
+                gecko_vol1 = _num(c.get("volume_1h_usd"))
+                dex_vol1 = _num(volume.get("h1"))
+                if gecko_vol1 > 0 and dex_vol1 > 0 and max(gecko_vol1, dex_vol1) / min(gecko_vol1, dex_vol1) > 5:
+                    c["market_data_discrepancy"] = True
+                    c.setdefault("risk_flags", []).append("GeckoTerminal and DEX Screener 1h volume disagree by more than 5x")
+                gecko_change1 = _num(c.get("change_1h_pct"))
+                dex_change1 = change.get("h1")
+                if dex_change1 is not None and abs(gecko_change1 - _num(dex_change1)) > 40:
+                    c["market_data_discrepancy"] = True
+                    c.setdefault("risk_flags", []).append("GeckoTerminal and DEX Screener 1h price changes disagree by more than 40 percentage points")
         except Exception as exc:
             logger.info("DEX Screener cross-check unavailable: %s", type(exc).__name__)
             for c in candidates:
@@ -319,7 +329,12 @@ class TrendingTokenScanner:
             return "REJECTED", ["On-chain mint authority is still active"]
         if info.get("freezeAuthority") not in (None, ""):
             return "REJECTED", ["On-chain freeze authority is still active"]
-        for ext in info.get("extensions") or []:
+        extensions = info.get("extensions")
+        if owner == TOKEN_2022_PROGRAM_ID and not isinstance(extensions, list):
+            return "REVIEW", ["Token-2022 extension list is missing; extension safety cannot be verified"]
+        if extensions is not None and not isinstance(extensions, list):
+            return "UNKNOWN", ["Token extension data is malformed"]
+        for ext in extensions or []:
             if not isinstance(ext, dict):
                 return "UNKNOWN", ["Token extension metadata is malformed"]
             name = str(ext.get("extension") or ext.get("type") or "").replace("_", "").lower()
