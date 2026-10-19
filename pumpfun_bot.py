@@ -1958,6 +1958,209 @@ class PumpFunBot:
             detail += "; transient preflight retry limit reached, no buy submitted"
         self._set_discovery_live_status(candidate, status, detail)
 
+    def _process_trending_live_entries(self) -> None:
+        """Consider only freshly screened trending candidates; each mint gets one live attempt."""
+        if (
+            self.s.mode != "live"
+            or not self.s.trending_discovery_enabled
+            or not self.s.trending_discovery_live_enabled
+        ):
+            return
+
+        now = time.time()
+        freshness_seconds = max(90, min(180, self.s.trending_discovery_poll_seconds + 30))
+        candidates = self.trending_scanner.dashboard_snapshot().get("candidates", [])
+        for original in candidates:
+            if str(original.get("status") or "") != "SCREENED":
+                continue
+            mint = str(original.get("mint") or "")
+            if not mint:
+                continue
+            prior_status = self.store.get_state(f"trending_live_status:{mint}", "")
+            # Submitted, uncertain, blocked or closed candidates are one-shot. Never
+            # replay a buy after a restart or after a delayed API/RPC response.
+            if prior_status:
+                continue
+            try:
+                updated_at = float(original.get("updated_at") or 0)
+                pool_created_at = float(original.get("pool_created_at") or 0)
+            except (TypeError, ValueError):
+                updated_at, pool_created_at = 0.0, 0.0
+            if updated_at <= 0 or now - updated_at > freshness_seconds or updated_at > now + 5:
+                self.trending_scanner.set_live_status(
+                    mint, "skipped_stale", "Trending/risk screen is stale; a fresh scan is required"
+                )
+                continue
+            if (
+                pool_created_at <= 0
+                or pool_created_at > now
+                or now - pool_created_at > self.s.trending_max_pool_age_hours * 3600
+            ):
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", "Pool creation time is missing or outside the configured age window"
+                )
+                continue
+            if (
+                not original.get("dexscreener_confirmed")
+                or original.get("same_pool_crosscheck") is not True
+                or original.get("market_data_discrepancy")
+                or original.get("onchain_status") != "PASS"
+                or original.get("rugcheck_status") != "SAFE_CANDIDATE"
+            ):
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", "Independent market, on-chain mint or RugCheck result is not trade-qualified"
+                )
+                continue
+
+            # Verify the same DEX pool again just before order construction.
+            try:
+                market = self.market.token_market(mint)
+            except Exception as exc:
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", f"Fresh market recheck failed ({type(exc).__name__})"
+                )
+                continue
+            if not market:
+                self.trending_scanner.set_live_status(mint, "blocked", "Fresh DEX pool is unavailable")
+                continue
+            if str(market.get("pair_address") or "") != str(original.get("dexscreener_pair_address") or ""):
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", "Highest-liquidity DEX pair changed since screening"
+                )
+                continue
+            raw_market = market.get("raw") or {}
+            liquidity = float(market.get("liquidity_usd") or 0)
+            price = float(market.get("price_usd") or 0)
+            volume = raw_market.get("volume") or {}
+            txns = raw_market.get("txns") or {}
+            changes = raw_market.get("priceChange") or {}
+            buys = int(float(((txns.get("h1") or {}).get("buys")) or 0))
+            sells = int(float(((txns.get("h1") or {}).get("sells")) or 0))
+            volume1 = float(volume.get("h1") or 0)
+            pair_age = int(market.get("pair_age_seconds") or 0)
+            if (
+                liquidity < self.s.trending_min_liquidity_usd
+                or volume1 < self.s.trending_min_volume_1h_usd
+                or price <= 0
+                or pair_age < self.s.min_pair_age_seconds
+            ):
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", "Fresh same-pool price/liquidity/volume/age requirements no longer pass"
+                )
+                continue
+            if buys <= sells:
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", "Fresh DEX one-hour trade flow no longer favors buys"
+                )
+                continue
+
+            gecko_liquidity = float(original.get("gecko_liquidity_usd") or original.get("liquidity_usd") or 0)
+            gecko_volume = float(original.get("volume_1h_usd") or 0)
+            dex_liquidity = liquidity
+            if gecko_liquidity > 0 and max(gecko_liquidity, dex_liquidity) / min(gecko_liquidity, dex_liquidity) > 3:
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", "Fresh DEX and GeckoTerminal liquidity now disagree by more than 3x"
+                )
+                continue
+            if gecko_volume > 0 and volume1 > 0 and max(gecko_volume, volume1) / min(gecko_volume, volume1) > 5:
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", "Fresh DEX and GeckoTerminal one-hour volume now disagree by more than 5x"
+                )
+                continue
+            if (
+                changes.get("h1") is not None
+                and abs(float(original.get("change_1h_pct") or 0) - float(changes.get("h1") or 0)) > 40
+            ):
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", "Fresh DEX and GeckoTerminal one-hour price changes disagree by more than 40 points"
+                )
+                continue
+
+            fresh_candidate = dict(original)
+            fresh_candidate.update({
+                "liquidity_usd": min(gecko_liquidity, dex_liquidity) if gecko_liquidity > 0 else dex_liquidity,
+                "volume_1h_usd": volume1,
+                "volume_24h_usd": float(volume.get("h24") or 0),
+                "change_1h_pct": float(changes.get("h1") or 0),
+                "change_24h_pct": float(changes.get("h24") or 0),
+                "dexscreener_buys_1h": buys,
+                "dexscreener_sells_1h": sells,
+                "risk_flags": list(original.get("risk_flags") or []),
+            })
+            # Refresh on-chain mint controls and RugCheck again immediately before trading.
+            try:
+                fresh_candidate = self.trending_scanner._evaluate(fresh_candidate)
+            except Exception as exc:
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", f"Fresh mint/RugCheck recheck failed ({type(exc).__name__})"
+                )
+                continue
+            if fresh_candidate.get("status") != "SCREENED":
+                self.trending_scanner.set_live_status(
+                    mint, "blocked",
+                    "Fresh security recheck did not pass: " + str(fresh_candidate.get("decision") or "unknown"),
+                )
+                continue
+            if int(fresh_candidate.get("momentum_score") or 0) < self.s.trending_min_score:
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", f"Fresh momentum score is below {self.s.trending_min_score}/100"
+                )
+                continue
+
+            try:
+                mint_account = self.rpc.call(
+                    "getAccountInfo", [mint, {"encoding": "jsonParsed", "commitment": "confirmed"}]
+                ) or {}
+                account = mint_account.get("value") or {}
+                info = ((((account.get("data") or {}).get("parsed") or {}).get("info")) or {})
+                decimals = int(info.get("decimals", -1))
+                supply_raw = int(info.get("supply") or 0)
+                if decimals < 0 or decimals > 18 or supply_raw <= 0:
+                    raise ValueError("invalid token decimals/supply")
+                total_supply_tokens = supply_raw / (10 ** decimals)
+            except Exception as exc:
+                self.trending_scanner.set_live_status(
+                    mint, "blocked", f"Could not verify fresh mint decimals/supply ({type(exc).__name__})"
+                )
+                continue
+
+            # Every candidate is recorded as checked before the one-shot buy path begins.
+            self.trending_scanner.set_live_status(
+                mint, "checking", "Fresh same-pool, mint, holder-risk and RugCheck gates passed; verifying portfolio budget"
+            )
+            signal = {
+                "mint": mint,
+                "wallet": "",
+                "signature": f"trending-discovery-{mint}-{int(updated_at * 1000)}",
+                "side": "buy",
+                "amount_ui": 0.0,
+                "decimals": decimals,
+                "total_supply_tokens": total_supply_tokens,
+                "observed_price_usd": price,
+                "source": "trending_discovery",
+                "fresh_security_verified": True,
+                "status": "SCREENED",
+                "momentum_score": int(fresh_candidate.get("momentum_score") or 0),
+                "real_liquidity_usd": liquidity,
+                "volume_1h_usd": volume1,
+                "dexscreener_buys_1h": buys,
+                "dexscreener_sells_1h": sells,
+                "dexscreener_pair_address": str(market.get("pair_address") or ""),
+                "same_pool_crosscheck": True,
+                "market_data_discrepancy": False,
+                "rugcheck_status": fresh_candidate.get("rugcheck_status"),
+                "onchain_status": fresh_candidate.get("onchain_status"),
+                "market_cap_usd": fresh_candidate.get("market_cap_usd"),
+            }
+            self.buy(
+                signal,
+                strategy="trending_discovery",
+                entry_cap_usd=min(0.50, float(self.s.trending_discovery_max_entry_usd)),
+            )
+            # At most one candidate can submit per bot loop. A successful fill or
+            # ambiguous outcome is tracked through persistent live_entry_status.
+            return
+
     def _process_discovery_live_entries(self) -> None:
         """Turn only fresh, newly-qualified shadow entries into small opt-in live buys."""
         if (
