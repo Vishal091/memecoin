@@ -1736,134 +1736,222 @@ class PumpFunBot:
             tx_sig = "PAPER-SELL"
         else:
             assert self.keypair is not None and self.wallet_address is not None
-            available = self.executor.token_balance_raw(self.wallet_address, mint)
-            requested_raw = min(requested_raw, available)
-            if requested_raw <= 0:
-                # Before pausing, look for an on-chain full Pump/PumpSwap sale after
-                # this position opened. Only an exact quantity match, wallet signature,
-                # successful execution and zero post-balance can reconcile the ledger.
-                # This is read-only chain inspection; it never retries/submits a sale.
-                evidence = None
-                if available <= 0:
-                    finder = getattr(self.executor, "find_confirmed_full_sale", None)
-                    if callable(finder):
-                        try:
-                            evidence = finder(
-                                owner=self.wallet_address,
-                                mint=mint,
-                                expected_raw=int(position.get("amount_raw") or 0),
-                                opened_at=str(position.get("opened_at") or ""),
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "Could not inspect prior full-sale history for %s: %s",
-                                mint[:8], " ".join(str(exc).split())[:220],
-                            )
-                if evidence:
-                    tx_signature = str(evidence.get("signature") or "")
-                    try:
-                        exited_at = datetime.fromtimestamp(
-                            int(evidence.get("block_time") or 0), timezone.utc
-                        ).isoformat(timespec="seconds")
-                    except (TypeError, ValueError, OverflowError, OSError):
-                        exited_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                    reconcile_reason = (
-                        "Verified on-chain full Pump/PumpSwap sell; stale position reconciled "
-                        f"from confirmed signature {tx_signature}. Historical USD proceeds and "
-                        "realized P&L were not recorded and are intentionally left unestimated."
+            if position.get("strategy", "leader_copy") == "trending_discovery":
+                try:
+                    available = self.executor.token_balance_raw(self.wallet_address, mint)
+                except Exception as exc:
+                    logger.error("Cannot confirm trending-token balance for %s: %s", mint[:8], type(exc).__name__)
+                    return False
+                requested_raw = min(requested_raw, available)
+                if requested_raw <= 0:
+                    self.store.set_state(
+                        f"exit_blocked_balance_zero:{mint}",
+                        "Wallet reports zero trending-token balance; inspect Jupiter transaction history before reconciling.",
                     )
-                    reconciled = self.store.reconcile_confirmed_full_exit(
-                        position,
-                        mode=self.s.mode,
-                        tx_signature=tx_signature,
-                        ts=exited_at,
-                        reason=reconcile_reason,
-                    )
-                    if reconciled:
-                        self.price_cache.pop(mint, None)
-                        self.price_cache_at.pop(mint, None)
+                    self.store.set_state(pending_key, "")
+                    self.store.set_state(pending_amount_key, "")
+                    self.store.set_state(pending_wallet_key, "")
+                    self.store.set_state(pending_signature_key, "")
+                    if manual_exit:
                         self.message = (
-                            f"Reconciled confirmed on-chain full exit for {mint[:8]}; no new sell "
-                            "was submitted. Historical USD proceeds/P&L are unavailable in the ledger."
+                            f"Manual exit for {mint[:8]} paused: token balance is zero and no "
+                            "confirmed Jupiter sale has been reconciled."
                         )
-                        logger.warning(
-                            "Reconciled stale position mint=%s from confirmed full-sale signature=%s; "
-                            "no transaction submitted and no historical P&L inferred",
-                            mint[:8], tx_signature,
+                    return False
+                before_raw = available
+                try:
+                    before_sol = self.rpc.sol_balance_lamports(self.wallet_address)
+                except Exception as exc:
+                    logger.error("Cannot read SOL balance before trending sell %s: %s", mint[:8], type(exc).__name__)
+                    return False
+                try:
+                    self.trending_executor.swap(
+                        owner=self.wallet_address,
+                        keypair=self.keypair,
+                        input_mint=mint,
+                        output_mint="So11111111111111111111111111111111111111112",
+                        amount_raw=requested_raw,
+                        action="sell",
+                        output_decimals=9,
+                    )
+                except TransactionOutcomeUncertain as exc:
+                    self._handle_uncertain_trade(
+                        exc, source_wallet=source_wallet, source_signature=source_signature,
+                    )
+                    return False
+                except TransactionFailedOnChain as exc:
+                    delay = self._defer_native_build_retry(mint, str(exc))
+                    logger.warning(
+                        "Jupiter trending sell failed on-chain mint=%s; retry deferred %ds: %s",
+                        mint[:8], delay, str(exc)[:250],
+                    )
+                    return False
+                except (TransactionBuildFailed, TransactionSimulationFailed) as exc:
+                    detail = " ".join(str(exc).split())[:300]
+                    delay = self._defer_native_build_retry(mint, detail)
+                    if manual_exit:
+                        self.message = (
+                            f"Manual trending exit for {mint[:8]} was not submitted; "
+                            f"retry deferred {delay}s. {detail}"
                         )
+                    logger.warning("Jupiter trending sell not submitted mint=%s: %s", mint[:8], detail)
+                    return False
+                try:
+                    after_raw = self.executor.token_balance_raw(self.wallet_address, mint)
+                    after_sol = self.rpc.sol_balance_lamports(self.wallet_address)
+                except Exception as exc:
+                    uncertain = TransactionOutcomeUncertain(
+                        "confirmed-signature-unavailable", "sell", mint,
+                        f"Jupiter reported success but balance reconciliation failed ({type(exc).__name__})",
+                    )
+                    self._handle_uncertain_trade(
+                        uncertain, source_wallet=source_wallet, source_signature=source_signature,
+                    )
+                    return False
+                sold_raw = before_raw - int(after_raw)
+                sol_delta_lamports = int(after_sol) - int(before_sol)
+                if sold_raw <= 0 or sold_raw > requested_raw or sol_delta_lamports <= 0:
+                    uncertain = TransactionOutcomeUncertain(
+                        "confirmed-signature-unavailable", "sell", mint,
+                        "Jupiter reported success but token reduction/native SOL proceeds did not reconcile",
+                    )
+                    self._handle_uncertain_trade(
+                        uncertain, source_wallet=source_wallet, source_signature=source_signature,
+                    )
+                    return False
+                tx_sig = self.store.get_state(f"unresolved_trade_signature:{mint}", "") or "JUPITER_CONFIRMED"
+                proceeds = (sol_delta_lamports / 1_000_000_000) * self.market.sol_price_usd()
+                units_sold = raw_to_units(sold_raw, decimals)
+            else:
+                available = self.executor.token_balance_raw(self.wallet_address, mint)
+                requested_raw = min(requested_raw, available)
+                if requested_raw <= 0:
+                    # Before pausing, look for an on-chain full Pump/PumpSwap sale after
+                    # this position opened. Only an exact quantity match, wallet signature,
+                    # successful execution and zero post-balance can reconcile the ledger.
+                    # This is read-only chain inspection; it never retries/submits a sale.
+                    evidence = None
+                    if available <= 0:
+                        finder = getattr(self.executor, "find_confirmed_full_sale", None)
+                        if callable(finder):
+                            try:
+                                evidence = finder(
+                                    owner=self.wallet_address,
+                                    mint=mint,
+                                    expected_raw=int(position.get("amount_raw") or 0),
+                                    opened_at=str(position.get("opened_at") or ""),
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "Could not inspect prior full-sale history for %s: %s",
+                                    mint[:8], " ".join(str(exc).split())[:220],
+                                )
+                    if evidence:
+                        tx_signature = str(evidence.get("signature") or "")
                         try:
-                            self._refresh_feed_subscriptions()
-                        except Exception:
-                            logger.exception("Could not refresh subscriptions after exit reconciliation")
-                        return True
-
-                detail = (
-                    "Configured wallet reports zero token balance; no matching full Pump/PumpSwap "
-                    "sale was verified after the position opened."
-                )
-                self.store.set_state(f"exit_blocked_balance_zero:{mint}", detail)
-                # Stop repeated attempts. Keep the ledger position visible until a
-                # human can reconcile it or a later fresh history check succeeds.
-                self.store.set_state(f"exit_pending:{mint}", "")
-                self.store.set_state(f"exit_pending_amount_raw:{mint}", "")
-                self.store.set_state(f"exit_pending_source_wallet:{mint}", "")
-                self.store.set_state(f"exit_pending_source_signature:{mint}", "")
-                if manual_exit:
-                    self.message = (
-                        f"Manual exit for {mint[:8]} paused: zero wallet balance and no matching full-sale "
-                        "transaction could be verified. Position retained for reconciliation."
+                            exited_at = datetime.fromtimestamp(
+                                int(evidence.get("block_time") or 0), timezone.utc
+                            ).isoformat(timespec="seconds")
+                        except (TypeError, ValueError, OverflowError, OSError):
+                            exited_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                        reconcile_reason = (
+                            "Verified on-chain full Pump/PumpSwap sell; stale position reconciled "
+                            f"from confirmed signature {tx_signature}. Historical USD proceeds and "
+                            "realized P&L were not recorded and are intentionally left unestimated."
+                        )
+                        reconciled = self.store.reconcile_confirmed_full_exit(
+                            position,
+                            mode=self.s.mode,
+                            tx_signature=tx_signature,
+                            ts=exited_at,
+                            reason=reconcile_reason,
+                        )
+                        if reconciled:
+                            self.price_cache.pop(mint, None)
+                            self.price_cache_at.pop(mint, None)
+                            self.message = (
+                                f"Reconciled confirmed on-chain full exit for {mint[:8]}; no new sell "
+                                "was submitted. Historical USD proceeds/P&L are unavailable in the ledger."
+                            )
+                            logger.warning(
+                                "Reconciled stale position mint=%s from confirmed full-sale signature=%s; "
+                                "no transaction submitted and no historical P&L inferred",
+                                mint[:8], tx_signature,
+                            )
+                            try:
+                                self._refresh_feed_subscriptions()
+                            except Exception:
+                                logger.exception("Could not refresh subscriptions after exit reconciliation")
+                            return True
+    
+                    detail = (
+                        "Configured wallet reports zero token balance; no matching full Pump/PumpSwap "
+                        "sale was verified after the position opened."
                     )
-                logger.error(
-                    "Sell paused for %s: zero token balance and no verified matching full-sale transaction; "
-                    "position retained and automatic retry suppressed",
-                    mint,
-                )
-                return False
-            units_requested = raw_to_units(requested_raw, decimals)
-            preferred = self.store.get_state(f"pool:{mint}", "pump")
-            try:
-                result = self.executor.trade(
-                    owner=self.wallet_address, keypair=self.keypair, mint=mint, action="sell",
-                    amount=units_requested, denominated_in_sol=False,
-                    slippage_bps=self.s.slippage_bps, preferred_pool=preferred,
-                    amount_raw=requested_raw,
-                )
-            except TransactionExpiredNotLanded as exc:
-                self._handle_expired_not_landed_trade(
-                    exc,
-                    source_wallet=source_wallet,
-                    source_signature=source_signature,
-                    reason=reason,
-                )
-                return False
-            except TransactionOutcomeUncertain as exc:
-                self._handle_uncertain_trade(
-                    exc,
-                    source_wallet=source_wallet,
-                    source_signature=source_signature,
-                )
-                return False
-            except TransactionBuildFailed as exc:
-                detail = " ".join(str(exc).split())[:220]
-                delay = self._defer_native_build_retry(mint, detail)
-                if manual_exit:
-                    self.message = (
-                        f"Manual exit for {mint[:8]} was not submitted: builder failed before signing; "
-                        f"retry deferred {delay}s. {detail}"
+                    self.store.set_state(f"exit_blocked_balance_zero:{mint}", detail)
+                    # Stop repeated attempts. Keep the ledger position visible until a
+                    # human can reconcile it or a later fresh history check succeeds.
+                    self.store.set_state(f"exit_pending:{mint}", "")
+                    self.store.set_state(f"exit_pending_amount_raw:{mint}", "")
+                    self.store.set_state(f"exit_pending_source_wallet:{mint}", "")
+                    self.store.set_state(f"exit_pending_source_signature:{mint}", "")
+                    if manual_exit:
+                        self.message = (
+                            f"Manual exit for {mint[:8]} paused: zero wallet balance and no matching full-sale "
+                            "transaction could be verified. Position retained for reconciliation."
+                        )
+                    logger.error(
+                        "Sell paused for %s: zero token balance and no verified matching full-sale transaction; "
+                        "position retained and automatic retry suppressed",
+                        mint,
                     )
-                logger.error(
-                    "Could not build sell for %s; no transaction was signed or submitted. "
-                    "Tracked position and pending exit are retained; retry deferred %ds: %s",
-                    mint[:8], delay, detail,
-                )
-                return False
-            tx_sig = result["signature"]
-            sold_raw = abs(int(result["token_delta_raw"]))
-            sol_received = max(0, int(result["sol_delta_lamports"])) / 1_000_000_000
-            proceeds = sol_received * self.market.sol_price_usd()
-            units_sold = raw_to_units(sold_raw, decimals)
-            if sold_raw <= 0:
-                raise RuntimeError("PumpPortal confirmed sell without a token balance decrease")
+                    return False
+                units_requested = raw_to_units(requested_raw, decimals)
+                preferred = self.store.get_state(f"pool:{mint}", "pump")
+                try:
+                    result = self.executor.trade(
+                        owner=self.wallet_address, keypair=self.keypair, mint=mint, action="sell",
+                        amount=units_requested, denominated_in_sol=False,
+                        slippage_bps=self.s.slippage_bps, preferred_pool=preferred,
+                        amount_raw=requested_raw,
+                    )
+                except TransactionExpiredNotLanded as exc:
+                    self._handle_expired_not_landed_trade(
+                        exc,
+                        source_wallet=source_wallet,
+                        source_signature=source_signature,
+                        reason=reason,
+                    )
+                    return False
+                except TransactionOutcomeUncertain as exc:
+                    self._handle_uncertain_trade(
+                        exc,
+                        source_wallet=source_wallet,
+                        source_signature=source_signature,
+                    )
+                    return False
+                except TransactionBuildFailed as exc:
+                    detail = " ".join(str(exc).split())[:220]
+                    delay = self._defer_native_build_retry(mint, detail)
+                    if manual_exit:
+                        self.message = (
+                            f"Manual exit for {mint[:8]} was not submitted: builder failed before signing; "
+                            f"retry deferred {delay}s. {detail}"
+                        )
+                    logger.error(
+                        "Could not build sell for %s; no transaction was signed or submitted. "
+                        "Tracked position and pending exit are retained; retry deferred %ds: %s",
+                        mint[:8], delay, detail,
+                    )
+                    return False
+                tx_sig = result["signature"]
+                sold_raw = abs(int(result["token_delta_raw"]))
+                sol_received = max(0, int(result["sol_delta_lamports"])) / 1_000_000_000
+                proceeds = sol_received * self.market.sol_price_usd()
+                units_sold = raw_to_units(sold_raw, decimals)
+                if sold_raw <= 0:
+                    raise RuntimeError("PumpPortal confirmed sell without a token balance decrease")
+    
 
         basis = float(position["invested_usd"]) * (sold_raw / current_raw)
         realized_pnl = proceeds - basis
