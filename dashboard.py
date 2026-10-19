@@ -98,8 +98,8 @@ function render(d){
   }).join(""):"<tr><td colspan='9' class='empty'>No discovery candidates recorded yet.</td></tr>";
   var tr=d.trending_discovery||{};
   el("trendingSummary").textContent=tr.enabled
-    ? "TRENDING SCANNER ENABLED · last scan "+ago(tr.last_scan_at)+" · pools "+(tr.pool_count||0)+" · checked "+(tr.checked_count||0)+" · screened "+(tr.screened_count||0)+" · rejected/filtered "+(tr.rejected_count||0)+" · liquidity floor $"+num(tr.min_liquidity_usd)+" · 1h volume floor $"+num(tr.min_volume_1h_usd)+" · interval "+(tr.poll_seconds||60)+"s"+(tr.last_error?" · Last error: "+tr.last_error:"")
-    : "TRENDING SCANNER DISABLED · Set TRENDING_DISCOVERY_ENABLED=true to enable the analysis-only scan.";
+    ? "TRENDING SCANNER ENABLED · live entries "+(tr.live_enabled?"ON":"OFF")+" · max swap input $"+num(tr.live_entry_cap_usd||0.50)+" · score floor "+(tr.min_score||75)+"/100 · max price impact "+num(tr.max_price_impact_pct||5)+"% · last scan "+ago(tr.last_scan_at)+" · pools "+(tr.pool_count||0)+" · checked "+(tr.checked_count||0)+" · screened "+(tr.screened_count||0)+" · rejected/filtered "+(tr.rejected_count||0)+" · liquidity floor $"+num(tr.min_liquidity_usd)+" · 1h volume floor $"+num(tr.min_volume_1h_usd)+" · interval "+(tr.poll_seconds||60)+"s"+(tr.last_error?" · Last error: "+tr.last_error:"")
+    : "TRENDING SCANNER DISABLED · Set TRENDING_DISCOVERY_ENABLED=true to enable screening.";
   var trendRows=tr.candidates||[];
   el("trendingCandidates").innerHTML=trendRows.length?trendRows.map(function(x){
     var changes=["change_5m_pct","change_1h_pct","change_6h_pct","change_24h_pct"].map(function(k){var v=x[k];return v===undefined||v===null?"—":((Number(v)>=0?"+":"")+Number(v).toFixed(1)+"%")});
