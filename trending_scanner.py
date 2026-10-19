@@ -314,6 +314,7 @@ class TrendingTokenScanner:
         self.store = store
         self.on_screened = on_screened
         self.enabled = bool(getattr(settings, "trending_discovery_enabled", False))
+        self.live_enabled = bool(getattr(settings, "trending_discovery_live_enabled", False))
         self.poll_seconds = max(60, min(900, int(getattr(settings, "trending_discovery_poll_seconds", 60))))
         self.max_candidates = max(1, min(20, int(getattr(settings, "trending_discovery_max_candidates", 8))))
         self.min_liquidity_usd = max(15000.0, float(getattr(settings, "trending_min_liquidity_usd", 15000.0)))
@@ -332,10 +333,16 @@ class TrendingTokenScanner:
         self._pool_count = self._checked_count = self._screened_count = self._rejected_count = self._scan_count = 0
 
     def start(self) -> None:
-        if self.enabled and not (self._thread and self._thread.is_alive()):
+        if not self.enabled:
+            return
+        if self._thread and self._thread.is_alive():
+            # If re-enabled during an in-flight request, reuse that worker rather
+            # than leaving scanning permanently stopped after the request returns.
             self._stop.clear()
-            self._thread = threading.Thread(target=self._run, name="trending-token-scanner", daemon=True)
-            self._thread.start()
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="trending-token-scanner", daemon=True)
+        self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
@@ -542,7 +549,7 @@ class TrendingTokenScanner:
             live_active = (
                 str(getattr(self.settings, "mode", "paper")).lower() == "live"
                 and bool(getattr(self.settings, "trending_discovery_enabled", False))
-                and bool(getattr(self.settings, "trending_discovery_live_enabled", False))
+                and self.live_enabled
             )
             score_eligible = int(item.get("momentum_score") or 0) >= int(
                 getattr(self.settings, "trending_min_score", 75)
@@ -564,9 +571,7 @@ class TrendingTokenScanner:
 
     def verify_live_candidate(self, candidate: dict) -> dict:
         """Fail closed if the exact pool or fresh on-chain/risk checks no longer pass."""
-        if str(getattr(self.settings, "mode", "paper")).lower() != "live" or not self.enabled or not bool(
-            getattr(self.settings, "trending_discovery_live_enabled", False)
-        ):
+        if str(getattr(self.settings, "mode", "paper")).lower() != "live" or not self.enabled or not self.live_enabled:
             raise ValueError("Trending live opt-in is not active")
         mint = str(candidate.get("mint") or "").strip()
         pool = str(candidate.get("pool_address") or "").strip()
@@ -694,7 +699,7 @@ class TrendingTokenScanner:
             self.on_screened is not None
             and str(getattr(self.settings, "mode", "paper")).lower() == "live"
             and self.enabled
-            and bool(getattr(self.settings, "trending_discovery_live_enabled", False))
+            and self.live_enabled
         )
         # Only one live discovery candidate may be in flight at a time. Persisted
         # "submitting"/"uncertain" states intentionally block new entries after a
@@ -778,7 +783,7 @@ class TrendingTokenScanner:
             live_active = (
                 str(getattr(self.settings, "mode", "paper")).lower() == "live"
                 and self.enabled
-                and bool(getattr(self.settings, "trending_discovery_live_enabled", False))
+                and self.live_enabled
             )
             return {
                 "enabled": self.enabled, "analysis_only": not live_active, "last_scan_at": self._last_scan_at,
