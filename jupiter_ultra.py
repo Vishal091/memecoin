@@ -288,6 +288,7 @@ class JupiterUltraExecutor:
         allowed_programs = CORE_PROGRAMS | allowed_dex_programs
         wsol_ata = self._expected_wsol_ata(owner)
         saw_system_input = False
+        system_input_lamports = 0
         instructions = list(getattr(message, "instructions", []) or [])
         if not instructions:
             raise TransactionBuildFailed("Jupiter transaction has no instructions")
@@ -326,6 +327,7 @@ class JupiterUltraExecutor:
                     raise TransactionBuildFailed(
                         "Jupiter transaction attempts an unexpected SOL transfer; no signature made"
                     )
+                system_input_lamports += lamports
                 saw_system_input = True
             elif program_id in {TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID}:
                 # Top-level token instructions are restricted to SyncNative and
@@ -345,12 +347,13 @@ class JupiterUltraExecutor:
                             "WSOL account close would not return lamports to the bot wallet"
                         )
 
-        if input_mint == WSOL_MINT and not saw_system_input:
-            # Some routes can use an existing WSOL balance. Trending buys are required
-            # to spend fresh SOL, so reject that route rather than silently spending a
-            # different asset balance.
+        if input_mint == WSOL_MINT and (
+            not saw_system_input or system_input_lamports != amount_raw
+        ):
+            # Trending buys must spend only the exact requested SOL input. Refuse
+            # transactions that wrap existing WSOL or fund a different amount.
             raise TransactionBuildFailed(
-                "Jupiter buy transaction contains no bounded SOL-to-WSOL funding transfer"
+                "Jupiter buy transaction does not transfer exactly the bounded SOL input"
             )
 
         try:
