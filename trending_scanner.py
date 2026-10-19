@@ -317,6 +317,10 @@ class TrendingTokenScanner:
         self.min_volume_1h_usd = max(10000.0, float(getattr(settings, "trending_min_volume_1h_usd", 10000.0)))
         self.timeout = max(3, min(15, int(timeout)))
         self._lock = threading.RLock()
+        # Public RugCheck API documentation specifies 1 request/second for the
+        # unauthenticated tier. Pace initial scans and live preflight through one lock.
+        self._rugcheck_lock = threading.Lock()
+        self._rugcheck_last_call = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._candidates: dict[str, dict] = {}
@@ -342,6 +346,15 @@ class TrendingTokenScanner:
         response = requests.get(url, headers=headers, timeout=self.timeout)
         response.raise_for_status()
         return response.json()
+
+    def _get_rugcheck_report(self, mint: str) -> Any:
+        """Fetch a full report with one-second pacing to avoid avoidable free-tier 429s."""
+        with self._rugcheck_lock:
+            wait_seconds = 1.05 - (time.monotonic() - self._rugcheck_last_call)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            self._rugcheck_last_call = time.monotonic()
+            return self._get_json(f"{RUGCHECK}/tokens/{mint}/report")
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -505,7 +518,7 @@ class TrendingTokenScanner:
             item.update({"status": "UNKNOWN", "decision": "; ".join(flags)})
             return item
         try:
-            report = self._get_json(f"{RUGCHECK}/tokens/{item['mint']}/report")
+            report = self._get_rugcheck_report(item["mint"])
         except Exception as exc:
             item["rugcheck_status"] = "UNAVAILABLE"
             item.setdefault("risk_flags", []).append(f"RugCheck unavailable ({type(exc).__name__})")
@@ -591,7 +604,7 @@ class TrendingTokenScanner:
         if supply_raw <= 0 or not 0 <= decimals <= 12:
             raise ValueError("Fresh token supply/decimals are outside the accepted range")
 
-        report = self._get_json(f"{RUGCHECK}/tokens/{mint}/report")
+        report = self._get_rugcheck_report(mint)
         rug_status, rug_flags = evaluate_rugcheck_report(report, pool)
         if rug_status != "SAFE_CANDIDATE":
             raise ValueError("Fresh RugCheck did not pass: " + "; ".join(rug_flags)[:250])
