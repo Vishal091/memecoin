@@ -176,7 +176,8 @@ class PumpFunBot:
             self.s, self.rpc, self.market, self.store, self.feed
         )
         self.trending_scanner = TrendingTokenScanner(
-            self.s, self.rpc, timeout=self.s.request_timeout_seconds, store=self.store
+            self.s, self.rpc, timeout=self.s.request_timeout_seconds, store=self.store,
+            on_screened=self._queue_trending_candidate,
         )
         if self.feed:
             self.feed.set_discovery_subscriptions(self.token_discovery.enabled, [])
@@ -651,6 +652,16 @@ class PumpFunBot:
         # Deduplicate per wallet so one recipient cannot suppress a signer actual trade.
         return f"{wallet}|{signature}"
 
+    def _queue_trending_candidate(self, candidate: dict) -> None:
+        """Move scanner results onto the main bot loop; scanner threads never trade."""
+        signal = dict(candidate)
+        signal["source"] = "trending_discovery"
+        signal["fresh_security_verified"] = False
+        self.trade_events.put({
+            "source": "trending_discovery_candidate",
+            "signal": signal,
+        })
+
     def _consume_feed_events(self) -> None:
         while True:
             try:
@@ -659,6 +670,11 @@ class PumpFunBot:
                 break
             self.signal_stats["queued_events"] += 1
             source = str(event.get("source") or "")
+            if source == "trending_discovery_candidate":
+                signal = event.get("signal")
+                if isinstance(signal, dict):
+                    self._buy_trending_discovery(signal)
+                continue
             if source == "token_discovery_new":
                 self.token_discovery.on_new_token_event(event)
                 continue
