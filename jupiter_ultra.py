@@ -339,6 +339,13 @@ class JupiterUltraExecutor:
                 "taker": owner,
             },
         )
+        if expected_output_value_usd is None and action == "buy" and expected_price_usd is not None:
+            try:
+                quoted_out = int(order.get("outAmount") or 0)
+            except (TypeError, ValueError, OverflowError):
+                quoted_out = 0
+            if quoted_out > 0 and output_decimals >= 0:
+                expected_output_value_usd = (quoted_out / (10 ** output_decimals)) * float(expected_price_usd)
         out_amount = self._validate_order_fields(
             order,
             input_mint=input_mint,
