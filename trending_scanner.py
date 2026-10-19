@@ -228,7 +228,7 @@ class TrendingTokenScanner:
     def _get_json(self, url: str, gecko: bool = False) -> Any:
         headers = {"Accept": "application/json", "User-Agent": "MemecoinResearchBot/1.0"}
         if gecko:
-            headers["Accept"] = "application/json;version=20230302"
+            headers["Accept"] = "application/json;version=20230203"
         response = requests.get(url, headers=headers, timeout=self.timeout)
         response.raise_for_status()
         return response.json()
@@ -269,6 +269,14 @@ class TrendingTokenScanner:
                     c.setdefault("risk_flags", []).append("No matching DEX Screener pair; market cross-check incomplete")
                     c["dexscreener_confirmed"] = False
                     continue
+                base, quote = pair.get("baseToken") or {}, pair.get("quoteToken") or {}
+                chosen = base if str(base.get("address") or "") == str(c.get("mint") or "") else quote
+                if chosen.get("name"):
+                    c["name"] = str(chosen["name"])
+                if chosen.get("symbol"):
+                    c["symbol"] = str(chosen["symbol"]).upper()
+                c["dexscreener_pair_address"] = str(pair.get("pairAddress") or "")
+                c["dexscreener_url"] = str(pair.get("url") or "")
                 dex_liq = _num((pair.get("liquidity") or {}).get("usd"))
                 gecko_liq = _num(c.get("liquidity_usd"))
                 if dex_liq > 0:
@@ -372,7 +380,12 @@ class TrendingTokenScanner:
         return item
 
     def scan_once(self) -> None:
-        payload = self._get_json(f"{GECKO}/networks/solana/trending_pools?page=1", gecko=True)
+        # Request token resources explicitly; without include=base_token,quote_token
+        # GeckoTerminal can omit name/symbol attributes and leave every row unnamed.
+        payload = self._get_json(
+            f"{GECKO}/networks/solana/trending_pools?include=base_token,quote_token&page=1",
+            gecko=True,
+        )
         raw = parse_gecko_trending(payload)
         raw.sort(key=lambda x: (score_trending_candidate(x), _num(x.get("liquidity_usd"))), reverse=True)
         self._dexscreener_enrich(raw)
