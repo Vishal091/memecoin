@@ -80,9 +80,15 @@ def parse_gecko_trending(payload: Any) -> list[dict]:
         br = (rel.get("base_token") or {}).get("data") or {}
         qr = (rel.get("quote_token") or {}).get("data") or {}
         base, quote = _token_ref(br.get("id"), included), _token_ref(qr.get("id"), included)
-        token = quote if (base["address"] in QUOTE_MINTS or base["symbol"] in QUOTE_SYMBOLS) else base
+        base_is_quote = base["address"] in QUOTE_MINTS
+        quote_is_quote = quote["address"] in QUOTE_MINTS
+        # Skip quote/quote and token/token pools. Only known SOL/stablecoin mint
+        # addresses may qualify a market; token symbols alone are spoofable.
+        if base_is_quote == quote_is_quote:
+            continue
+        token = quote if base_is_quote else base
         mint = token["address"]
-        if not mint or mint in QUOTE_MINTS or token["symbol"] in QUOTE_SYMBOLS or not (32 <= len(mint) <= 48):
+        if not mint or mint in QUOTE_MINTS or not (32 <= len(mint) <= 48):
             continue
         volume = attrs.get("volume_usd") or {}
         change = attrs.get("price_change_percentage") or {}
@@ -145,54 +151,156 @@ def score_trending_candidate(c: dict) -> int:
     return max(0, min(100, int(round(score))))
 
 
-def evaluate_rugcheck_report(report: Any) -> tuple[str, list[str]]:
-    """Fail closed on missing risk fields; return SAFE_CANDIDATE, REVIEW, REJECTED, UNKNOWN."""
+def _rugcheck_metrics(report: Any, pool_address: str = "") -> dict:
+    """Normalize the documented full RugCheck response without assuming summary-only fields."""
+    if not isinstance(report, dict):
+        return {}
+
+    token = report.get("token") if isinstance(report.get("token"), dict) else {}
+    explicit_level = report.get("riskLevel") or report.get("risk_level") or ""
+    raw_score = report.get("score_normalised", report.get("score_normalized"))
+    score = _num(raw_score, -1.0) if raw_score not in (None, "") else -1.0
+    if not 0 <= score <= 100:
+        score = None
+
+    level = str(explicit_level or "").strip().lower()
+    if not level and score is not None:
+        # Project policy, not an official RugCheck verdict: <=15 is a low-risk
+        # ceiling; 16-35 stays review-only; >35 is rejected below.
+        level = "low" if score <= 15 else ("medium" if score <= 35 else "high")
+
+    def authority_field(name: str) -> tuple[bool, Any]:
+        if name in report:
+            return True, report.get(name)
+        if name in token:
+            return True, token.get(name)
+        return False, None
+
+    mint_present, mint_authority = authority_field("mintAuthority")
+    freeze_present, freeze_authority = authority_field("freezeAuthority")
+
+    top = None
+    for key in ("topHoldersPct", "top10HoldersPct", "top10_holders_pct"):
+        value = report.get(key)
+        if value not in (None, ""):
+            parsed = _num(value, -1.0)
+            if parsed >= 0:
+                top = parsed
+            break
+    if top is None:
+        holders = report.get("topHolders")
+        if isinstance(holders, list) and holders:
+            percentages = []
+            for holder in holders[:10]:
+                if not isinstance(holder, dict) or holder.get("pct") in (None, ""):
+                    percentages = []
+                    break
+                pct = _num(holder.get("pct"), -1.0)
+                if pct < 0 or pct > 100:
+                    percentages = []
+                    break
+                percentages.append(pct)
+            if percentages:
+                top = sum(percentages)
+
+    raw_lp = report.get("lpLockedPct", report.get("lp_locked_pct"))
+    markets = report.get("markets")
+    if pool_address and isinstance(markets, list) and markets:
+        matching_markets = [
+            market for market in markets
+            if isinstance(market, dict)
+            and str(market.get("pubkey") or market.get("address") or "") == pool_address
+        ]
+        # Full reports can describe several markets. Do not borrow LP-lock data
+        # from a different pool and pretend it describes the candidate pool.
+        if matching_markets:
+            lp_info = matching_markets[0].get("lp") or {}
+            raw_lp = lp_info.get("lpLockedPct", matching_markets[0].get("lpLockedPct"))
+        else:
+            raw_lp = None
+    lp = _num(raw_lp, -1.0) if raw_lp not in (None, "") else -1.0
+    if not 0 <= lp <= 100:
+        lp = None
+
+    return {
+        "risk_level": level,
+        "score_normalised": score,
+        "mint_authority_present": mint_present,
+        "mint_authority": mint_authority,
+        "freeze_authority_present": freeze_present,
+        "freeze_authority": freeze_authority,
+        "top_holders_pct": top,
+        "lp_locked_pct": lp,
+    }
+
+
+def evaluate_rugcheck_report(report: Any, pool_address: str = "") -> tuple[str, list[str]]:
+    """Fail closed when RugCheck authority, holder, LP, or risk evidence is missing."""
     if not isinstance(report, dict):
         return "UNKNOWN", ["RugCheck response was not a JSON object"]
     risks = report.get("risks")
-    level = str(report.get("riskLevel") or report.get("risk_level") or "").strip().lower()
-    if not level and not isinstance(risks, list):
-        return "UNKNOWN", ["RugCheck response lacks a risk level and risk list"]
-    flags: list[str] = []
+    if not isinstance(risks, list):
+        return "UNKNOWN", ["RugCheck response lacks a usable risks list"]
+
+    metrics = _rugcheck_metrics(report, pool_address)
+    level = str(metrics.get("risk_level") or "").strip().lower()
+    score = metrics.get("score_normalised")
+    top = metrics.get("top_holders_pct")
+    lp = metrics.get("lp_locked_pct")
+
     if level in BAD_LEVELS:
         return "REJECTED", [f"RugCheck risk level: {level}"]
-    if report.get("mintAuthority") not in (None, ""):
-        flags.append("RugCheck reports active mint authority")
-    if report.get("freezeAuthority") not in (None, ""):
-        flags.append("RugCheck reports active freeze authority")
-    top = report.get("topHoldersPct")
-    lp = report.get("lpLockedPct")
-    if top is not None and _num(top, 100.0) > 35:
-        return "REJECTED", [f"Top holders concentration {_num(top):.1f}% exceeds 35%"]
-    if lp is not None and _num(lp, -1) < 80:
-        flags.append(f"LP lock/burn coverage is only {_num(lp):.1f}% (review threshold 80%)")
-    elif lp is None and report.get("lpLocked") is False:
-        flags.append("RugCheck reports LP is not locked")
-    if isinstance(risks, list):
-        for risk in risks:
-            if not isinstance(risk, dict):
-                flags.append("RugCheck returned an unparsed risk item")
-                continue
-            risk_level = str(risk.get("level") or risk.get("riskLevel") or "").strip().lower()
-            label = str(risk.get("name") or risk.get("description") or "Unlabelled risk").strip()
-            if risk_level in BAD_LEVELS:
-                flags.append(f"{risk_level.upper()}: {label}")
-            elif risk_level in REVIEW_LEVELS or risk_level not in GOOD_LEVELS | {"info", "informational", ""}:
-                flags.append(f"Review: {label}")
-    if report.get("mintAuthority") not in (None, "") or report.get("freezeAuthority") not in (None, ""):
-        return "REJECTED", flags
-    if any(x.startswith(("DANGER:", "CRITICAL:", "HIGH:", "SEVERE:", "MALICIOUS:")) for x in flags):
-        return "REJECTED", flags
+    if score is not None and score > 35:
+        return "REJECTED", [f"RugCheck normalized risk score {score:.1f} exceeds 35"]
+
+    flags: list[str] = []
+    fatal_risk = False
+
+    if not metrics.get("mint_authority_present"):
+        flags.append("Mint-authority field is missing from RugCheck report")
+    elif metrics.get("mint_authority") not in (None, ""):
+        return "REJECTED", ["RugCheck reports active mint authority"]
+
+    if not metrics.get("freeze_authority_present"):
+        flags.append("Freeze-authority field is missing from RugCheck report")
+    elif metrics.get("freeze_authority") not in (None, ""):
+        return "REJECTED", ["RugCheck reports active freeze authority"]
+
     if top is None:
-        flags.append("Top-holder concentration field is missing")
-    if lp is None and report.get("lpLocked") is not True:
-        flags.append("LP lock coverage field is missing")
-    if level not in GOOD_LEVELS:
-        flags.append(f"RugCheck level is not clearly low risk: {level or 'missing'}")
+        flags.append("Top-holder concentration data is missing or malformed")
+    elif top > 35:
+        return "REJECTED", [f"Top-holder concentration {top:.1f}% exceeds 35%"]
+
+    if lp is None:
+        flags.append("LP lock coverage for the candidate pool is missing or malformed")
+    elif lp < 80:
+        flags.append(f"LP lock/burn coverage is only {lp:.1f}% (review threshold 80%)")
+
+    for risk in risks:
+        if not isinstance(risk, dict):
+            flags.append("RugCheck returned an unparsed risk item")
+            continue
+        risk_level = str(risk.get("level") or risk.get("riskLevel") or "").strip().lower()
+        label = str(risk.get("name") or risk.get("description") or "Unlabelled risk").strip()
+        if risk_level in BAD_LEVELS:
+            fatal_risk = True
+            flags.append(f"{risk_level.upper()}: {label}")
+        elif risk_level in REVIEW_LEVELS or risk_level not in GOOD_LEVELS | {"info", "informational", ""}:
+            flags.append(f"Review: {label}")
+
+    if fatal_risk:
+        return "REJECTED", flags
+
+    if score is not None and score > 15:
+        flags.append(f"Normalized RugCheck risk score {score:.1f} exceeds the 15-point live-entry ceiling")
+    if not level:
+        flags.append("RugCheck risk level and normalized score are unavailable")
+    elif level not in GOOD_LEVELS:
+        flags.append(f"RugCheck level is not clearly low risk: {level}")
+
     if flags:
         return "REVIEW", flags
-    return "SAFE_CANDIDATE", ["RugCheck summary passed configured thresholds"]
-
+    return "SAFE_CANDIDATE", ["RugCheck full report passed configured authority, holder, pool LP-lock, and risk-score thresholds"]
 
 class TrendingTokenScanner:
     """Paced scanner; live candidate callbacks require separate explicit opt-ins."""
@@ -376,10 +484,10 @@ class TrendingTokenScanner:
         item["trade_eligible"] = False
         liquidity, vol1 = _num(item.get("liquidity_usd")), _num(item.get("volume_1h_usd"))
         if liquidity < self.min_liquidity_usd:
-            item.update({"status": "FILTERED", "decision": f"Liquidity ${{liquidity:,.0f}} below ${{self.min_liquidity_usd:,.0f}} minimum"})
+            item.update({"status": "FILTERED", "decision": f"Liquidity ${liquidity:,.0f} below ${self.min_liquidity_usd:,.0f} minimum"})
             return item
         if vol1 < self.min_volume_1h_usd:
-            item.update({"status": "FILTERED", "decision": f"1h volume ${{vol1:,.0f}} below ${{self.min_volume_1h_usd:,.0f}} minimum"})
+            item.update({"status": "FILTERED", "decision": f"1h volume ${vol1:,.0f} below ${self.min_volume_1h_usd:,.0f} minimum"})
             return item
         if not item.get("dexscreener_confirmed"):
             item.update({"status": "REVIEW", "decision": "Independent DEX market-data cross-check unavailable"})
@@ -397,19 +505,20 @@ class TrendingTokenScanner:
             item.update({"status": "UNKNOWN", "decision": "; ".join(flags)})
             return item
         try:
-            report = self._get_json(f"{RUGCHECK}/tokens/{item['mint']}/report/summary")
+            report = self._get_json(f"{RUGCHECK}/tokens/{item['mint']}/report")
         except Exception as exc:
             item["rugcheck_status"] = "UNAVAILABLE"
             item.setdefault("risk_flags", []).append(f"RugCheck unavailable ({type(exc).__name__})")
             item.update({"status": "UNKNOWN", "decision": "RugCheck unavailable; no safety approval"})
             return item
-        status, risk_flags = evaluate_rugcheck_report(report)
+        status, risk_flags = evaluate_rugcheck_report(report, str(item.get("pool_address") or ""))
         item["rugcheck_status"] = status
         if isinstance(report, dict):
-            item["rugcheck_level"] = str(report.get("riskLevel") or report.get("risk_level") or "")
-            item["rugcheck_score"] = report.get("score")
-            item["top_holders_pct"] = _num(report.get("topHoldersPct")) if report.get("topHoldersPct") is not None else None
-            item["lp_locked_pct"] = _num(report.get("lpLockedPct")) if report.get("lpLockedPct") is not None else None
+            metrics = _rugcheck_metrics(report, str(item.get("pool_address") or ""))
+            item["rugcheck_level"] = str(metrics.get("risk_level") or report.get("riskLevel") or report.get("risk_level") or "")
+            item["rugcheck_score"] = metrics.get("score_normalised", report.get("score"))
+            item["top_holders_pct"] = metrics.get("top_holders_pct")
+            item["lp_locked_pct"] = metrics.get("lp_locked_pct")
         item.setdefault("risk_flags", []).extend(risk_flags)
         if status == "REJECTED":
             item.update({"status": "REJECTED", "decision": "; ".join(risk_flags) or "RugCheck rejected candidate"})
@@ -482,8 +591,8 @@ class TrendingTokenScanner:
         if supply_raw <= 0 or not 0 <= decimals <= 12:
             raise ValueError("Fresh token supply/decimals are outside the accepted range")
 
-        report = self._get_json(f"{RUGCHECK}/tokens/{mint}/report/summary")
-        rug_status, rug_flags = evaluate_rugcheck_report(report)
+        report = self._get_json(f"{RUGCHECK}/tokens/{mint}/report")
+        rug_status, rug_flags = evaluate_rugcheck_report(report, pool)
         if rug_status != "SAFE_CANDIDATE":
             raise ValueError("Fresh RugCheck did not pass: " + "; ".join(rug_flags)[:250])
 
@@ -491,8 +600,11 @@ class TrendingTokenScanner:
         row["total_supply_tokens"] = supply_raw / (10 ** decimals)
         row["onchain_status"] = onchain
         row["rugcheck_status"] = rug_status
-        row["top_holders_pct"] = _num(report.get("topHoldersPct"))
-        row["lp_locked_pct"] = _num(report.get("lpLockedPct"))
+        metrics = _rugcheck_metrics(report, pool)
+        row["rugcheck_level"] = str(metrics.get("risk_level") or report.get("riskLevel") or report.get("risk_level") or "")
+        row["rugcheck_score"] = metrics.get("score_normalised", report.get("score"))
+        row["top_holders_pct"] = metrics.get("top_holders_pct")
+        row["lp_locked_pct"] = metrics.get("lp_locked_pct")
         row["volume_1h_usd"] = volume
         row["volume_24h_usd"] = _num(row.get("dexscreener_volume_24h_usd"))
         row["buys_1h"] = int(_num(row.get("dexscreener_buys_1h")))
