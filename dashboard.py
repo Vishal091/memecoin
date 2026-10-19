@@ -24,7 +24,9 @@ button.primary{background:#146e49;border-color:#23835c}button.danger{background:
 table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:middle}th{font-size:12px;text-transform:uppercase;color:var(--muted)}
 .scroll{overflow-x:auto}.addr{font-family:ui-monospace,Consolas,monospace;font-size:12px;word-break:break-all}.green{color:var(--green)}.red{color:var(--red)}
 .status{border:1px solid var(--line);border-radius:10px;padding:10px 12px;color:var(--muted);margin:12px 0}.empty{padding:22px;text-align:center;color:var(--muted)}.footer{font-size:12px;color:var(--muted);margin-top:20px}
-@media(max-width:760px){main{padding:14px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.hide-sm{display:none}}
+.strategy-controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px}
+.strategy-controls .pill{font-size:11px}
+@media(max-width:760px){main{padding:14px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.hide-sm{display:none}.strategy-controls{margin-top:12px}}
 </style></head>
 <body><main>
 <header><div><h1>Memecoin <span class="muted">/ Pump.fun</span></h1><div class="muted">Top traders · automatic copy · manual exits</div></div><div><span class="pill" id="mode">MODE</span> <button id="refresh">Refresh</button></div></header>
@@ -34,12 +36,14 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px 8px
 <div class="metric"><small>Active traders</small><strong id="walletCount">0</strong></div></div>
  <section class="panel"><h2>Trade-feed diagnostics</h2><div id="feedSummary" class="status">Checking feed status…</div>
  <div id="feedDetail" class="muted">Waiting for feed counters…</div><div id="rpcFeedDetail" class="muted" style="margin-top:8px">Waiting for Solana logs feed…</div><div id="signalDetail" class="muted" style="margin-top:8px"></div></section>
-<section class="panel"><div class="toolbar"><div><h2>Independent token discovery <span class="pill" id="discoveryMode">SHADOW ONLY</span></h2><div class="muted">Live execution is a separate opt-in. Swap input is capped at $0.50; actual wallet debit can be higher when network fees or new token-account rent apply. At most one discovery position can be open.</div></div></div>
+<section class="panel"><div class="toolbar"><div><h2>Independent token discovery <span class="pill" id="discoveryMode">SHADOW ONLY</span></h2><div class="muted">Find newly launched tokens, screen them, and optionally enable live buys. Live buys require an armed live-mode wallet; swap input is capped at $0.50 before network fees/rent.</div></div></div>
+ <div class="strategy-controls"><span class="pill" id="newScanStatus">SCANNER OFF</span><button id="newScanToggle">Enable new-token scanner</button><span class="pill" id="newLiveStatus">LIVE BUYS OFF</span><button class="danger" id="newLiveToggle">Enable new-token live buys</button></div>
  <div id="discoverySummary" class="status">Checking independent scanner…</div>
  <div id="opportunityFunnel" class="status">Building opportunity and execution funnel…</div>
  <div class="scroll"><table><thead><tr><th>Token</th><th>Status / score</th><th>Real curve liquidity</th><th>Entry MC</th><th>Current MC</th><th>Holder exposure</th><th>Buyers / flow</th><th>Shadow return</th><th>Decision</th></tr></thead><tbody id="discoveryCandidates"><tr><td colspan="9" class="empty">No discovery candidates recorded.</td></tr></tbody></table></div>
  <div class="footer">Token creation events are free from PumpPortal; token-specific trade subscriptions are metered. Entry screens are not guarantees. Market-cap values prefixed with ~ are estimates from price × total supply (FDV-style), not guaranteed realizable value. Live discovery is off by default and only opens a trade after fresh on-chain rechecks and global risk gates. The $0.50 cap applies to swap input; actual wallet debit can be higher due to network fees or account rent. Only one discovery position can be open.</div></section>
-<section class="panel"><div class="toolbar"><div><h2>Trending Solana tokens <span class="pill">LIVE OPT-IN</span></h2><div class="muted">Analysis is read-only by default. Live entries require BOT_MODE=live, both trending opt-ins, a Jupiter API key and fresh pre-trade checks.</div></div></div>
+<section class="panel"><div class="toolbar"><div><h2>Trending Solana tokens <span class="pill" id="trendingMode">ANALYSIS ONLY</span></h2><div class="muted">Search existing trending pools independently of newly launched tokens. Live buys require BOT_MODE=live, the explicit live confirmation, a Jupiter API key and fresh pre-trade checks.</div></div></div>
+ <div class="strategy-controls"><span class="pill" id="trendingScanStatus">SCANNER OFF</span><button id="trendingScanToggle">Enable trending scanner</button><span class="pill" id="trendingLiveStatus">LIVE BUYS OFF</span><button class="danger" id="trendingLiveToggle">Enable trending live buys</button></div>
  <div id="trendingSummary" class="status">Trending scanner disabled.</div>
  <div class="scroll"><table><thead><tr><th>Token / pool</th><th>Momentum</th><th>Liquidity</th><th>Volume 1h / 24h</th><th>Price move 5m / 1h / 6h / 24h</th><th>Mint / RugCheck</th><th>Holder / LP risk</th><th>Decision</th></tr></thead><tbody id="trendingCandidates"><tr><td colspan="8" class="empty">Enable TRENDING_DISCOVERY_ENABLED to scan trending Solana tokens.</td></tr></tbody></table></div>
  <div class="footer">SCREENED is not a safety or profit guarantee. Live entries require the same-pool market check, fresh mint/extension review, fresh RugCheck, live one-hour buy pressure and Jupiter transaction validation/simulation. Swap input is capped at $0.50 (fees/rent can raise total wallet debit); at most one discovery position may be open. Keep both trending flags off unless you intend to authorize live trades.</div></section>
@@ -71,7 +75,37 @@ function render(d){
   var notices=[];if(f.error)notices.push("Feed error: "+f.error);if(f.last_notice)notices.push("Provider notice: "+f.last_notice);if(f.last_event_summary)notices.push("Last event: "+f.last_event_summary);if(r.error)notices.push("RPC log feed error: "+r.error);
   el("signalDetail").textContent=notices.join(" · ")+" · Parsed signals: "+(ss.parsed_signals||0)+" · Unparsed: "+(ss.unparsed_events||0)+" · Duplicate: "+(ss.duplicate_events||0)+" · Unwatched: "+(ss.unwatched_events||0)+" · Sells with no position: "+(ss.sell_without_position||0)+" · RPC-derived signals: "+(ss.rpc_log_signals||0);
   var td=d.token_discovery||{};
-  el("discoveryMode").textContent=td.live_enabled?"LIVE EXECUTION ON":"SHADOW ONLY";
+  function strategyToggle(buttonId,statusId,enabled,label,actionName,isLive,scannerEnabled){
+    var btn=el(buttonId), status=el(statusId);
+    status.textContent=isLive?(enabled?"LIVE BUYS ON":"LIVE BUYS OFF"):(enabled?"SCANNER ON":"SCANNER OFF");
+    btn.textContent=(enabled?"Turn off ":"Turn on ")+label;
+    btn.className=enabled?"danger":"primary";
+    btn.onclick=function(){
+      if(enabled){
+        if(isLive && !confirm("Turn OFF live buys for "+label+"? New buys stop immediately; existing positions will still be managed and may be sold by the exit rules."))return;
+        if(!isLive && ((label==="new-token scanner" && td.live_enabled)||(label==="trending scanner" && tr.live_enabled)) &&
+           !confirm("Turning off "+label+" also turns off its live-buy switch. Existing positions remain managed. Continue?"))return;
+        action({action:actionName,enabled:false});
+        return;
+      }
+      if(isLive){
+        if(String(d.mode||"").toLowerCase()!=="live"){
+          el("message").textContent="Live buys are blocked: set BOT_MODE=live, configure the required credentials, restart, then explicitly enable live buys here.";
+          return;
+        }
+        if(!scannerEnabled){
+          el("message").textContent="Enable the corresponding scanner first. No live order was submitted.";
+          return;
+        }
+        var extra=label==="trending live buys"?" A valid JUPITER_API_KEY is also required.":"";
+        if(!confirm("REAL-MONEY TRADING CONFIRMATION\n\nEnable "+label+" on the live Solana wallet? Each swap input is capped at $0.50, but fees and account rent can increase wallet debit. Token safety and exits are not guaranteed."+extra+"\n\nOnly proceed if the wallet is dedicated and funded with an amount you can afford to lose."))return;
+      }
+      action({action:actionName,enabled:true});
+    };
+  }
+  strategyToggle("newScanToggle","newScanStatus",Boolean(td.enabled),"new-token scanner","set_token_discovery_enabled",false,undefined);
+  strategyToggle("newLiveToggle","newLiveStatus",Boolean(td.live_enabled),"new-token live buys","set_token_discovery_live_enabled",true,Boolean(td.enabled));
+  el("discoveryMode").textContent=td.live_enabled?"LIVE BUYS ON":"SHADOW / ANALYSIS ONLY";
   el("discoverySummary").textContent=td.enabled
     ? "SCANNER ENABLED · "+(td.live_enabled?("LIVE DISCOVERY ON · max swap input $"+num(td.live_entry_cap_usd)+" · open discovery positions "+(td.live_open_positions||0)+"/"+(td.live_position_limit||1)):"LIVE EXECUTION OFF · shadow entries only")+" · Launch events "+(td.launch_events||0)+" · On-chain safety scans "+(td.safety_scans||0)+" · Safety rejected "+(td.safety_rejected||0)+" · Low-liquidity rejected "+(td.liquidity_rejected||0)+" · Skipped (capacity/rate) "+((td.capacity_skips||0)+(td.rate_limit_skips||0))+" · Queue "+(td.queue_count||0)+"/"+(td.queue_limit||100)+" · Queue expired/dropped "+(td.queue_expired||0)+"/"+(td.queue_dropped||0)+" · Recent-list backfill polls/errors "+(td.backfill_polls||0)+"/"+(td.backfill_errors||0)+" · Max launch age "+(td.max_token_age_hours||24)+"h · Shadow entries "+(td.shadow_entries||0)+" · Active token subscriptions "+(td.active_watch_count||0)+"/"+(td.max_watched_tokens||0)+" · Min verified curve liquidity $"+num(td.min_liquidity_usd)+" · Score threshold "+(td.min_score||0)+" · Buyer floor "+(td.min_unique_buyers||8)
     : "SCANNER DISABLED · Set TOKEN_DISCOVERY_ENABLED=true to enable screening. Live execution additionally requires TOKEN_DISCOVERY_LIVE_ENABLED=true, BOT_MODE=live and explicit live confirmation.";
@@ -97,6 +131,9 @@ function render(d){
     return "<tr><td><div>"+esc(x.name||x.symbol||"Unnamed token")+"</div><div class='addr' title='"+esc(x.mint)+"'>"+short(esc(x.mint))+"</div><a class='muted' target='_blank' rel='noreferrer' href='https://pump.fun/coin/"+encodeURIComponent(x.mint||"")+"'>Pump.fun ↗</a></td><td>"+esc(status)+" · "+score+"/100<div class='muted'>Launch/seen "+esc(age)+"</div></td><td>$"+num(liquidity)+"</td><td title='"+esc(entryMcSource)+"'>"+esc(entryMc)+"</td><td title='"+esc(currentMcSource)+"'>"+esc(currentMc)+"</td><td>"+esc(holders)+"</td><td>"+(x.unique_buyers||0)+" · "+flow.toFixed(3)+" SOL net</td><td class='"+(move===null?"":(move>=0?"green":"red"))+"'>"+esc(ret)+"</td><td>"+esc(decision)+"</td></tr>";
   }).join(""):"<tr><td colspan='9' class='empty'>No discovery candidates recorded yet.</td></tr>";
   var tr=d.trending_discovery||{};
+  el("trendingMode").textContent=tr.live_enabled?"LIVE BUYS ON":(tr.enabled?"ANALYSIS ONLY":"SCANNER OFF");
+  strategyToggle("trendingScanToggle","trendingScanStatus",Boolean(tr.enabled),"trending scanner","set_trending_discovery_enabled",false,undefined);
+  strategyToggle("trendingLiveToggle","trendingLiveStatus",Boolean(tr.live_enabled),"trending live buys","set_trending_discovery_live_enabled",true,Boolean(tr.enabled));
   el("trendingSummary").textContent=tr.enabled
     ? "TRENDING SCANNER ENABLED · live entries "+(tr.live_enabled?"ON":"OFF")+" · max swap input $"+num(tr.live_entry_cap_usd||0.50)+" · score floor "+(tr.min_score||75)+"/100 · max price impact "+num(tr.max_price_impact_pct||5)+"% · last scan "+ago(tr.last_scan_at)+" · pools "+(tr.pool_count||0)+" · checked "+(tr.checked_count||0)+" · screened "+(tr.screened_count||0)+" · rejected/filtered "+(tr.rejected_count||0)+" · liquidity floor $"+num(tr.min_liquidity_usd)+" · 1h volume floor $"+num(tr.min_volume_1h_usd)+" · interval "+(tr.poll_seconds||60)+"s"+(tr.last_error?" · Last error: "+tr.last_error:"")
     : "TRENDING SCANNER DISABLED · Set TRENDING_DISCOVERY_ENABLED=true to enable screening.";
@@ -189,9 +226,13 @@ class DashboardServer:
                         raise ValueError("Invalid request size")
                     command = json.loads(self.rfile.read(length))
                     if not isinstance(command, dict) or command.get("action") not in {
-                        "copy_top10", "stop_copy", "manual_exit", "exit_all"
+                        "copy_top10", "stop_copy", "manual_exit", "exit_all",
+                        "set_token_discovery_enabled", "set_token_discovery_live_enabled",
+                        "set_trending_discovery_enabled", "set_trending_discovery_live_enabled",
                     }:
                         raise ValueError("Unknown action")
+                    if str(command.get("action", "")).startswith("set_") and not isinstance(command.get("enabled"), bool):
+                        raise ValueError("Discovery toggle enabled value must be true or false")
                     commands.put(command)
                     self.send_body(202, "application/json; charset=utf-8",
                                    json.dumps({"message":"Command queued; check status and trade log."}).encode())
