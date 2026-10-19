@@ -2198,6 +2198,8 @@ class PumpFunBot:
                 "volume_24h_usd": float(volume.get("h24") or 0),
                 "change_1h_pct": float(changes.get("h1") or 0),
                 "change_24h_pct": float(changes.get("h24") or 0),
+                "buys_1h": buys,
+                "sells_1h": sells,
                 "dexscreener_buys_1h": buys,
                 "dexscreener_sells_1h": sells,
                 "risk_flags": list(original.get("risk_flags") or []),
