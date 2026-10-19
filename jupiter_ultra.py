@@ -467,6 +467,45 @@ class JupiterUltraExecutor:
         signature = str(signed.signatures[0])
         return signed, signature
 
+    @staticmethod
+    def _validate_execute_response(
+        result: Any,
+        *,
+        signature: str,
+        action: str,
+        mint_for_error: str,
+    ) -> None:
+        """Trust only Jupiter's documented success result and exact transaction signature."""
+        if not isinstance(result, dict):
+            raise TransactionOutcomeUncertain(
+                signature, action, mint_for_error,
+                "Jupiter execute returned a non-object response after submission",
+            )
+        status = str(result.get("status") or "").strip().lower()
+        result_signature = str(result.get("signature") or "")
+        if status == "failed":
+            raise TransactionFailedOnChain(
+                result_signature or signature,
+                action,
+                mint_for_error,
+                str(result.get("error") or result.get("errorMessage") or "Jupiter reports failed execution")[:500],
+            )
+        if status != "success" or result_signature != signature:
+            raise TransactionOutcomeUncertain(
+                signature, action, mint_for_error,
+                f"Jupiter execute status/signature could not be verified: status={status or 'missing'}",
+            )
+        try:
+            code_raw = result.get("code")
+            code = int(code_raw) if code_raw is not None else None
+        except (TypeError, ValueError, OverflowError):
+            code = None
+        if code != 0:
+            raise TransactionOutcomeUncertain(
+                signature, action, mint_for_error,
+                f"Jupiter execute returned success with missing or nonzero code: {code_raw!r}",
+            )
+
     def swap(
         self,
         *,
@@ -581,42 +620,14 @@ class JupiterUltraExecutor:
                 signature, action, output_mint if action == "buy" else input_mint,
                 f"Jupiter execute response unavailable; inspect signature before retry ({type(exc).__name__})",
             ) from exc
-        if not isinstance(result, dict):
-            raise TransactionOutcomeUncertain(
-                signature, action, output_mint if action == "buy" else input_mint,
-                "Jupiter execute returned a non-object response after submission",
-            )
-        status = str(result.get("status") or "").strip().lower()
-        result_signature = str(result.get("signature") or "")
         mint_for_error = output_mint if action == "buy" else input_mint
-        if status == "failed":
-            raise TransactionFailedOnChain(
-                result_signature or signature, action, mint_for_error,
-                str(result.get("error") or result.get("errorMessage") or "Jupiter reports failed execution")[:500],
-            )
-        if status != "success" or (result_signature and result_signature != signature):
-            raise TransactionOutcomeUncertain(
-                signature, action, mint_for_error,
-                f"Jupiter execute status/signature could not be verified: status={status or 'missing'}",
-            )
-
-        try:
-            confirmed_tx = self.rpc.transaction(signature)
-        except Exception as exc:
-            raise TransactionOutcomeUncertain(
-                signature, action, mint_for_error,
-                f"Jupiter reported success but RPC confirmation check failed ({type(exc).__name__})",
-            ) from exc
-        if not confirmed_tx:
-            raise TransactionOutcomeUncertain(
-                signature, action, mint_for_error,
-                "Jupiter reported success but transaction is not yet visible in configured RPC",
-            )
-        meta = confirmed_tx.get("meta") or {}
-        if meta.get("err") is not None:
-            raise TransactionFailedOnChain(
-                signature, action, mint_for_error, str(meta.get("err"))[:500]
-            )
+        # Swap V2 /execute returns status, signature and code after Jupiter's managed
+        # landing/confirmation path. The bot caller independently reconciles token/SOL
+        # wallet deltas before changing its position ledger, so a lagging secondary RPC
+        # transaction index must not falsely turn a successful swap into a lost position.
+        self._validate_execute_response(
+            result, signature=signature, action=action, mint_for_error=mint_for_error,
+        )
         return {
             "signature": signature,
             "input_amount_raw": int(amount_raw),
