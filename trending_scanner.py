@@ -450,7 +450,7 @@ class TrendingTokenScanner:
             raise ValueError("Mint or cross-checked pool address is missing")
 
         payload = self._get_json(
-            f"{GECK}/networks/solana/trending_pools?include=base_token,quote_token&page=1",
+            f"{GECKO}/networks/solana/trending_pools?include=base_token,quote_token&page=1",
             gecko=True,
         )
         row = next((r for r in parse_gecko_trending(payload)
