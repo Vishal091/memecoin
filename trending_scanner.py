@@ -195,12 +195,13 @@ def evaluate_rugcheck_report(report: Any) -> tuple[str, list[str]]:
 
 
 class TrendingTokenScanner:
-    """Paced background scanner. Trending results are research-only, never live orders."""
+    """Paced scanner; live candidate callbacks require separate explicit opt-ins."""
 
-    def __init__(self, settings, rpc, timeout: int = 8, store=None):
+    def __init__(self, settings, rpc, timeout: int = 8, store=None, on_screened=None):
         self.settings = settings
         self.rpc = rpc
         self.store = store
+        self.on_screened = on_screened
         self.enabled = bool(getattr(settings, "trending_discovery_enabled", False))
         self.poll_seconds = max(60, min(900, int(getattr(settings, "trending_discovery_poll_seconds", 60))))
         self.max_candidates = max(1, min(20, int(getattr(settings, "trending_discovery_max_candidates", 8))))
