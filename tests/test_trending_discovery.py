@@ -364,6 +364,53 @@ class TrendingLiveQueueTests(unittest.TestCase):
         self.assertEqual(len(queued), 1)
         self.assertEqual(store.get_state("trending_live_status:TrendMint11111111111111111111111111111111"), "queued")
 
+    def test_fresh_live_recheck_requires_same_pool_and_complete_security_data(self):
+        from trending_scanner import TrendingTokenScanner, parse_gecko_trending
+
+        mint = "TrendMint11111111111111111111111111111111"
+        pool = "TrendPool11111111111111111111111111111"
+        wsol = "So11111111111111111111111111111111111111112"
+        gecko = self._gecko_payload(mint, pool)
+        pair = {
+            "chainId": "solana",
+            "pairAddress": pool,
+            "url": "https://dexscreener.com/solana/" + pool,
+            "baseToken": {"address": mint, "name": "Trend", "symbol": "TRND"},
+            "quoteToken": {"address": wsol, "name": "Wrapped SOL", "symbol": "SOL"},
+            "liquidity": {"usd": 1000000},
+            "volume": {"h1": 1000000, "h24": 1000000000},
+            "priceChange": {"m5": 20, "h1": 30, "h24": 35},
+            "txns": {"h1": {"buys": 200, "sells": 5}},
+        }
+        report = {
+            "riskLevel": "Good", "risks": [], "topHoldersPct": 20, "lpLockedPct": 95,
+            "mintAuthority": None, "freezeAuthority": None,
+        }
+        class FakeRPC:
+            def call(self, method, params):
+                return {"value": {"owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                                  "data": {"parsed": {"info": {"decimals": 6, "supply": "1000000000000000"}}}}}
+
+        scanner = TrendingTokenScanner(self._settings(), rpc=FakeRPC())
+        def get_json(url, gecko=False):
+            if "trending_pools" in url:
+                return gecko
+            if "/tokens/v1/" in url:
+                return [pair]
+            if "/report/summary" in url:
+                return report
+            raise AssertionError("Unexpected URL " + url)
+        scanner._get_json = get_json
+        scanner._check_mint = lambda candidate_mint: ("PASS", ["Mint authority checks passed"])
+        initial = parse_gecko_trending(gecko)[0]
+        initial["dexscreener_pair_address"] = pool
+        checked = scanner.verify_live_candidate(initial)
+        self.assertTrue(checked["fresh_security_verified"])
+        self.assertEqual(checked["decimals"], 6)
+        self.assertEqual(checked["dexscreener_pair_address"], pool)
+        self.assertGreaterEqual(checked["momentum_score"], 75)
+        self.assertGreater(checked["buys_1h"], checked["sells_1h"])
+
     def test_live_recheck_fails_closed_when_exact_pool_disappears(self):
         from trending_scanner import TrendingTokenScanner
 
