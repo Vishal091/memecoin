@@ -339,7 +339,33 @@ class DiscoveryQueueTests(unittest.TestCase):
 
 
 class LossExitGracePeriodTests(unittest.TestCase):
-    def test_losing_exit_waits_for_remaining_two_minute_window(self):
+    def test_marked_loss_stop_bypasses_minimum_hold_immediately(self):
+        now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
+        position = {
+            "entry_price_usd": 1.0,
+            "opened_at": (now - timedelta(seconds=5)).isoformat(timespec="seconds"),
+        }
+        self.assertEqual(
+            loss_exit_hold_remaining_seconds(
+                position, 0.82, "marked loss stop", 120, now=now.timestamp()
+            ),
+            0.0,
+        )
+
+    def test_trailing_stop_bypasses_minimum_hold_immediately(self):
+        now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
+        position = {
+            "entry_price_usd": 1.0,
+            "opened_at": (now - timedelta(seconds=5)).isoformat(timespec="seconds"),
+        }
+        self.assertEqual(
+            loss_exit_hold_remaining_seconds(
+                position, 0.95, "trailing stop", 120, now=now.timestamp()
+            ),
+            0.0,
+        )
+
+    def test_other_losing_exits_still_use_remaining_grace_period(self):
         now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
         position = {
             "entry_price_usd": 1.0,
@@ -347,7 +373,8 @@ class LossExitGracePeriodTests(unittest.TestCase):
         }
         self.assertEqual(
             loss_exit_hold_remaining_seconds(
-                position, 0.75, "marked loss stop", 120, now=now.timestamp()
+                position, 0.75, "followed wallet leader partial sell", 120,
+                now=now.timestamp()
             ),
             90.0,
         )
