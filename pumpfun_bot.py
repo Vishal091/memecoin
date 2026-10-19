@@ -39,6 +39,7 @@ from pump_curve import fetch_pump_curve
 from storage import Store
 from token_discovery import TokenDiscoveryShadow
 from trending_scanner import TrendingTokenScanner
+from jupiter_ultra import JupiterUltraExecutor
 
 logger = logging.getLogger("pumpfun")
 
@@ -126,6 +127,9 @@ class PumpFunBot:
                 self.s.min_sol_reserve,
             )
         self._validate_addresses()
+        self.trending_executor = JupiterUltraExecutor(
+            self.rpc, self.s.jupiter_api_key, timeout=self.s.request_timeout_seconds
+        )
 
         self.leaderboard_client = PumpFunLeaderboard(timeout=self.s.request_timeout_seconds)
         self.leaderboards = {}
@@ -172,7 +176,7 @@ class PumpFunBot:
             self.s, self.rpc, self.market, self.store, self.feed
         )
         self.trending_scanner = TrendingTokenScanner(
-            self.s, self.rpc, timeout=self.s.request_timeout_seconds
+            self.s, self.rpc, timeout=self.s.request_timeout_seconds, store=self.store
         )
         if self.feed:
             self.feed.set_discovery_subscriptions(self.token_discovery.enabled, [])
@@ -951,7 +955,7 @@ class PumpFunBot:
         self, equity: float, *, strategy: str = "leader_copy",
         entry_cap_usd: float | None = None,
     ) -> tuple[bool, str]:
-        if strategy != "token_discovery" and self.store.get_state("copy_paused", "0") == "1":
+        if strategy not in {"token_discovery", "trending_discovery"} and self.store.get_state("copy_paused", "0") == "1":
             return False, "Copying is paused from the dashboard"
         if self.store.daily_entries() >= self.s.max_entries_per_day:
             return False, "Daily entry cap reached"
@@ -964,8 +968,10 @@ class PumpFunBot:
         configured_cap = self.s.max_entry_usd if entry_cap_usd is None else float(entry_cap_usd)
         if strategy == "token_discovery":
             configured_cap = min(0.50, configured_cap, float(self.s.token_discovery_max_entry_usd))
+        elif strategy == "trending_discovery":
+            configured_cap = min(0.50, configured_cap, float(self.s.trending_discovery_max_entry_usd))
         spend = min(self.s.max_entry_usd, configured_cap, room)
-        minimum_practical_spend = 0.10 if strategy == "token_discovery" else 0.50
+        minimum_practical_spend = 0.10 if strategy in {"token_discovery", "trending_discovery"} else 0.50
         if spend < minimum_practical_spend:
             return False, "Too little exposure headroom for a practical trade"
         if self.s.mode == "paper":
