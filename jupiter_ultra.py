@@ -1,0 +1,441 @@
+"""Jupiter Ultra swap executor for explicitly opted-in trending-token trades.
+
+All trading calls are gated elsewhere by fresh token screening. This module adds
+transaction-level checks, bounded SOL input, local signing, pre-submit simulation,
+and no automatic resubmission when a submission outcome is ambiguous.
+"""
+from __future__ import annotations
+
+import base64
+import logging
+import time
+from typing import Any
+
+import requests
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.transaction import VersionedTransaction
+
+from native_pump import (
+    ASSOCIATED_TOKEN_PROGRAM_ID,
+    COMPUTE_BUDGET_ID,
+    SYSTEM_PROGRAM_ID,
+    TOKEN_2022_PROGRAM_ID,
+    TOKEN_PROGRAM_ID,
+    TransactionBuildFailed,
+    TransactionFailedOnChain,
+    TransactionOutcomeUncertain,
+    TransactionSimulationFailed,
+)
+from solders.pubkey import Pubkey as SoldersPubkey
+
+logger = logging.getLogger("jupiter_ultra")
+
+ULTRA_BASE = "https://api.jup.ag/ultra/v1"
+PROGRAM_LABELS_URL = "https://api.jup.ag/swap/v1/program-id-to-label"
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+CORE_PROGRAMS = {
+    SYSTEM_PROGRAM_ID,
+    COMPUTE_BUDGET_ID,
+    TOKEN_PROGRAM_ID,
+    TOKEN_2022_PROGRAM_ID,
+    ASSOCIATED_TOKEN_PROGRAM_ID,
+    "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
+    "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo",
+}
+
+
+def _base58(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (result == result and abs(result) != float("inf")):
+        return None
+    return result
+
+
+class JupiterUltraExecutor:
+    """Build/sign/execute swaps via Jupiter Ultra; never retries a submitted swap."""
+
+    def __init__(self, rpc, api_key: str, timeout: int = 12):
+        self.rpc = rpc
+        self.api_key = str(api_key or "").strip()
+        self.timeout = max(3, min(25, int(timeout)))
+        self.session = requests.Session()
+        self._program_labels: set[str] = set()
+        self._program_labels_at = 0.0
+
+    @staticmethod
+    def _expected_wsol_ata(owner: str) -> str:
+        owner_key = Pubkey.from_string(owner)
+        token_program = Pubkey.from_string(TOKEN_PROGRAM_ID)
+        mint = Pubkey.from_string(WSOL_MINT)
+        ata_program = Pubkey.from_string(ASSOCIATED_TOKEN_PROGRAM_ID)
+        ata, _ = Pubkey.find_program_address(
+            [bytes(owner_key), bytes(token_program), bytes(mint)],
+            ata_program,
+        )
+        return str(ata)
+
+    def _headers(self) -> dict[str, str]:
+        if not self.api_key:
+            raise TransactionBuildFailed("JUPITER_API_KEY is required for trending live execution")
+        return {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key,
+            "User-Agent": "MemecoinTrendingExecutor/1.0",
+        }
+
+    def _get_json(self, url: str, *, params: dict | None = None) -> dict:
+        try:
+            response = self.session.get(
+                url, params=params, headers=self._headers(), timeout=self.timeout
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException as exc:
+            raise TransactionBuildFailed(
+                f"Jupiter order/metadata request failed before submission: {type(exc).__name__}"
+            ) from exc
+        except ValueError as exc:
+            raise TransactionBuildFailed("Jupiter returned invalid JSON before submission") from exc
+        if not isinstance(payload, dict):
+            raise TransactionBuildFailed("Jupiter response was not a JSON object")
+        return payload
+
+    def _dex_program_labels(self) -> set[str]:
+        now = time.time()
+        if self._program_labels and now - self._program_labels_at < 3600:
+            return set(self._program_labels)
+        payload = self._get_json(PROGRAM_LABELS_URL)
+        labels = set(payload.keys())
+        if not labels:
+            raise TransactionBuildFailed(
+                "Jupiter DEX program allowlist was empty; refusing to sign an unreviewed route"
+            )
+        self._program_labels = labels
+        self._program_labels_at = now
+        return set(labels)
+
+    @staticmethod
+    def _validate_order_fields(
+        order: dict,
+        *,
+        input_mint: str,
+        output_mint: str,
+        amount_raw: int,
+        max_price_impact_pct: float | None,
+        expected_output_value_usd: float | None,
+        input_value_usd: float | None,
+        output_decimals: int,
+    ) -> int:
+        if order.get("errorCode") not in (None, "", 0, "0"):
+            detail = str(order.get("errorMessage") or order.get("errorCode") or "route unavailable")
+            raise TransactionBuildFailed(f"Jupiter order rejected: {detail[:250]}")
+        if order.get("inputMint") != input_mint or order.get("outputMint") != output_mint:
+            raise TransactionBuildFailed("Jupiter order mint mismatch; refusing to sign")
+        try:
+            in_amount = int(order.get("inAmount") or 0)
+            out_amount = int(order.get("outAmount") or 0)
+            threshold = int(order.get("otherAmountThreshold") or 0)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise TransactionBuildFailed("Jupiter returned malformed order amounts") from exc
+        if in_amount != amount_raw or in_amount <= 0:
+            raise TransactionBuildFailed("Jupiter input amount differs from the requested hard cap")
+        if out_amount <= 0 or threshold <= 0 or threshold > out_amount:
+            raise TransactionBuildFailed("Jupiter order has no valid positive minimum output")
+        if not order.get("transaction") or not order.get("requestId"):
+            raise TransactionBuildFailed("Jupiter order omitted the transaction or request ID")
+
+        if max_price_impact_pct is not None:
+            impact = _finite_float(order.get("priceImpactPct"))
+            if impact is not None:
+                # Jupiter expresses priceImpactPct as a fraction (0.01 == 1%).
+                if impact < 0 or impact > 1:
+                    raise TransactionBuildFailed("Jupiter returned an invalid price-impact value")
+                impact_pct = impact * 100.0
+            else:
+                impact_pct = None
+            if impact_pct is not None and impact_pct > max_price_impact_pct:
+                raise TransactionBuildFailed(
+                    f"Jupiter price impact {impact_pct:.2f}% exceeds the "
+                    f"{max_price_impact_pct:.2f}% entry limit"
+                )
+            # Independently compare the quoted output to the current same-pool USD
+            # mark. This check remains mandatory even when the API omits priceImpactPct.
+            if (
+                expected_output_value_usd is None
+                or input_value_usd is None
+                or input_value_usd <= 0
+                or expected_output_value_usd < 0
+            ):
+                raise TransactionBuildFailed(
+                    "No reliable independent USD mark is available for impact verification"
+                )
+            implied_loss_pct = max(
+                0.0, (input_value_usd - expected_output_value_usd) / input_value_usd * 100.0
+            )
+            # The order's output-value proxy is intentionally a second hard check.
+            # A small tolerance allows slight mark/quote timing differences.
+            if implied_loss_pct > max_price_impact_pct + 2.0:
+                raise TransactionBuildFailed(
+                    f"Quoted output is {implied_loss_pct:.2f}% below the independent market mark"
+                )
+        if output_decimals < 0 or output_decimals > 18:
+            raise TransactionBuildFailed("Output token decimals are invalid")
+        return out_amount
+
+    def _validate_and_sign(
+        self,
+        transaction_b64: str,
+        *,
+        owner: str,
+        keypair: Keypair,
+        input_mint: str,
+        amount_raw: int,
+        allowed_dex_programs: set[str],
+    ) -> tuple[VersionedTransaction, str]:
+        try:
+            raw = base64.b64decode(transaction_b64, validate=True)
+            unsigned = VersionedTransaction.from_bytes(raw)
+        except Exception as exc:
+            raise TransactionBuildFailed("Jupiter order contained an invalid serialized transaction") from exc
+
+        message = unsigned.message
+        header = getattr(message, "header", None)
+        required_signers = int(getattr(header, "num_required_signatures", 0) or 0)
+        keys = list(getattr(message, "account_keys", []) or [])
+        if required_signers != 1 or not keys or str(keys[0]) != owner:
+            raise TransactionBuildFailed(
+                "Jupiter transaction must require exactly one signer: the configured bot wallet"
+            )
+        if str(keypair.pubkey()) != owner:
+            raise TransactionBuildFailed("Configured keypair does not match the bot wallet")
+
+        allowed_programs = CORE_PROGRAMS | allowed_dex_programs
+        wsol_ata = self._expected_wsol_ata(owner)
+        saw_system_input = False
+        instructions = list(getattr(message, "instructions", []) or [])
+        if not instructions:
+            raise TransactionBuildFailed("Jupiter transaction has no instructions")
+
+        for instruction in instructions:
+            program_index = int(instruction.program_id_index)
+            if program_index >= len(keys):
+                raise TransactionBuildFailed(
+                    "Jupiter transaction has an unresolved program address; refusing to sign"
+                )
+            program_id = str(keys[program_index])
+            accounts = list(bytes(instruction.accounts))
+            data = bytes(instruction.data)
+            if program_id not in allowed_programs:
+                raise TransactionBuildFailed(
+                    f"Jupiter transaction contains unrecognized program {program_id}; no signature made"
+                )
+
+            if program_id == SYSTEM_PROGRAM_ID:
+                if len(data) != 12 or int.from_bytes(data[:4], "little") != 2 or len(accounts) < 2:
+                    raise TransactionBuildFailed(
+                        "Jupiter transaction contains a non-transfer System Program instruction"
+                    )
+                src_idx, dst_idx = accounts[0], accounts[1]
+                if src_idx >= len(keys) or dst_idx >= len(keys):
+                    raise TransactionBuildFailed("System transfer uses unresolved account keys")
+                src, dst = str(keys[src_idx]), str(keys[dst_idx])
+                lamports = int.from_bytes(data[4:12], "little")
+                if (
+                    input_mint != WSOL_MINT
+                    or src != owner
+                    or dst != wsol_ata
+                    or lamports <= 0
+                    or lamports > amount_raw
+                ):
+                    raise TransactionBuildFailed(
+                        "Jupiter transaction attempts an unexpected SOL transfer; no signature made"
+                    )
+                saw_system_input = True
+            elif program_id in {TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID}:
+                # Top-level token instructions are restricted to SyncNative and
+                # CloseAccount for the wallet's WSOL ATA. DEX swaps themselves are
+                # invoked through an allowlisted route program.
+                if not data or data[0] not in {9, 17}:
+                    raise TransactionBuildFailed(
+                        "Jupiter transaction contains an unexpected top-level token instruction"
+                    )
+                if not accounts or accounts[0] >= len(keys) or str(keys[accounts[0]]) != wsol_ata:
+                    raise TransactionBuildFailed(
+                        "Jupiter transaction token instruction is not scoped to the wallet's WSOL ATA"
+                    )
+                if data[0] == 9:
+                    if len(accounts) < 2 or accounts[1] >= len(keys) or str(keys[accounts[1]]) != owner:
+                        raise TransactionBuildFailed(
+                            "WSOL account close would not return lamports to the bot wallet"
+                        )
+
+        if input_mint == WSOL_MINT and not saw_system_input:
+            # Some routes can use an existing WSOL balance. Trending buys are required
+            # to spend fresh SOL, so reject that route rather than silently spending a
+            # different asset balance.
+            raise TransactionBuildFailed(
+                "Jupiter buy transaction contains no bounded SOL-to-WSOL funding transfer"
+            )
+
+        try:
+            signed = VersionedTransaction(message, [keypair])
+            signed.verify()
+        except Exception as exc:
+            raise TransactionBuildFailed("Could not sign/verify the Jupiter transaction") from exc
+        if len(signed.signatures) != 1:
+            raise TransactionBuildFailed("Signed Jupiter transaction has an unexpected signer count")
+        signature = str(signed.signatures[0])
+        return signed, signature
+
+    def swap(
+        self,
+        *,
+        owner: str,
+        keypair: Keypair,
+        input_mint: str,
+        output_mint: str,
+        amount_raw: int,
+        action: str,
+        output_decimals: int,
+        expected_price_usd: float | None = None,
+        expected_output_value_usd: float | None = None,
+        input_value_usd: float | None = None,
+        max_price_impact_pct: float | None = None,
+    ) -> dict:
+        if not self.api_key:
+            raise TransactionBuildFailed("Set JUPITER_API_KEY locally before enabling trending live trades")
+        try:
+            Pubkey.from_string(owner)
+            Pubkey.from_string(input_mint)
+            Pubkey.from_string(output_mint)
+        except Exception as exc:
+            raise TransactionBuildFailed("Invalid wallet or mint address") from exc
+        if input_mint == output_mint or amount_raw <= 0:
+            raise TransactionBuildFailed("Invalid swap input/output mint or amount")
+        if (input_mint == WSOL_MINT) != (action == "buy"):
+            raise TransactionBuildFailed("Swap direction does not match the requested trade action")
+        if input_mint == WSOL_MINT and amount_raw > 50_000_000:
+            raise TransactionBuildFailed("Trending live buy exceeds the hard 0.05 SOL transaction input ceiling")
+        if output_mint != WSOL_MINT and action != "buy":
+            raise TransactionBuildFailed("Trending live sell must return to wrapped SOL")
+        if output_mint == WSOL_MINT and action != "sell":
+            raise TransactionBuildFailed("Only trending live sells may output wrapped SOL")
+
+        order = self._get_json(
+            f"{ULTRA_BASE}/order",
+            params={
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": str(int(amount_raw)),
+                "taker": owner,
+            },
+        )
+        out_amount = self._validate_order_fields(
+            order,
+            input_mint=input_mint,
+            output_mint=output_mint,
+            amount_raw=int(amount_raw),
+            max_price_impact_pct=max_price_impact_pct,
+            expected_output_value_usd=expected_output_value_usd,
+            input_value_usd=input_value_usd,
+            output_decimals=output_decimals,
+        )
+        allowed_dex_programs = self._dex_program_labels()
+        signed, signature = self._validate_and_sign(
+            str(order["transaction"]),
+            owner=owner,
+            keypair=keypair,
+            input_mint=input_mint,
+            amount_raw=int(amount_raw),
+            allowed_dex_programs=allowed_dex_programs,
+        )
+
+        try:
+            simulation = self.rpc.call(
+                "simulateTransaction",
+                [
+                    base64.b64encode(bytes(signed)).decode("ascii"),
+                    {"encoding": "base64", "sigVerify": True, "commitment": "processed"},
+                ],
+            )
+        except Exception as exc:
+            raise TransactionSimulationFailed(
+                f"Jupiter transaction simulation unavailable before submission: {type(exc).__name__}",
+                retryable=False,
+            ) from exc
+        sim_value = (simulation or {}).get("value") or {}
+        if sim_value.get("err") is not None:
+            detail = f"Jupiter route simulation failed: {sim_value.get('err')}; logs={sim_value.get('logs') or []}"
+            raise TransactionSimulationFailed(detail[:1000], retryable=False)
+
+        try:
+            response = self.session.post(
+                f"{ULTRA_BASE}/execute",
+                json={
+                    "signedTransaction": base64.b64encode(bytes(signed)).decode("ascii"),
+                    "requestId": str(order["requestId"]),
+                },
+                headers=self._headers(),
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            result = response.json()
+        except Exception as exc:
+            # A request failure after signed bytes may have reached Jupiter is
+            # ambiguous. Never issue a second order until the signature is checked.
+            raise TransactionOutcomeUncertain(
+                signature, action, output_mint if action == "buy" else input_mint,
+                f"Jupiter execute response unavailable; inspect signature before retry ({type(exc).__name__})",
+            ) from exc
+        if not isinstance(result, dict):
+            raise TransactionOutcomeUncertain(
+                signature, action, output_mint if action == "buy" else input_mint,
+                "Jupiter execute returned a non-object response after submission",
+            )
+        status = str(result.get("status") or "").strip().lower()
+        result_signature = str(result.get("signature") or "")
+        mint_for_error = output_mint if action == "buy" else input_mint
+        if status == "failed":
+            raise TransactionFailedOnChain(
+                result_signature or signature, action, mint_for_error,
+                str(result.get("error") or result.get("errorMessage") or "Jupiter reports failed execution")[:500],
+            )
+        if status != "success" or (result_signature and result_signature != signature):
+            raise TransactionOutcomeUncertain(
+                signature, action, mint_for_error,
+                f"Jupiter execute status/signature could not be verified: status={status or 'missing'}",
+            )
+
+        try:
+            confirmed_tx = self.rpc.transaction(signature)
+        except Exception as exc:
+            raise TransactionOutcomeUncertain(
+                signature, action, mint_for_error,
+                f"Jupiter reported success but RPC confirmation check failed ({type(exc).__name__})",
+            ) from exc
+        if not confirmed_tx:
+            raise TransactionOutcomeUncertain(
+                signature, action, mint_for_error,
+                "Jupiter reported success but transaction is not yet visible in configured RPC",
+            )
+        meta = confirmed_tx.get("meta") or {}
+        if meta.get("err") is not None:
+            raise TransactionFailedOnChain(
+                signature, action, mint_for_error, str(meta.get("err"))[:500]
+            )
+        return {
+            "signature": signature,
+            "input_amount_raw": int(amount_raw),
+            "quoted_output_raw": int(out_amount),
+            "execute_result": result,
+            "order": order,
+        }
