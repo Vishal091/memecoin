@@ -351,18 +351,37 @@ class TrendingLiveQueueTests(unittest.TestCase):
                 return self.state.get(key, default)
             def set_state(self, key, value):
                 self.state[key] = str(value)
+            def list_state_prefix(self, prefix, limit=10000):
+                return [(key, value) for key, value in self.state.items() if key.startswith(prefix)][:limit]
+            def list_positions(self):
+                return []
 
+        payload = self._gecko_payload()
+        second_mint = "TrendMint22222222222222222222222222222222"
+        second_pool = "TrendPool22222222222222222222222222222"
+        second_row = dict(payload["data"][0])
+        second_row["id"] = "solana_" + second_pool
+        second_row["relationships"] = {
+            "base_token": {"data": {"id": "solana_" + second_mint}},
+            "quote_token": payload["data"][0]["relationships"]["quote_token"],
+        }
+        payload["data"].append(second_row)
+        payload["included"].append({
+            "id": "solana_" + second_mint,
+            "attributes": {"address": second_mint, "name": "Trend Two", "symbol": "TRND2"},
+        })
         store, queued = MemoryStore(), []
         scanner = TrendingTokenScanner(
             self._settings(), rpc=object(), store=store, on_screened=queued.append
         )
-        scanner._get_json = lambda url, gecko=False: self._gecko_payload()
+        scanner._get_json = lambda url, gecko=False: payload
         scanner._dexscreener_enrich = lambda rows: None
         scanner._evaluate = lambda row: dict(row, status="SCREENED", momentum_score=95)
         scanner.scan_once()
         scanner.scan_once()
-        self.assertEqual(len(queued), 1)
-        self.assertEqual(store.get_state("trending_live_status:TrendMint11111111111111111111111111111111"), "queued")
+        self.assertEqual(len(queued), 1, "one candidate is queued at a time across scan cycles")
+        queued_mint = queued[0]["mint"]
+        self.assertEqual(store.get_state(f"trending_live_status:{queued_mint}"), "queued")
 
     def test_fresh_live_recheck_requires_same_pool_and_complete_security_data(self):
         from trending_scanner import TrendingTokenScanner, parse_gecko_trending
