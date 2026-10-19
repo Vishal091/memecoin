@@ -179,8 +179,23 @@ class PumpFunBot:
             self.s, self.rpc, timeout=self.s.request_timeout_seconds, store=self.store,
             on_screened=self._queue_trending_candidate,
         )
+        # Dashboard scanner state is persistent, but live-buy authorization is
+        # intentionally session-only: every process restart requires an explicit
+        # operator click on each live-buy switch.
+        self.token_discovery.enabled = self.store.get_state(
+            "dashboard_token_discovery_enabled",
+            "1" if self.s.token_discovery_enabled else "0",
+        ) == "1"
+        self.trending_scanner.enabled = self.store.get_state(
+            "dashboard_trending_discovery_enabled",
+            "1" if self.s.trending_discovery_enabled else "0",
+        ) == "1"
+        self.token_discovery.live_enabled = False
+        self.trending_scanner.live_enabled = False
+        self.store.set_state("dashboard_token_discovery_live_enabled", "0")
+        self.store.set_state("dashboard_trending_discovery_live_enabled", "0")
         if self.feed:
-            self.feed.set_discovery_subscriptions(self.token_discovery.enabled, [])
+            self.token_discovery._update_feed_subscriptions()
         self.solana_log_events = queue.Queue()
         self.logs_feed = (
             SolanaLogsFeed(self.s.rpc_url, self.solana_log_events, self.s.request_timeout_seconds)
@@ -414,7 +429,7 @@ class PumpFunBot:
         paused = self.store.get_state("copy_paused", "0") == "1"
         token_discovery_state = self.token_discovery.dashboard_snapshot()
         token_discovery_state.update({
-            "live_enabled": bool(self.s.mode == "live" and self.s.token_discovery_live_enabled),
+            "live_enabled": bool(self.s.mode == "live" and self.token_discovery.live_enabled),
             "live_entry_cap_usd": min(0.50, float(self.s.token_discovery_max_entry_usd)),
             "live_open_positions": sum(
                 1 for p in self.store.list_positions()
@@ -492,6 +507,34 @@ class PumpFunBot:
             # must not hide it or terminate the monitor.
             logger.exception("Could not refresh dashboard state after loop error")
 
+    def _discovery_live_toggle_block_reason(self, strategy: str) -> str:
+        """Fail closed before enabling either dashboard live-buy switch."""
+        if self.s.mode != "live":
+            return "BOT_MODE must be live before enabling real-money discovery buys."
+        if self.s.live_confirmation != "I_ACCEPT_THE_RISK_AND_UNDERSTAND_LIVE_TRADING":
+            return "LIVE_CONFIRMATION is missing or invalid."
+        if not getattr(self, "wallet_address", "") or not getattr(self, "keypair", None):
+            return "A loaded live wallet/keypair is required."
+        if strategy == "token_discovery":
+            if not self.token_discovery.enabled:
+                return "Enable the new-token scanner before enabling its live buys."
+            if not (0.10 <= float(self.s.token_discovery_max_entry_usd) <= 0.50):
+                return "TOKEN_DISCOVERY_MAX_ENTRY_USD must be between $0.10 and $0.50."
+            if not self.s.pumpfun_auth_token or not self.s.pumpportal_api_key:
+                return "Live mode requires Pump.fun and PumpPortal credentials."
+        elif strategy == "trending_discovery":
+            if not self.trending_scanner.enabled:
+                return "Enable the trending scanner before enabling its live buys."
+            if not (0.10 <= float(self.s.trending_discovery_max_entry_usd) <= 0.50):
+                return "TRENDING_DISCOVERY_MAX_ENTRY_USD must be between $0.10 and $0.50."
+            if not self.s.jupiter_api_key or not getattr(self.trending_executor, "api_key", ""):
+                return "JUPITER_API_KEY is required for trending live buys."
+            if not self.s.pumpfun_auth_token or not self.s.pumpportal_api_key:
+                return "Live mode requires Pump.fun and PumpPortal credentials."
+        else:
+            return "Unknown discovery strategy."
+        return ""
+
     def _process_dashboard_commands(self) -> None:
         while True:
             try:
@@ -499,6 +542,69 @@ class PumpFunBot:
             except queue.Empty:
                 break
             action = command.get("action")
+            discovery_actions = {
+                "set_token_discovery_enabled", "set_token_discovery_live_enabled",
+                "set_trending_discovery_enabled", "set_trending_discovery_live_enabled",
+            }
+            if action in discovery_actions:
+                requested = command.get("enabled")
+                if not isinstance(requested, bool):
+                    self.message = "Invalid discovery toggle value; expected a boolean."
+                    continue
+
+                if action == "set_token_discovery_enabled":
+                    self.token_discovery.enabled = requested
+                    self.store.set_state("dashboard_token_discovery_enabled", "1" if requested else "0")
+                    if not requested:
+                        self.token_discovery.live_enabled = False
+                        self.store.set_state("dashboard_token_discovery_live_enabled", "0")
+                    self.token_discovery._update_feed_subscriptions()
+                    self.message = (
+                        "New-token discovery scanner enabled. Live buys remain off until separately enabled."
+                        if requested else
+                        "New-token discovery scanner disabled; new-token live buys are also off. Existing positions remain managed."
+                    )
+                    logger.warning("%s", self.message)
+                elif action == "set_trending_discovery_enabled":
+                    self.trending_scanner.enabled = requested
+                    self.store.set_state("dashboard_trending_discovery_enabled", "1" if requested else "0")
+                    if not requested:
+                        self.trending_scanner.live_enabled = False
+                        self.store.set_state("dashboard_trending_discovery_live_enabled", "0")
+                        self.trending_scanner.stop()
+                    else:
+                        self.trending_scanner.start()
+                    self.message = (
+                        "Trending-token scanner enabled. Live buys remain off until separately enabled."
+                        if requested else
+                        "Trending-token scanner disabled; trending live buys are also off. Existing positions remain managed."
+                    )
+                    logger.warning("%s", self.message)
+                else:
+                    strategy = "token_discovery" if action == "set_token_discovery_live_enabled" else "trending_discovery"
+                    tracker = self.token_discovery if strategy == "token_discovery" else self.trending_scanner
+                    if requested:
+                        block_reason = self._discovery_live_toggle_block_reason(strategy)
+                        if block_reason:
+                            self.message = "Live buys NOT enabled: " + block_reason
+                            logger.warning("%s", self.message)
+                            continue
+                    tracker.live_enabled = requested
+                    state_key = (
+                        "dashboard_token_discovery_live_enabled"
+                        if strategy == "token_discovery"
+                        else "dashboard_trending_discovery_live_enabled"
+                    )
+                    # This marker is diagnostic only; live authorization itself resets
+                    # to OFF during startup regardless of any stale state value.
+                    self.store.set_state(state_key, "1" if requested else "0")
+                    self.message = (
+                        ("LIVE BUYS ENABLED for " if requested else "Live buys disabled for ")
+                        + strategy + ". Existing positions remain managed."
+                    )
+                    logger.warning("%s", self.message)
+                continue
+
             if action == "copy_top10":
                 window = str(command.get("window", "day")).lower()
                 if window not in {"overall", "day", "week", "month"}:
@@ -1178,7 +1284,7 @@ class PumpFunBot:
         if (
             self.s.mode != "live"
             or not self.s.trending_discovery_enabled
-            or not self.s.trending_discovery_live_enabled
+            or not self.trending_scanner.live_enabled
             or signal.get("source") != "trending_discovery"
         ):
             self.trending_scanner.set_live_status(
@@ -1441,7 +1547,7 @@ class PumpFunBot:
             if (
                 self.s.mode != "live"
                 or not self.s.token_discovery_enabled
-                or not self.s.token_discovery_live_enabled
+                or not self.token_discovery.live_enabled
                 or signal.get("source") != "token_discovery"
                 or signal.get("fresh_security_verified") is not True
             ):
@@ -2133,7 +2239,7 @@ class PumpFunBot:
         if (
             self.s.mode != "live"
             or not self.s.trending_discovery_enabled
-            or not self.s.trending_discovery_live_enabled
+            or not self.trending_scanner.live_enabled
         ):
             return
 
@@ -2367,7 +2473,7 @@ class PumpFunBot:
         if (
             self.s.mode != "live"
             or not self.s.token_discovery_enabled
-            or not self.s.token_discovery_live_enabled
+            or not self.token_discovery.live_enabled
         ):
             return
 
