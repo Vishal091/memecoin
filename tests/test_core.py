@@ -783,6 +783,152 @@ class EntryDrawdownCircuitBreakerTests(unittest.TestCase):
         self.assertIn("Risk baseline is invalid", reason)
 
 
+
+class DashboardDiscoveryToggleTests(unittest.TestCase):
+    class FakeStore:
+        def __init__(self):
+            self.state = {}
+        def get_state(self, key, default=""):
+            return self.state.get(key, default)
+        def set_state(self, key, value):
+            self.state[str(key)] = str(value)
+
+    class FakeTracker:
+        def __init__(self, enabled=False, live_enabled=False):
+            self.enabled = enabled
+            self.live_enabled = live_enabled
+            self.subscription_updates = 0
+            self.started = 0
+            self.stopped = 0
+        def _update_feed_subscriptions(self):
+            self.subscription_updates += 1
+        def start(self):
+            self.started += 1
+        def stop(self):
+            self.stopped += 1
+
+    def _bot(self, mode="paper"):
+        bot = PumpFunBot.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(
+            mode=mode,
+            live_confirmation="I_ACCEPT_THE_RISK_AND_UNDERSTAND_LIVE_TRADING",
+            token_discovery_enabled=False,
+            token_discovery_live_enabled=False,
+            token_discovery_max_entry_usd=0.50,
+            trending_discovery_enabled=False,
+            trending_discovery_live_enabled=False,
+            trending_discovery_max_entry_usd=0.50,
+            pumpfun_auth_token="test-auth",
+            pumpportal_api_key="test-pumpportal",
+            jupiter_api_key="test-jupiter",
+        )
+        bot.store = self.FakeStore()
+        bot.commands = queue.Queue()
+        bot.token_discovery = self.FakeTracker()
+        bot.trending_scanner = self.FakeTracker()
+        bot.trending_executor = SimpleNamespace(api_key="test-jupiter")
+        bot.wallet_address="TestWallet"
+        bot.keypair=object()
+        bot.message=""
+        return bot
+
+    def test_dashboard_exposes_separate_scan_and_live_buy_controls(self):
+        from dashboard import _PAGE
+        for control_id in (
+            "newScanToggle", "newLiveToggle",
+            "trendingScanToggle", "trendingLiveToggle",
+        ):
+            self.assertIn(control_id, _PAGE)
+        for action_name in (
+            "set_token_discovery_enabled",
+            "set_token_discovery_live_enabled",
+            "set_trending_discovery_enabled",
+            "set_trending_discovery_live_enabled",
+        ):
+            self.assertIn(action_name, _PAGE)
+
+    def test_enabling_scanner_does_not_enable_live_buys(self):
+        bot = self._bot()
+        bot.commands.put({"action": "set_token_discovery_enabled", "enabled": True})
+        bot._process_dashboard_commands()
+        self.assertTrue(bot.token_discovery.enabled)
+        self.assertFalse(bot.token_discovery.live_enabled)
+        self.assertEqual(bot.store.get_state("dashboard_token_discovery_enabled"), "1")
+        self.assertEqual(bot.token_discovery.subscription_updates, 1)
+
+        bot.commands.put({"action": "set_trending_discovery_enabled", "enabled": True})
+        bot._process_dashboard_commands()
+        self.assertTrue(bot.trending_scanner.enabled)
+        self.assertFalse(bot.trending_scanner.live_enabled)
+        self.assertEqual(bot.trending_scanner.started, 1)
+        self.assertEqual(bot.store.get_state("dashboard_trending_discovery_enabled"), "1")
+
+    def test_turning_off_scanner_also_turns_off_its_live_buy_switch(self):
+        bot = self._bot(mode="live")
+        bot.token_discovery.enabled = True
+        bot.token_discovery.live_enabled = True
+        bot.trending_scanner.enabled = True
+        bot.trending_scanner.live_enabled = True
+
+        bot.commands.put({"action": "set_token_discovery_enabled", "enabled": False})
+        bot.commands.put({"action": "set_trending_discovery_enabled", "enabled": False})
+        bot._process_dashboard_commands()
+
+        self.assertFalse(bot.token_discovery.enabled)
+        self.assertFalse(bot.token_discovery.live_enabled)
+        self.assertEqual(bot.store.get_state("dashboard_token_discovery_live_enabled"), "0")
+        self.assertFalse(bot.trending_scanner.enabled)
+        self.assertFalse(bot.trending_scanner.live_enabled)
+        self.assertEqual(bot.trending_scanner.stopped, 1)
+        self.assertEqual(bot.store.get_state("dashboard_trending_discovery_live_enabled"), "0")
+
+    def test_live_buy_switch_is_rejected_in_paper_mode(self):
+        bot = self._bot(mode="paper")
+        bot.token_discovery.enabled = True
+        bot.trending_scanner.enabled = True
+        bot.commands.put({"action": "set_token_discovery_live_enabled", "enabled": True})
+        bot.commands.put({"action": "set_trending_discovery_live_enabled", "enabled": True})
+        bot._process_dashboard_commands()
+
+        self.assertFalse(bot.token_discovery.live_enabled)
+        self.assertFalse(bot.trending_scanner.live_enabled)
+        self.assertIn("BOT_MODE must be live", bot.message)
+
+    def test_live_buy_switch_requires_scanner_and_credentials(self):
+        bot = self._bot(mode="live")
+        bot.keypair = None
+        bot.commands.put({"action": "set_trending_discovery_live_enabled", "enabled": True})
+        bot._process_dashboard_commands()
+        self.assertFalse(bot.trending_scanner.live_enabled)
+        self.assertIn("A loaded live wallet/keypair is required", bot.message)
+
+        bot.keypair = object()
+        bot.commands.put({"action": "set_trending_discovery_live_enabled", "enabled": True})
+        bot._process_dashboard_commands()
+        self.assertFalse(bot.trending_scanner.live_enabled)
+        self.assertIn("Enable the trending scanner", bot.message)
+
+    def test_trending_live_buy_can_be_enabled_after_all_gates_pass(self):
+        bot = self._bot(mode="live")
+        bot.trending_scanner.enabled = True
+        bot.commands.put({"action": "set_trending_discovery_live_enabled", "enabled": True})
+        bot._process_dashboard_commands()
+        self.assertTrue(bot.trending_scanner.live_enabled)
+        self.assertEqual(bot.store.get_state("dashboard_trending_discovery_live_enabled"), "1")
+        self.assertIn("LIVE BUYS ENABLED", bot.message)
+
+    def test_disabling_live_buy_switch_does_not_disable_scanner(self):
+        bot = self._bot(mode="live")
+        bot.token_discovery.enabled = True
+        bot.token_discovery.live_enabled = True
+        bot.commands.put({"action": "set_token_discovery_live_enabled", "enabled": False})
+        bot._process_dashboard_commands()
+        self.assertTrue(bot.token_discovery.enabled)
+        self.assertFalse(bot.token_discovery.live_enabled)
+        self.assertEqual(bot.store.get_state("dashboard_token_discovery_enabled"), "")
+        self.assertEqual(bot.store.get_state("dashboard_token_discovery_live_enabled"), "0")
+
+
 class CopySafetyGateTests(unittest.TestCase):
     class FakeStore:
         def __init__(self, state=None, positions=None):
