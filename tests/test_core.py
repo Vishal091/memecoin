@@ -753,6 +753,17 @@ class EntryDrawdownCircuitBreakerTests(unittest.TestCase):
             self.assertFalse(allowed)
             self.assertIn("Daily-loss limit", reason)
 
+    def test_daily_loss_pause_remains_after_equity_recovers_until_new_utc_day(self):
+        bot = self._bot(equity=9.50)
+        allowed, reason = bot._can_enter(9.50, strategy="leader_copy")
+        self.assertFalse(allowed)
+        self.assertIn("Daily-loss limit", reason)
+        self.assertEqual(bot.store.get_state("daily_paused"), "1")
+
+        allowed, reason = bot._can_enter(9.90, strategy="trending_discovery")
+        self.assertFalse(allowed)
+        self.assertIn("paused until the next UTC day", reason)
+
     def test_total_loss_limit_blocks_entries_even_when_daily_loss_is_small(self):
         bot = self._bot(equity=8.99, day_start=9.40)
         allowed, reason = bot._can_enter(8.99, strategy="trending_discovery")
