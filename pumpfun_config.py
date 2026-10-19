@@ -86,10 +86,16 @@ class PumpFunSettings:
     token_discovery_shadow_window_seconds: int
     token_discovery_max_token_age_hours: int
     trending_discovery_enabled: bool
+    trending_discovery_live_enabled: bool
+    trending_discovery_max_entry_usd: float
     trending_discovery_poll_seconds: int
     trending_discovery_max_candidates: int
     trending_min_liquidity_usd: float
     trending_min_volume_1h_usd: float
+    trending_min_score: int
+    trending_max_price_impact_pct: float
+    trending_max_pool_age_hours: int
+    jupiter_api_key: str
     database_path: Path
     log_level: str
 
@@ -163,12 +169,18 @@ class PumpFunSettings:
             token_discovery_shadow_window_seconds=max(60, min(3600, _int("TOKEN_DISCOVERY_SHADOW_WINDOW_SECONDS", 900))),
             # The scanner only queues launches observed inside this rolling age limit; never allow >24h.
             token_discovery_max_token_age_hours=max(1, min(24, _int("TOKEN_DISCOVERY_MAX_TOKEN_AGE_HOURS", 24))),
-            # Trending is a separate, paced, analysis-only pipeline; it never submits trades.
+            # Trending discovery has independent scanning and live-execution opt-ins.
             trending_discovery_enabled=os.getenv("TRENDING_DISCOVERY_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
+            trending_discovery_live_enabled=os.getenv("TRENDING_DISCOVERY_LIVE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
+            trending_discovery_max_entry_usd=min(0.50, _float("TRENDING_DISCOVERY_MAX_ENTRY_USD", 0.50)),
             trending_discovery_poll_seconds=max(60, min(900, _int("TRENDING_DISCOVERY_POLL_SECONDS", 60))),
             trending_discovery_max_candidates=max(1, min(20, _int("TRENDING_DISCOVERY_MAX_CANDIDATES", 8))),
             trending_min_liquidity_usd=max(15000.0, _float("TRENDING_MIN_LIQUIDITY_USD", 15000.0)),
             trending_min_volume_1h_usd=max(10000.0, _float("TRENDING_MIN_VOLUME_1H_USD", 10000.0)),
+            trending_min_score=max(75, min(100, _int("TRENDING_MIN_SCORE", 75))),
+            trending_max_price_impact_pct=max(1.0, min(5.0, _float("TRENDING_MAX_PRICE_IMPACT_PCT", 5.0))),
+            trending_max_pool_age_hours=max(1, min(720, _int("TRENDING_MAX_POOL_AGE_HOURS", 720))),
+            jupiter_api_key=os.getenv("JUPITER_API_KEY", "").strip(),
             database_path=Path(os.getenv("DATABASE_PATH", "memecoin-pumpfun.db")),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )
@@ -195,6 +207,15 @@ class PumpFunSettings:
                 raise ValueError("TOKEN_DISCOVERY_LIVE_ENABLED requires BOT_MODE=live")
             if not (0.10 <= self.token_discovery_max_entry_usd <= 0.50):
                 raise ValueError("TOKEN_DISCOVERY_MAX_ENTRY_USD must be between $0.10 and the $0.50 hard cap")
+        if self.trending_discovery_live_enabled:
+            if not self.trending_discovery_enabled:
+                raise ValueError("TRENDING_DISCOVERY_LIVE_ENABLED requires TRENDING_DISCOVERY_ENABLED=true")
+            if self.mode != "live":
+                raise ValueError("TRENDING_DISCOVERY_LIVE_ENABLED requires BOT_MODE=live")
+            if not self.jupiter_api_key:
+                raise ValueError("TRENDING_DISCOVERY_LIVE_ENABLED requires JUPITER_API_KEY in the local .env")
+            if not (0.10 <= self.trending_discovery_max_entry_usd <= 0.50):
+                raise ValueError("TRENDING_DISCOVERY_MAX_ENTRY_USD must be between $0.10 and the $0.50 hard cap")
         if self.mode == "live":
             if self.live_confirmation != "I_ACCEPT_THE_RISK_AND_UNDERSTAND_LIVE_TRADING":
                 raise ValueError("Live mode not armed. Review risks and set LIVE_CONFIRMATION locally.")
