@@ -347,7 +347,7 @@ class TrendingTokenScanner:
         self.enabled = bool(getattr(settings, "trending_discovery_enabled", False))
         self.live_enabled = bool(getattr(settings, "trending_discovery_live_enabled", False))
         self.poll_seconds = max(60, min(900, int(getattr(settings, "trending_discovery_poll_seconds", 60))))
-        self.max_candidates = max(1, min(20, int(getattr(settings, "trending_discovery_max_candidates", 8))))
+        self.max_candidates = max(1, min(20, int(getattr(settings, "trending_discovery_max_candidates", 20))))
         self.min_liquidity_usd = max(15000.0, float(getattr(settings, "trending_min_liquidity_usd", 15000.0)))
         self.min_volume_1h_usd = max(10000.0, float(getattr(settings, "trending_min_volume_1h_usd", 10000.0)))
         self.timeout = max(3, min(15, int(timeout)))
