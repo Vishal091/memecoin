@@ -135,17 +135,18 @@ class PumpFunBot:
         self.leaderboards = {}
         self.selected_window = self.store.get_state("leaderboard_window", self.s.default_leaderboard_window)
         saved_auto = self.store.get_state("auto_copy_enabled", "1" if self.s.auto_copy_on_start else "0")
-        # Migrate old automatic safety-halt flags. Explicit user stop-copy state remains
-        # respected unless it was coupled to one of the old automatic halt latches.
+        # Migrate old automatic safety-halt flags. Do not clear the persisted
+        # consecutive-loss circuit breaker: a same-day pause must survive restarts.
+        # Explicit user stop-copy state remains respected unless coupled to an old
+        # automatic halt latch.
         legacy_auto_halt = any(
             self.store.get_state(key, "0") == "1"
             for key in ("manual_review_halt", "halted", "daily_paused", "experiment_expired")
-        ) or bool(self.store.get_state("consecutive_loss_pause_day", ""))
+        )
         if legacy_auto_halt:
             self.store.set_state("manual_review_halt", "0")
             self.store.set_state("halted", "0")
             self.store.set_state("daily_paused", "0")
-            self.store.set_state("consecutive_loss_pause_day", "")
             self.store.set_state("experiment_expired", "0")
             if saved_auto == "0" and self.store.get_state("copy_paused", "0") == "1":
                 # These flags were also written by automatic halt handlers; restore
