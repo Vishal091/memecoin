@@ -355,7 +355,7 @@ class JupiterUltraExecutor:
                 # Only create the bot wallet's ATA for one of the two swap mints.
                 # ATA rent comes from the wallet; other owners or unexpected mints
                 # are out of scope for a $0.50 trending swap.
-                if data not in {b"", b"\\x01"} or len(accounts) < 6:
+                if data not in {b"", b"\x01"} or len(accounts) < 6:
                     raise TransactionBuildFailed("Jupiter transaction contains an unsupported associated-token instruction")
                 if any(index >= len(keys) for index in accounts[:6]):
                     raise TransactionBuildFailed("Associated-token instruction references unresolved account keys")
