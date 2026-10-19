@@ -246,6 +246,7 @@ class TrendingScannerSafetyTests(unittest.TestCase):
         self.assertIn("extension list is missing", " ".join(flags))
 
 
+class TrendingScannerIntegrationTests(unittest.TestCase):
     def test_liquidity_and_volume_rejection_messages_show_real_thresholds(self):
         scanner = TrendingTokenScanner(self._settings(), rpc=object())
         low_liq = scanner._evaluate({"mint": "CandidateMint1111111111111111111111111111", "liquidity_usd": 1234, "volume_1h_usd": 25000})
@@ -257,7 +258,6 @@ class TrendingScannerSafetyTests(unittest.TestCase):
         self.assertIn("$1,234", low_vol["decision"])
         self.assertIn("$10,000", low_vol["decision"])
 
-class TrendingScannerIntegrationTests(unittest.TestCase):
     def _settings(self):
         from types import SimpleNamespace
         return SimpleNamespace(
