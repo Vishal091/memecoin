@@ -1140,11 +1140,20 @@ class PumpFunBot:
             or not self.s.trending_discovery_enabled
             or not self.s.trending_discovery_live_enabled
             or signal.get("source") != "trending_discovery"
-            or signal.get("fresh_security_verified") is not True
         ):
             self.trending_scanner.set_live_status(
                 mint, "blocked", "Trending live opt-in or freshly verified security checks are missing"
             )
+            return
+        try:
+            signal = self.trending_scanner.verify_live_candidate(signal)
+            signal["source"] = "trending_discovery"
+            signal["fresh_security_verified"] = True
+        except Exception as exc:
+            self.trending_scanner.set_live_status(
+                mint, "blocked", f"Fresh pre-trade security/market recheck failed ({type(exc).__name__}): {str(exc)[:300]}"
+            )
+            logger.warning("Trending live entry blocked by fresh recheck mint=%s: %s", mint[:8], exc)
             return
         if not mint or self.store.get_state(f"unresolved_trade:{mint}", ""):
             self.trending_scanner.set_live_status(
@@ -1201,9 +1210,10 @@ class PumpFunBot:
                 f"Fresh same-pool 1h volume ${volume1:,.0f} is below ${self.s.trending_min_volume_1h_usd:,.0f}",
             )
             return
-        if pair_age < self.s.min_pair_age_seconds or price <= 0:
+        max_pair_age = max(1, int(self.s.trending_max_pool_age_hours)) * 3600
+        if pair_age < self.s.min_pair_age_seconds or pair_age > max_pair_age or price <= 0:
             self.trending_scanner.set_live_status(
-                mint, "blocked", "Fresh DEX pair is too young or has no reliable USD price"
+                mint, "blocked", "Fresh DEX pair is too young/old or has no reliable USD price"
             )
             return
         if bool(signal.get("market_data_discrepancy")) or signal.get("same_pool_crosscheck") is not True:
@@ -1225,10 +1235,14 @@ class PumpFunBot:
             )
             return
         try:
-            buys = int(signal.get("dexscreener_buys_1h", signal.get("buys_1h", 0)) or 0)
-            sells = int(signal.get("dexscreener_sells_1h", signal.get("sells_1h", 0)) or 0)
-        except (TypeError, ValueError):
-            buys, sells = 0, 0
+            fresh_txns = (raw_market.get("txns") or {}).get("h1") or {}
+            buys = int(fresh_txns["buys"])
+            sells = int(fresh_txns["sells"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            self.trending_scanner.set_live_status(
+                mint, "blocked", "Fresh DEX market response has no usable one-hour buy/sell counts"
+            )
+            return
         if buys <= sells:
             self.trending_scanner.set_live_status(
                 mint, "blocked", "Fresh one-hour trade flow does not show more buys than sells"
