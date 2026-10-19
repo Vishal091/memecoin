@@ -252,7 +252,7 @@ class TrendingTokenScanner:
             payload = self._get_json(f"{DEX}/tokens/v1/solana/{','.join(mints)}")
             if not isinstance(payload, list):
                 return
-            best: dict[str, dict] = {}
+            pools_by_mint: dict[str, list[dict]] = {}
             for pair in payload:
                 if not isinstance(pair, dict) or pair.get("chainId") != "solana":
                     continue
@@ -260,15 +260,27 @@ class TrendingTokenScanner:
                 mint = str(base.get("address") or "")
                 if mint not in mints:
                     mint = str(quote.get("address") or "")
-                liq = _num((pair.get("liquidity") or {}).get("usd"))
-                if mint in mints and (mint not in best or liq > _num((best[mint].get("liquidity") or {}).get("usd"))):
-                    best[mint] = pair
+                if mint in mints:
+                    pools_by_mint.setdefault(mint, []).append(pair)
             for c in candidates:
-                pair = best.get(c.get("mint"))
-                if not pair:
+                pairs = pools_by_mint.get(str(c.get("mint") or ""), [])
+                if not pairs:
                     c.setdefault("risk_flags", []).append("No matching DEX Screener pair; market cross-check incomplete")
                     c["dexscreener_confirmed"] = False
                     continue
+                pool_address = str(c.get("pool_address") or "")
+                pair = next(
+                    (row for row in pairs if str(row.get("pairAddress") or "") == pool_address),
+                    None,
+                )
+                same_pool = pair is not None
+                if pair is None:
+                    # Do not compare liquidity/volume figures from different pools as
+                    # if they were the same market; surface the best alternate pair for review.
+                    pair = max(
+                        pairs,
+                        key=lambda row: _num((row.get("liquidity") or {}).get("usd")),
+                    )
                 base, quote = pair.get("baseToken") or {}, pair.get("quoteToken") or {}
                 chosen = base if str(base.get("address") or "") == str(c.get("mint") or "") else quote
                 if chosen.get("name"):
@@ -278,21 +290,27 @@ class TrendingTokenScanner:
                 c["dexscreener_pair_address"] = str(pair.get("pairAddress") or "")
                 c["dexscreener_url"] = str(pair.get("url") or "")
                 dex_liq = _num((pair.get("liquidity") or {}).get("usd"))
-                gecko_liq = _num(c.get("liquidity_usd"))
-                if dex_liq > 0:
-                    c["gecko_liquidity_usd"] = gecko_liq
-                    c["dexscreener_liquidity_usd"] = dex_liq
-                    c["liquidity_usd"] = min(gecko_liq, dex_liq) if gecko_liq > 0 else dex_liq
-                    c["market_data_sources"] = ["GeckoTerminal", "DEX Screener"]
-                    c["dexscreener_confirmed"] = True
-                    if gecko_liq > 0 and max(gecko_liq, dex_liq) / min(gecko_liq, dex_liq) > 3:
-                        c["market_data_discrepancy"] = True
-                        c.setdefault("risk_flags", []).append("Market sources disagree on liquidity by more than 3x")
                 volume, change = pair.get("volume") or {}, pair.get("priceChange") or {}
+                c["dexscreener_liquidity_usd"] = dex_liq
                 c["dexscreener_volume_1h_usd"] = _num(volume.get("h1"))
                 c["dexscreener_volume_24h_usd"] = _num(volume.get("h24"))
                 c["dexscreener_change_1h_pct"] = _num(change.get("h1"))
                 c["dexscreener_change_24h_pct"] = _num(change.get("h24"))
+                c["same_pool_crosscheck"] = same_pool
+                c["dexscreener_confirmed"] = bool(same_pool and dex_liq > 0)
+                if not same_pool:
+                    c.setdefault("risk_flags", []).append(
+                        "DEX Screener's best pair differs from GeckoTerminal's trending pool; pool-level metrics are not directly comparable"
+                    )
+                    continue
+                gecko_liq = _num(c.get("liquidity_usd"))
+                if dex_liq > 0:
+                    c["gecko_liquidity_usd"] = gecko_liq
+                    c["liquidity_usd"] = min(gecko_liq, dex_liq) if gecko_liq > 0 else dex_liq
+                    c["market_data_sources"] = ["GeckoTerminal", "DEX Screener"]
+                    if gecko_liq > 0 and max(gecko_liq, dex_liq) / min(gecko_liq, dex_liq) > 3:
+                        c["market_data_discrepancy"] = True
+                        c.setdefault("risk_flags", []).append("Market sources disagree on liquidity by more than 3x")
                 gecko_vol1 = _num(c.get("volume_1h_usd"))
                 dex_vol1 = _num(volume.get("h1"))
                 if gecko_vol1 > 0 and dex_vol1 > 0 and max(gecko_vol1, dex_vol1) / min(gecko_vol1, dex_vol1) > 5:
