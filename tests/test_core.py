@@ -757,14 +757,14 @@ class CopySafetyGateTests(unittest.TestCase):
         bot._refresh_feed_subscriptions()
         self.assertEqual(bot.active_wallets, {"leader-wallet"})
 
-    def test_held_position_leader_remains_monitored_when_copy_is_blocked(self):
+    def test_legacy_manual_review_flag_keeps_held_and_leader_wallets_monitored(self):
         position = {"mint": "open-mint", "source_wallet": "held-leader"}
         bot = self._bot({
             "manual_review_halt": "1",
             "manual_review_reason": "Reconcile wallet before resuming",
         }, positions=[position])
         bot._refresh_feed_subscriptions()
-        self.assertEqual(bot.active_wallets, {"held-leader"})
+        self.assertEqual(bot.active_wallets, {"held-leader", "leader-wallet"})
 
 
 class StaleWalletSignalTests(unittest.TestCase):
