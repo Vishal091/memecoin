@@ -370,7 +370,7 @@ class TrendingLiveQueueTests(unittest.TestCase):
         mint = "TrendMint11111111111111111111111111111111"
         pool = "TrendPool11111111111111111111111111111"
         wsol = "So11111111111111111111111111111111111111112"
-        gecko = self._gecko_payload(mint, pool)
+        gecko_payload = self._gecko_payload(mint, pool)
         pair = {
             "chainId": "solana",
             "pairAddress": pool,
@@ -394,7 +394,7 @@ class TrendingLiveQueueTests(unittest.TestCase):
         scanner = TrendingTokenScanner(self._settings(), rpc=FakeRPC())
         def get_json(url, gecko=False):
             if "trending_pools" in url:
-                return gecko
+                return gecko_payload
             if "/tokens/v1/" in url:
                 return [pair]
             if "/report/summary" in url:
@@ -402,7 +402,7 @@ class TrendingLiveQueueTests(unittest.TestCase):
             raise AssertionError("Unexpected URL " + url)
         scanner._get_json = get_json
         scanner._check_mint = lambda candidate_mint: ("PASS", ["Mint authority checks passed"])
-        initial = parse_gecko_trending(gecko)[0]
+        initial = parse_gecko_trending(gecko_payload)[0]
         initial["dexscreener_pair_address"] = pool
         checked = scanner.verify_live_candidate(initial)
         self.assertTrue(checked["fresh_security_verified"])
