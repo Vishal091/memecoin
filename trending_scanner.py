@@ -48,6 +48,37 @@ def _epoch(value: Any) -> float:
         return 0.0
 
 
+LIVE_RETRYABLE_STATUSES = frozenset({"blocked", "failed", "stale_queue"})
+LIVE_RETRY_COOLDOWN_SECONDS = 300
+
+
+def live_candidate_retry_allowed(
+    status: Any,
+    updated_at: Any,
+    *,
+    now: float | None = None,
+    cooldown_seconds: int = LIVE_RETRY_COOLDOWN_SECONDS,
+) -> bool:
+    """Retry only known pre-submit/confirmed-failure states after a fresh-scan cooldown.
+
+    An order with a possibly submitted/unknown outcome must never be replayed.
+    Opened/closed states also remain terminal to prevent duplicate or re-entry buys.
+    """
+    normalized = str(status or "").strip().lower()
+    if not normalized:
+        return True
+    if normalized not in LIVE_RETRYABLE_STATUSES:
+        return False
+    try:
+        timestamp = float(updated_at or 0)
+    except (TypeError, ValueError, OverflowError):
+        timestamp = 0.0
+    if timestamp <= 0:
+        return True
+    current = time.time() if now is None else float(now)
+    return current - timestamp >= max(0, int(cooldown_seconds))
+
+
 def _address(resource_id: Any) -> str:
     value = str(resource_id or "")
     return value[len("solana_"):] if value.startswith("solana_") else value
@@ -548,7 +579,7 @@ class TrendingTokenScanner:
         elif status == "SAFE_CANDIDATE":
             live_active = (
                 str(getattr(self.settings, "mode", "paper")).lower() == "live"
-                and bool(getattr(self.settings, "trending_discovery_enabled", False))
+                and self.enabled
                 and self.live_enabled
             )
             score_eligible = int(item.get("momentum_score") or 0) >= int(
@@ -740,6 +771,7 @@ class TrendingTokenScanner:
             self._screened_count = sum(c.get("status") == "SCREENED" for c in checked)
             self._rejected_count = sum(c.get("status") in {"REJECTED", "FILTERED"} for c in checked)
             self._scan_count += 1
+            retry_suppressed = 0
             for item in checked:
                 live_status, live_reason, live_updated_at = self._stored_live_status(item["mint"])
                 if live_status:
@@ -747,17 +779,25 @@ class TrendingTokenScanner:
                     item["live_entry_reason"] = live_reason
                     item["live_entry_status_updated_at"] = live_updated_at
                 self._candidates[item["mint"]] = item
+                is_trade_candidate = (
+                    item.get("status") == "SCREENED"
+                    and int(item.get("momentum_score") or 0) >= int(getattr(self.settings, "trending_min_score", 75))
+                )
+                retry_allowed = live_candidate_retry_allowed(live_status, live_updated_at)
+                if live_active and is_trade_candidate and live_status and not retry_allowed:
+                    retry_suppressed += 1
                 if (
                     live_active
                     and not live_reserved
-                    and item.get("status") == "SCREENED"
-                    and int(item.get("momentum_score") or 0) >= int(getattr(self.settings, "trending_min_score", 75))
-                    and not live_status
+                    and is_trade_candidate
+                    and retry_allowed
                 ):
-                    self.set_live_status(
-                        item["mint"], "queued",
-                        "Passed first-pass screens; checking fresh pool, on-chain and RugCheck data",
+                    retry_note = (
+                        f"Re-screened after prior {live_status} status; fresh pre-trade checks required"
+                        if live_status else
+                        "Passed first-pass screens; checking fresh pool, on-chain and RugCheck data"
                     )
+                    self.set_live_status(item["mint"], "queued", retry_note)
                     queue_for_live.append(dict(item))
                     live_reserved = True
             cutoff = time.time() - 6 * 3600
@@ -770,8 +810,12 @@ class TrendingTokenScanner:
                     str(candidate.get("mint") or ""), "failed",
                     f"Could not enqueue candidate ({type(exc).__name__})",
                 )
-        logger.info("Trending scan complete: pools=%d checked=%d screened=%d queued=%d rejected/filtered=%d",
-                    len(raw), len(checked), self._screened_count, len(queue_for_live), self._rejected_count)
+        logger.info(
+            "Trending scan complete: pools=%d checked=%d screened=%d queued=%d "
+            "existing-status-skips=%d rejected/filtered=%d",
+            len(raw), len(checked), self._screened_count, len(queue_for_live),
+            retry_suppressed, self._rejected_count,
+        )
 
     def dashboard_snapshot(self) -> dict:
         with self._lock:
