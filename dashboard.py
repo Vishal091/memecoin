@@ -108,7 +108,7 @@ function render(d){
     var top=x.top_holders_pct===undefined||x.top_holders_pct===null?"—":Number(x.top_holders_pct).toFixed(1)+"%";
     var lp=x.lp_locked_pct===undefined||x.lp_locked_pct===null?"—":Number(x.lp_locked_pct).toFixed(1)+"%";
     var flags=(x.risk_flags||[]).join(" · ");
-    var poolUrl="https://dexscreener.com/solana/"+encodeURIComponent(x.pool_address||"");
+    var poolUrl=x.dexscreener_url||("https://dexscreener.com/solana/"+encodeURIComponent(x.dexscreener_pair_address||x.pool_address||""));
     var rugUrl="https://rugcheck.xyz/tokens/"+encodeURIComponent(x.mint||"");
     var tokenLabel=(x.name||x.symbol||"Unknown token")+" ("+(x.symbol||"—")+")";
     return "<tr><td><div>"+esc(tokenLabel)+"</div><div class='addr' title='"+esc(x.mint)+"'>"+esc(short(x.mint))+"</div><div class='muted'>"+esc(x.pool_name||"Solana pool")+"</div><a target='_blank' rel='noreferrer' href='"+poolUrl+"'>DEX Screener ↗</a></td><td>"+Number(x.momentum_score||0)+"/100<div class='muted'>"+esc(ago(x.updated_at))+"</div></td><td>$"+num(x.liquidity_usd)+"<div class='muted'>Gecko "+(x.gecko_liquidity_usd===undefined?"—":"$"+num(x.gecko_liquidity_usd))+" / DEX "+(x.dexscreener_liquidity_usd===undefined?"—":"$"+num(x.dexscreener_liquidity_usd))+"</div></td><td>$"+num(x.volume_1h_usd)+" / $"+num(x.volume_24h_usd)+"</td><td>"+changes.join(" / ")+"</td><td>"+esc(x.onchain_status||"—")+" · "+esc(x.rugcheck_status||"not checked")+"<div><a target='_blank' rel='noreferrer' href='"+rugUrl+"'>RugCheck ↗</a></div></td><td>Top holders "+top+" · LP locked/burned "+lp+"</td><td><strong class='"+statusClass+"'>"+esc(status)+"</strong><div>"+esc(x.decision||"")+"</div><div class='muted'>"+esc(flags)+"</div></td></tr>";
