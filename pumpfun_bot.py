@@ -990,6 +990,10 @@ class PumpFunBot:
             return False, "Open position cap reached"
         if equity <= 0:
             return False, "Equity is zero or less"
+        # Make UTC-day rollover deterministic even when an event arrives before the
+        # next periodic heartbeat refreshes the risk baselines.
+        if hasattr(self.store, "reset_day_if_needed"):
+            self.store.reset_day_if_needed(equity)
         loss_streak_reason = self._loss_streak_pause_reason()
         if loss_streak_reason:
             return False, loss_streak_reason
