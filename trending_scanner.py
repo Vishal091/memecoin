@@ -296,8 +296,13 @@ class TrendingTokenScanner:
                 c["dexscreener_liquidity_usd"] = dex_liq
                 c["dexscreener_volume_1h_usd"] = _num(volume.get("h1"))
                 c["dexscreener_volume_24h_usd"] = _num(volume.get("h24"))
+                c["dexscreener_change_5m_pct"] = _num(change.get("m5"))
                 c["dexscreener_change_1h_pct"] = _num(change.get("h1"))
                 c["dexscreener_change_24h_pct"] = _num(change.get("h24"))
+                txns = pair.get("txns") or {}
+                h1_txns = txns.get("h1") or {}
+                c["dexscreener_buys_1h"] = int(_num(h1_txns.get("buys")))
+                c["dexscreener_sells_1h"] = int(_num(h1_txns.get("sells")))
                 c["same_pool_crosscheck"] = same_pool
                 c["dexscreener_confirmed"] = bool(same_pool and dex_liq > 0)
                 if not same_pool:
@@ -409,7 +414,25 @@ class TrendingTokenScanner:
         if status == "REJECTED":
             item.update({"status": "REJECTED", "decision": "; ".join(risk_flags) or "RugCheck rejected candidate"})
         elif status == "SAFE_CANDIDATE":
-            item.update({"status": "SCREENED", "decision": "Passed market, on-chain mint and RugCheck screens; analysis-only"})
+            live_active = (
+                str(getattr(self.settings, "mode", "paper")).lower() == "live"
+                and bool(getattr(self.settings, "trending_discovery_enabled", False))
+                and bool(getattr(self.settings, "trending_discovery_live_enabled", False))
+            )
+            score_eligible = int(item.get("momentum_score") or 0) >= int(
+                getattr(self.settings, "trending_min_score", 75)
+            )
+            item.update({
+                "status": "SCREENED",
+                "execution_mode": "live_opt_in" if live_active else "analysis_only",
+                "trade_eligible": bool(live_active and score_eligible),
+                "decision": (
+                    "Passed initial market, on-chain mint and RugCheck screens; "
+                    "live entry still requires fresh pre-trade checks"
+                    if live_active and score_eligible
+                    else "Passed analysis screens; live execution is not authorized or score is below threshold"
+                ),
+            })
         else:
             item.update({"status": "REVIEW", "decision": "; ".join(risk_flags) or "Risk report incomplete; manual review required"})
         return item
