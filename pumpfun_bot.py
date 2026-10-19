@@ -60,8 +60,14 @@ def loss_exit_hold_remaining_seconds(
     """Seconds remaining in the minimum holding period for a loss-making exit."""
     entry_price = float(position.get("entry_price_usd") or 0)
     normalized_reason = str(reason or "").strip().lower()
-    # Portfolio emergencies, experiment shutdown and an explicit human exit override the grace period.
-    if normalized_reason.startswith(("total loss limit", "experiment expiry", "manual exit")):
+    # A triggered algorithmic stop must attempt an exit immediately. Deferring it
+    # for the minimum-hold grace period can turn a defined stop into a much larger
+    # loss during a fast dump. Leader-triggered sells still use the grace period
+    # unless there is a portfolio emergency or explicit human exit.
+    if normalized_reason.startswith((
+        "total loss limit", "experiment expiry", "manual exit",
+        "marked loss stop", "trailing stop",
+    )):
         return 0.0
     if entry_price <= 0 or mark_price <= 0 or mark_price >= entry_price:
         return 0.0
