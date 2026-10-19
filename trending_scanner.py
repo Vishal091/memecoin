@@ -568,6 +568,38 @@ class TrendingTokenScanner:
             and self.enabled
             and bool(getattr(self.settings, "trending_discovery_live_enabled", False))
         )
+        # Only one live discovery candidate may be in flight at a time. Persisted
+        # "submitting"/"uncertain" states intentionally block new entries after a
+        # restart until the possible transaction has been reconciled.
+        live_reserved = False
+        if live_active and self.store is not None:
+            try:
+                if hasattr(self.store, "list_positions"):
+                    live_reserved = any(
+                        p.get("strategy", "leader_copy") in {"token_discovery", "trending_discovery"}
+                        for p in self.store.list_positions()
+                    )
+                if hasattr(self.store, "list_state_prefix"):
+                    for key, value in self.store.list_state_prefix("trending_live_status:", limit=10000):
+                        status = str(value or "").strip().lower()
+                        mint = key[len("trending_live_status:"):]
+                        if status == "queued":
+                            try:
+                                queued_at = float(self.store.get_state(f"trending_live_status_at:{mint}", "0") or 0)
+                            except (TypeError, ValueError):
+                                queued_at = 0.0
+                            if queued_at and time.time() - queued_at > 180:
+                                # Safe to move on to another candidate after a stale queue.
+                                # The candidate is not retried automatically across restart.
+                                self.set_live_status(mint, "stale_queue", "Queued candidate expired before the main loop processed it")
+                                continue
+                            live_reserved = True
+                        elif status in {"submitting", "uncertain"}:
+                            live_reserved = True
+            except Exception as exc:
+                # State inspection failure means live entry must remain blocked.
+                live_reserved = True
+                logger.warning("Trending live single-flight state check failed; blocking new entries: %s", type(exc).__name__)
         with self._lock:
             self._last_scan_at = time.time()
             self._last_error = ""
@@ -584,6 +616,7 @@ class TrendingTokenScanner:
                 self._candidates[item["mint"]] = item
                 if (
                     live_active
+                    and not live_reserved
                     and item.get("status") == "SCREENED"
                     and int(item.get("momentum_score") or 0) >= int(getattr(self.settings, "trending_min_score", 75))
                     and not live_status
@@ -593,6 +626,7 @@ class TrendingTokenScanner:
                         "Passed first-pass screens; checking fresh pool, on-chain and RugCheck data",
                     )
                     queue_for_live.append(dict(item))
+                    live_reserved = True
             cutoff = time.time() - 6 * 3600
             self._candidates = {m: c for m, c in self._candidates.items() if _num(c.get("updated_at")) >= cutoff}
         for candidate in queue_for_live:
