@@ -80,6 +80,83 @@ class JupiterOrderValidationTests(unittest.TestCase):
             self._validate(self._order(transaction=""))
 
 
+class TransactionInstructionPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.executor = JupiterUltraExecutor(rpc=object(), api_key="test-key")
+        self.owner = "SysvarRent111111111111111111111111111111111"
+        self.input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        self.output_mint = WSOL_MINT
+
+    @staticmethod
+    def _ix(program_index, data, accounts=b""):
+        return SimpleNamespace(
+            program_id_index=program_index,
+            data=data,
+            accounts=accounts,
+        )
+
+    def _validate(self, instructions, keys, allowed=None, input_mint=None, output_mint=None, amount=1000):
+        allowed = set(allowed or keys)
+        return self.executor._validate_transaction_instructions(
+            instructions=instructions,
+            keys=keys,
+            owner=self.owner,
+            input_mint=input_mint or self.input_mint,
+            output_mint=output_mint or self.output_mint,
+            amount_raw=amount,
+            allowed_programs=allowed,
+        )
+
+    def test_transaction_without_swap_instruction_is_rejected(self):
+        data = bytes([2]) + (500_000).to_bytes(4, "little")
+        with self.assertRaisesRegex(TransactionBuildFailed, "no allowlisted swap route"):
+            self._validate(
+                [self._ix(0, data)],
+                [ "ComputeBudget111111111111111111111111111111" ],
+                allowed={"ComputeBudget111111111111111111111111111111"},
+            )
+
+    def test_priority_fee_above_one_millions_lamports_is_rejected(self):
+        compute_budget = "ComputeBudget111111111111111111111111111111"
+        cu_limit = self._ix(0, bytes([2]) + (1_400_000).to_bytes(4, "little"))
+        cu_price = self._ix(0, bytes([3]) + (1_000_000).to_bytes(8, "little"))
+        route = self._ix(1, b"\x01")
+        with self.assertRaisesRegex(TransactionBuildFailed, "priority fee exceeds"):
+            self._validate(
+                [cu_limit, cu_price, route],
+                [compute_budget, "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"],
+                allowed={compute_budget, "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"},
+            )
+
+    def test_reasonable_priority_fee_and_allowlisted_route_are_accepted(self):
+        compute_budget = "ComputeBudget111111111111111111111111111111"
+        cu_limit = self._ix(0, bytes([2]) + (1_000_000).to_bytes(4, "little"))
+        cu_price = self._ix(0, bytes([3]) + (100_000).to_bytes(8, "little"))
+        route = self._ix(1, b"\x01")
+        self._validate(
+            [cu_limit, cu_price, route],
+            [compute_budget, "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"],
+            allowed={compute_budget, "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"},
+        )
+
+    def test_bounded_sol_input_rejects_transfer_above_exact_buy_amount(self):
+        from native_pump import SYSTEM_PROGRAM_ID
+        owner = self.owner
+        wsol_ata = self.executor._expected_wsol_ata(owner)
+        amount = 50_000
+        transfer_data = (2).to_bytes(4, "little") + (amount + 1).to_bytes(8, "little")
+        transfer = self._ix(2, transfer_data, accounts=bytes([0, 1]))
+        with self.assertRaisesRegex(TransactionBuildFailed, "unexpected SOL transfer"):
+            self._validate(
+                [transfer],
+                [owner, wsol_ata, SYSTEM_PROGRAM_ID],
+                allowed={SYSTEM_PROGRAM_ID},
+                input_mint=WSOL_MINT,
+                output_mint=self.input_mint,
+                amount=amount,
+            )
+
+
 class AddressLookupResolutionTests(unittest.TestCase):
     def test_v0_lookup_table_writable_and_readonly_keys_are_resolved(self):
         writable = Pubkey.from_string(WSOL_MINT)
