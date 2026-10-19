@@ -250,6 +250,157 @@ class JupiterUltraExecutor:
                     target.append(addresses[index])
         return static_keys + writable_keys + readonly_keys
 
+    def _validate_transaction_instructions(
+        self,
+        *,
+        instructions: list,
+        keys: list[str],
+        owner: str,
+        input_mint: str,
+        output_mint: str,
+        amount_raw: int,
+        allowed_programs: set[str],
+    ) -> None:
+        """Enforce explicit top-level programs, bounded priority fee and owner-only ATA creation."""
+        wsol_ata = self._expected_wsol_ata(owner)
+        saw_system_input = False
+        system_input_lamports = 0
+        compute_unit_limit = 1_400_000
+        compute_unit_price_micro_lamports = 0
+        saw_compute_limit = False
+        saw_compute_price = False
+        ata_creations = 0
+        owner_key = Pubkey.from_string(owner)
+        associated_program = Pubkey.from_string(ASSOCIATED_TOKEN_PROGRAM_ID)
+
+        for instruction in instructions:
+            program_index = int(instruction.program_id_index)
+            if program_index >= len(keys):
+                raise TransactionBuildFailed(
+                    "Jupiter transaction has an unresolved program address; refusing to sign"
+                )
+            program_id = str(keys[program_index])
+            accounts = list(bytes(instruction.accounts))
+            data = bytes(instruction.data)
+            if program_id not in allowed_programs:
+                raise TransactionBuildFailed(
+                    f"Jupiter transaction contains unrecognized program {program_id}; no signature made"
+                )
+
+            if program_id == COMPUTE_BUDGET_ID:
+                if len(data) != 5:
+                    if len(data) == 9 and data[0] == 3:
+                        if saw_compute_price:
+                            raise TransactionBuildFailed("Jupiter transaction repeats compute-unit price instructions")
+                        compute_unit_price_micro_lamports = int.from_bytes(data[1:9], "little")
+                        saw_compute_price = True
+                        continue
+                    raise TransactionBuildFailed("Jupiter transaction has an unsupported compute-budget instruction")
+                tag = data[0]
+                value = int.from_bytes(data[1:5], "little")
+                if tag == 1:  # RequestHeapFrame
+                    if not 32_768 <= value <= 262_144:
+                        raise TransactionBuildFailed("Jupiter transaction requests an invalid heap-frame size")
+                elif tag == 2:  # SetComputeUnitLimit
+                    if saw_compute_limit:
+                        raise TransactionBuildFailed("Jupiter transaction repeats compute-unit limit instructions")
+                    if not 1 <= value <= 1_400_000:
+                        raise TransactionBuildFailed("Jupiter transaction compute-unit limit exceeds the hard cap")
+                    compute_unit_limit = value
+                    saw_compute_limit = True
+                elif tag == 4:  # SetLoadedAccountsDataSizeLimit
+                    if not 1 <= value <= 64_000_000:
+                        raise TransactionBuildFailed("Jupiter transaction loaded-account data size is invalid")
+                else:
+                    raise TransactionBuildFailed("Jupiter transaction has an unknown compute-budget instruction")
+            elif program_id == SYSTEM_PROGRAM_ID:
+                if len(data) != 12 or int.from_bytes(data[:4], "little") != 2 or len(accounts) < 2:
+                    raise TransactionBuildFailed(
+                        "Jupiter transaction contains a non-transfer System Program instruction"
+                    )
+                src_idx, dst_idx = accounts[0], accounts[1]
+                if src_idx >= len(keys) or dst_idx >= len(keys):
+                    raise TransactionBuildFailed("System transfer uses unresolved account keys")
+                src, dst = str(keys[src_idx]), str(keys[dst_idx])
+                lamports = int.from_bytes(data[4:12], "little")
+                if (
+                    input_mint != WSOL_MINT
+                    or src != owner
+                    or dst != wsol_ata
+                    or lamports <= 0
+                    or lamports > amount_raw
+                ):
+                    raise TransactionBuildFailed(
+                        "Jupiter transaction attempts an unexpected SOL transfer; no signature made"
+                    )
+                system_input_lamports += lamports
+                saw_system_input = True
+            elif program_id in {TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID}:
+                # Top-level token instructions are restricted to SyncNative and
+                # CloseAccount for the wallet's WSOL ATA.
+                if not data or data[0] not in {9, 17}:
+                    raise TransactionBuildFailed(
+                        "Jupiter transaction contains an unexpected top-level token instruction"
+                    )
+                if not accounts or accounts[0] >= len(keys) or str(keys[accounts[0]]) != wsol_ata:
+                    raise TransactionBuildFailed(
+                        "Jupiter transaction token instruction is not scoped to the wallet's WSOL ATA"
+                    )
+                if data[0] == 9:
+                    if len(accounts) < 2 or accounts[1] >= len(keys) or str(keys[accounts[1]]) != owner:
+                        raise TransactionBuildFailed(
+                            "WSOL account close would not return lamports to the bot wallet"
+                        )
+            elif program_id == ASSOCIATED_TOKEN_PROGRAM_ID:
+                # Only create the bot wallet's ATA for one of the two swap mints.
+                # ATA rent comes from the wallet; other owners or unexpected mints
+                # are out of scope for a $0.50 trending swap.
+                if data not in {b"", b"\\x01"} or len(accounts) < 6:
+                    raise TransactionBuildFailed("Jupiter transaction contains an unsupported associated-token instruction")
+                if any(index >= len(keys) for index in accounts[:6]):
+                    raise TransactionBuildFailed("Associated-token instruction references unresolved account keys")
+                payer = str(keys[accounts[0]])
+                ata = str(keys[accounts[1]])
+                ata_owner = str(keys[accounts[2]])
+                mint = str(keys[accounts[3]])
+                system_program = str(keys[accounts[4]])
+                token_program = str(keys[accounts[5]])
+                if (
+                    payer != owner
+                    or ata_owner != owner
+                    or system_program != SYSTEM_PROGRAM_ID
+                    or token_program not in {TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID}
+                    or mint not in {input_mint, output_mint}
+                ):
+                    raise TransactionBuildFailed("Associated-token instruction is not limited to the bot's swap accounts")
+                mint_key = Pubkey.from_string(mint)
+                token_program_key = Pubkey.from_string(token_program)
+                expected_ata, _ = Pubkey.find_program_address(
+                    [bytes(owner_key), bytes(token_program_key), bytes(mint_key)],
+                    associated_program,
+                )
+                if ata != str(expected_ata):
+                    raise TransactionBuildFailed("Associated-token instruction targets a non-canonical wallet ATA")
+                ata_creations += 1
+                if ata_creations > 2:
+                    raise TransactionBuildFailed("Jupiter route would create more than two token accounts; rent risk exceeds policy")
+
+        # Jupiter's route may omit threshold fields in its V2 JSON response, but the
+        # signed transaction must still contain an on-chain spend cap.
+        if input_mint == WSOL_MINT and (
+            not saw_system_input or system_input_lamports != amount_raw
+        ):
+            raise TransactionBuildFailed(
+                "Jupiter buy transaction does not transfer exactly the bounded SOL input"
+            )
+        estimated_priority_fee = (
+            compute_unit_price_micro_lamports * compute_unit_limit + 999_999
+        ) // 1_000_000
+        if estimated_priority_fee > 1_000_000:
+            raise TransactionBuildFailed(
+                "Jupiter compute-budget priority fee exceeds the 0.001 SOL hard cap"
+            )
+
     def _validate_and_sign(
         self,
         transaction_b64: str,
@@ -286,75 +437,18 @@ class JupiterUltraExecutor:
             raise TransactionBuildFailed("Configured keypair does not match the bot wallet")
 
         allowed_programs = CORE_PROGRAMS | allowed_dex_programs
-        wsol_ata = self._expected_wsol_ata(owner)
-        saw_system_input = False
-        system_input_lamports = 0
         instructions = list(getattr(message, "instructions", []) or [])
         if not instructions:
             raise TransactionBuildFailed("Jupiter transaction has no instructions")
-
-        for instruction in instructions:
-            program_index = int(instruction.program_id_index)
-            if program_index >= len(keys):
-                raise TransactionBuildFailed(
-                    "Jupiter transaction has an unresolved program address; refusing to sign"
-                )
-            program_id = str(keys[program_index])
-            accounts = list(bytes(instruction.accounts))
-            data = bytes(instruction.data)
-            if program_id not in allowed_programs:
-                raise TransactionBuildFailed(
-                    f"Jupiter transaction contains unrecognized program {program_id}; no signature made"
-                )
-
-            if program_id == SYSTEM_PROGRAM_ID:
-                if len(data) != 12 or int.from_bytes(data[:4], "little") != 2 or len(accounts) < 2:
-                    raise TransactionBuildFailed(
-                        "Jupiter transaction contains a non-transfer System Program instruction"
-                    )
-                src_idx, dst_idx = accounts[0], accounts[1]
-                if src_idx >= len(keys) or dst_idx >= len(keys):
-                    raise TransactionBuildFailed("System transfer uses unresolved account keys")
-                src, dst = str(keys[src_idx]), str(keys[dst_idx])
-                lamports = int.from_bytes(data[4:12], "little")
-                if (
-                    input_mint != WSOL_MINT
-                    or src != owner
-                    or dst != wsol_ata
-                    or lamports <= 0
-                    or lamports > amount_raw
-                ):
-                    raise TransactionBuildFailed(
-                        "Jupiter transaction attempts an unexpected SOL transfer; no signature made"
-                    )
-                system_input_lamports += lamports
-                saw_system_input = True
-            elif program_id in {TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID}:
-                # Top-level token instructions are restricted to SyncNative and
-                # CloseAccount for the wallet's WSOL ATA. DEX swaps themselves are
-                # invoked through an allowlisted route program.
-                if not data or data[0] not in {9, 17}:
-                    raise TransactionBuildFailed(
-                        "Jupiter transaction contains an unexpected top-level token instruction"
-                    )
-                if not accounts or accounts[0] >= len(keys) or str(keys[accounts[0]]) != wsol_ata:
-                    raise TransactionBuildFailed(
-                        "Jupiter transaction token instruction is not scoped to the wallet's WSOL ATA"
-                    )
-                if data[0] == 9:
-                    if len(accounts) < 2 or accounts[1] >= len(keys) or str(keys[accounts[1]]) != owner:
-                        raise TransactionBuildFailed(
-                            "WSOL account close would not return lamports to the bot wallet"
-                        )
-
-        if input_mint == WSOL_MINT and (
-            not saw_system_input or system_input_lamports != amount_raw
-        ):
-            # Trending buys must spend only the exact requested SOL input. Refuse
-            # transactions that wrap existing WSOL or fund a different amount.
-            raise TransactionBuildFailed(
-                "Jupiter buy transaction does not transfer exactly the bounded SOL input"
-            )
+        self._validate_transaction_instructions(
+            instructions=instructions,
+            keys=keys,
+            owner=owner,
+            input_mint=input_mint,
+            output_mint=output_mint,
+            amount_raw=amount_raw,
+            allowed_programs=allowed_programs,
+        )
 
         try:
             signed = VersionedTransaction(message, [keypair])
