@@ -197,9 +197,10 @@ def evaluate_rugcheck_report(report: Any) -> tuple[str, list[str]]:
 class TrendingTokenScanner:
     """Paced background scanner. Trending results are research-only, never live orders."""
 
-    def __init__(self, settings, rpc, timeout: int = 8):
+    def __init__(self, settings, rpc, timeout: int = 8, store=None):
         self.settings = settings
         self.rpc = rpc
+        self.store = store
         self.enabled = bool(getattr(settings, "trending_discovery_enabled", False))
         self.poll_seconds = max(60, min(900, int(getattr(settings, "trending_discovery_poll_seconds", 60))))
         self.max_candidates = max(1, min(20, int(getattr(settings, "trending_discovery_max_candidates", 8))))
@@ -412,6 +413,30 @@ class TrendingTokenScanner:
             item.update({"status": "REVIEW", "decision": "; ".join(risk_flags) or "Risk report incomplete; manual review required"})
         return item
 
+    def set_live_status(self, mint: str, status: str, reason: str) -> None:
+        """Persist one-shot live-attempt state so restarts cannot replay a buy."""
+        normalized = " ".join(str(reason or "").split())[:500]
+        if self.store is not None:
+            self.store.set_state(f"trending_live_status:{mint}", str(status))
+            self.store.set_state(f"trending_live_reason:{mint}", normalized)
+            self.store.set_state(f"trending_live_status_at:{mint}", str(time.time()))
+        with self._lock:
+            if mint in self._candidates:
+                self._candidates[mint]["live_entry_status"] = str(status)
+                self._candidates[mint]["live_entry_reason"] = normalized
+                self._candidates[mint]["live_entry_status_updated_at"] = time.time()
+
+    def _stored_live_status(self, mint: str) -> tuple[str, str, float]:
+        if self.store is None:
+            return "", "", 0.0
+        status = self.store.get_state(f"trending_live_status:{mint}", "")
+        reason = self.store.get_state(f"trending_live_reason:{mint}", "")
+        try:
+            updated_at = float(self.store.get_state(f"trending_live_status_at:{mint}", "0") or 0)
+        except (TypeError, ValueError):
+            updated_at = 0.0
+        return status, reason, updated_at
+
     def scan_once(self) -> None:
         # Request token resources explicitly; without include=base_token,quote_token
         # GeckoTerminal can omit name/symbol attributes and leave every row unnamed.
@@ -447,6 +472,11 @@ class TrendingTokenScanner:
             self._rejected_count = sum(c.get("status") in {"REJECTED", "FILTERED"} for c in checked)
             self._scan_count += 1
             for item in checked:
+                live_status, live_reason, live_updated_at = self._stored_live_status(item["mint"])
+                if live_status:
+                    item["live_entry_status"] = live_status
+                    item["live_entry_reason"] = live_reason
+                    item["live_entry_status_updated_at"] = live_updated_at
                 self._candidates[item["mint"]] = item
             cutoff = time.time() - 6 * 3600
             self._candidates = {m: c for m, c in self._candidates.items() if _num(c.get("updated_at")) >= cutoff}
@@ -467,5 +497,9 @@ class TrendingTokenScanner:
                 "pool_count": self._pool_count, "checked_count": self._checked_count,
                 "screened_count": self._screened_count, "rejected_count": self._rejected_count,
                 "scan_count": self._scan_count, "candidates": candidates,
+                "live_enabled": bool(getattr(self.settings, "trending_discovery_live_enabled", False)),
+                "live_entry_cap_usd": min(0.50, float(getattr(self.settings, "trending_discovery_max_entry_usd", 0.50))),
+                "min_score": int(getattr(self.settings, "trending_min_score", 75)),
+                "max_price_impact_pct": float(getattr(self.settings, "trending_max_price_impact_pct", 5.0)),
                 "source": "GeckoTerminal + DEX Screener + RugCheck + direct mint RPC",
             }
