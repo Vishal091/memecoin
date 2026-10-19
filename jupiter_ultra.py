@@ -31,9 +31,11 @@ from solders.pubkey import Pubkey as SoldersPubkey
 
 logger = logging.getLogger("jupiter_ultra")
 
-ULTRA_BASE = "https://api.jup.ag/ultra/v1"
+JUPITER_SWAP_V2_BASE = "https://api.jup.ag/swap/v2"
 PROGRAM_LABELS_URL = "https://api.jup.ag/swap/v1/program-id-to-label"
 WSOL_MINT = "So11111111111111111111111111111111111111112"
+ADDRESS_LOOKUP_TABLE_PROGRAM_ID = "AddressLookupTab1e1111111111111111111111111"
+JUPITER_AGGREGATOR_PROGRAM_ID = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
 CORE_PROGRAMS = {
     SYSTEM_PROGRAM_ID,
     COMPUTE_BUDGET_ID,
@@ -42,6 +44,7 @@ CORE_PROGRAMS = {
     ASSOCIATED_TOKEN_PROGRAM_ID,
     "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
     "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo",
+    JUPITER_AGGREGATOR_PROGRAM_ID,
 }
 
 
@@ -143,13 +146,18 @@ class JupiterUltraExecutor:
         try:
             in_amount = int(order.get("inAmount") or 0)
             out_amount = int(order.get("outAmount") or 0)
-            threshold = int(order.get("otherAmountThreshold") or 0)
+            threshold_raw = order.get("otherAmountThreshold")
+            threshold = int(threshold_raw) if threshold_raw not in (None, "") else None
         except (TypeError, ValueError, OverflowError) as exc:
             raise TransactionBuildFailed("Jupiter returned malformed order amounts") from exc
         if in_amount != amount_raw or in_amount <= 0:
             raise TransactionBuildFailed("Jupiter input amount differs from the requested hard cap")
-        if out_amount <= 0 or threshold <= 0 or threshold > out_amount:
-            raise TransactionBuildFailed("Jupiter order has no valid positive minimum output")
+        if out_amount <= 0:
+            raise TransactionBuildFailed("Jupiter order has no valid positive output amount")
+        # Swap V2's Order & Execute response need not expose otherAmountThreshold;
+        # the route's RTSE-protected transaction enforces its on-chain minimum.
+        if threshold is not None and (threshold <= 0 or threshold > out_amount):
+            raise TransactionBuildFailed("Jupiter order returned an invalid minimum output")
         if not order.get("transaction") or not order.get("requestId"):
             raise TransactionBuildFailed("Jupiter order omitted the transaction or request ID")
 
@@ -191,6 +199,53 @@ class JupiterUltraExecutor:
             raise TransactionBuildFailed("Output token decimals are invalid")
         return out_amount
 
+    def _resolved_account_keys(self, message) -> list[str]:
+        """Resolve v0 address lookup tables so all route programs can be inspected."""
+        static_keys = [str(key) for key in list(getattr(message, "account_keys", []) or [])]
+        lookups = list(getattr(message, "address_table_lookups", []) or [])
+        if not lookups:
+            return static_keys
+
+        writable_keys: list[str] = []
+        readonly_keys: list[str] = []
+        for lookup in lookups:
+            table_key = str(getattr(lookup, "account_key", ""))
+            if not table_key:
+                raise TransactionBuildFailed("Transaction lookup table has no address")
+            result = self.rpc.call(
+                "getAccountInfo",
+                [table_key, {"encoding": "base64", "commitment": "confirmed"}],
+            ) or {}
+            account = result.get("value") or {}
+            if str(account.get("owner") or "") != ADDRESS_LOOKUP_TABLE_PROGRAM_ID:
+                raise TransactionBuildFailed("Transaction references an account that is not an address lookup table")
+            raw_data = account.get("data")
+            if not isinstance(raw_data, list) or not raw_data:
+                raise TransactionBuildFailed("Address lookup table data is unavailable")
+            try:
+                table_data = base64.b64decode(raw_data[0], validate=True)
+            except Exception as exc:
+                raise TransactionBuildFailed("Address lookup table returned invalid base64") from exc
+            # AddressLookupTableState has a fixed 56-byte metadata prefix followed
+            # by packed 32-byte public keys.
+            if len(table_data) < 56 or (len(table_data) - 56) % 32:
+                raise TransactionBuildFailed("Address lookup table has a malformed byte layout")
+            addresses = [
+                str(Pubkey.from_bytes(table_data[offset:offset + 32]))
+                for offset in range(56, len(table_data), 32)
+            ]
+            for attribute, target in (
+                ("writable_indexes", writable_keys),
+                ("readonly_indexes", readonly_keys),
+            ):
+                indexes = list(getattr(lookup, attribute, []) or [])
+                for index in indexes:
+                    index = int(index)
+                    if index < 0 or index >= len(addresses):
+                        raise TransactionBuildFailed("Address lookup table index is out of range")
+                    target.append(addresses[index])
+        return static_keys + writable_keys + readonly_keys
+
     def _validate_and_sign(
         self,
         transaction_b64: str,
@@ -210,10 +265,18 @@ class JupiterUltraExecutor:
         message = unsigned.message
         header = getattr(message, "header", None)
         required_signers = int(getattr(header, "num_required_signatures", 0) or 0)
-        keys = list(getattr(message, "account_keys", []) or [])
+        try:
+            keys = self._resolved_account_keys(message)
+        except TransactionBuildFailed:
+            raise
+        except Exception as exc:
+            raise TransactionBuildFailed(
+                f"Could not resolve transaction account lookup tables ({type(exc).__name__})"
+            ) from exc
         if required_signers != 1 or not keys or str(keys[0]) != owner:
             raise TransactionBuildFailed(
-                "Jupiter transaction must require exactly one signer: the configured bot wallet"
+                "Jupiter route must require only the configured bot wallet signer; "
+                "RFQ/extra-signer transactions are not supported by this executor"
             )
         if str(keypair.pubkey()) != owner:
             raise TransactionBuildFailed("Configured keypair does not match the bot wallet")
@@ -331,12 +394,15 @@ class JupiterUltraExecutor:
             raise TransactionBuildFailed("Only trending live sells may output wrapped SOL")
 
         order = self._get_json(
-            f"{ULTRA_BASE}/order",
+            f"{JUPITER_SWAP_V2_BASE}/order",
             params={
                 "inputMint": input_mint,
                 "outputMint": output_mint,
                 "amount": str(int(amount_raw)),
                 "taker": owner,
+                # RFQ routes may require a second market-maker signature which
+                # this one-keypair executor deliberately does not support.
+                "excludeRouters": "jupiterz",
             },
         )
         if expected_output_value_usd is None and action == "buy" and expected_price_usd is not None:
@@ -346,6 +412,10 @@ class JupiterUltraExecutor:
                 quoted_out = 0
             if quoted_out > 0 and output_decimals >= 0:
                 expected_output_value_usd = (quoted_out / (10 ** output_decimals)) * float(expected_price_usd)
+        if str(order.get("router") or "").strip().lower() == "jupiterz":
+            raise TransactionBuildFailed(
+                "Jupiter selected an RFQ route requiring an extra signer; no transaction submitted"
+            )
         out_amount = self._validate_order_fields(
             order,
             input_mint=input_mint,
@@ -386,7 +456,7 @@ class JupiterUltraExecutor:
 
         try:
             response = self.session.post(
-                f"{ULTRA_BASE}/execute",
+                f"{JUPITER_SWAP_V2_BASE}/execute",
                 json={
                     "signedTransaction": base64.b64encode(bytes(signed)).decode("ascii"),
                     "requestId": str(order["requestId"]),
