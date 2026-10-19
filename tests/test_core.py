@@ -10,7 +10,9 @@ from pumpfun_bot import (
     PumpFunBot,
     loss_exit_hold_remaining_seconds,
     native_build_retry_delay_seconds,
+    verified_curve_fallback_allowed,
 )
+from trending_scanner import live_candidate_retry_allowed
 from native_pump import (
     NativePumpExecutor,
     TransactionBuildFailed,
@@ -1162,6 +1164,58 @@ class MarketTests(unittest.TestCase):
         ok, reason = m.is_entry_eligible({"liquidity_usd": 100, "pair_age_seconds": 999})
         self.assertFalse(ok)
         self.assertIn("Liquidity", reason)
+
+
+class VerifiedCurveFallbackTests(unittest.TestCase):
+    def test_only_fresh_security_verified_pump_discovery_can_use_curve_fallback(self):
+        signal = {
+            "source": "token_discovery",
+            "fresh_security_verified": True,
+            "curve_state_verified": True,
+        }
+        self.assertTrue(verified_curve_fallback_allowed(
+            signal, strategy="token_discovery", venue="pump",
+            curve_liquidity_usd=6690, minimum_liquidity_usd=5000,
+        ))
+
+    def test_curve_fallback_does_not_bypass_missing_security_or_liquidity(self):
+        valid = {
+            "source": "token_discovery",
+            "fresh_security_verified": True,
+            "curve_state_verified": True,
+        }
+        self.assertFalse(verified_curve_fallback_allowed(
+            valid, strategy="leader_copy", venue="pump",
+            curve_liquidity_usd=6690, minimum_liquidity_usd=5000,
+        ))
+        self.assertFalse(verified_curve_fallback_allowed(
+            {**valid, "fresh_security_verified": False},
+            strategy="token_discovery", venue="pump",
+            curve_liquidity_usd=6690, minimum_liquidity_usd=5000,
+        ))
+        self.assertFalse(verified_curve_fallback_allowed(
+            valid, strategy="token_discovery", venue="pump",
+            curve_liquidity_usd=4999, minimum_liquidity_usd=5000,
+        ))
+        self.assertFalse(verified_curve_fallback_allowed(
+            valid, strategy="token_discovery", venue="pump-amm",
+            curve_liquidity_usd=6690, minimum_liquidity_usd=5000,
+        ))
+
+
+class TrendingLiveRetryPolicyTests(unittest.TestCase):
+    def test_retryable_terminal_status_waits_for_five_minute_cooldown(self):
+        now = 10_000.0
+        self.assertFalse(live_candidate_retry_allowed("blocked", now - 299, now=now))
+        self.assertTrue(live_candidate_retry_allowed("blocked", now - 300, now=now))
+        self.assertTrue(live_candidate_retry_allowed("failed", now - 600, now=now))
+        self.assertTrue(live_candidate_retry_allowed("", 0, now=now))
+
+    def test_unknown_or_submitted_outcomes_are_never_auto_replayed(self):
+        now = 10_000.0
+        for status in ("queued", "submitting", "uncertain", "opened", "closed", "unknown"):
+            with self.subTest(status=status):
+                self.assertFalse(live_candidate_retry_allowed(status, now - 3600, now=now))
 
 
 class StorageTests(unittest.TestCase):
