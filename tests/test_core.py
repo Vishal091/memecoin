@@ -1218,6 +1218,86 @@ class TrendingLiveRetryPolicyTests(unittest.TestCase):
                 self.assertFalse(live_candidate_retry_allowed(status, now - 3600, now=now))
 
 
+class TrendingScannerRequeueIntegrationTests(unittest.TestCase):
+    class FakeStore:
+        def __init__(self, state=None):
+            self.state = dict(state or {})
+
+        def get_state(self, key, default=""):
+            return self.state.get(key, default)
+
+        def set_state(self, key, value):
+            self.state[str(key)] = str(value)
+
+        def list_positions(self):
+            return []
+
+        def list_state_prefix(self, prefix, limit=10000):
+            return [(key, value) for key, value in self.state.items()
+                    if key.startswith(prefix)][:limit]
+
+    def _scanner(self, previous_status, age_seconds=600):
+        import time
+        from trending_scanner import TrendingTokenScanner
+
+        now = time.time()
+        mint = "test-trending-mint"
+        store = self.FakeStore({
+            f"trending_live_status:{mint}": previous_status,
+            f"trending_live_reason:{mint}": "previous attempt",
+            f"trending_live_status_at:{mint}": str(now - age_seconds),
+        })
+        settings = SimpleNamespace(
+            mode="live",
+            trending_discovery_enabled=False,
+            trending_discovery_live_enabled=False,
+            trending_discovery_poll_seconds=60,
+            trending_discovery_max_candidates=8,
+            trending_min_liquidity_usd=15000,
+            trending_min_volume_1h_usd=10000,
+            trending_min_score=75,
+            trending_max_price_impact_pct=5.0,
+        )
+        queued = []
+        scanner = TrendingTokenScanner(
+            settings, object(), timeout=5, store=store, on_screened=queued.append
+        )
+        scanner.enabled = True
+        scanner.live_enabled = True
+        scanner._get_json = lambda *args, **kwargs: {}
+        scanner._dexscreener_enrich = lambda rows: None
+        scanner._evaluate = lambda row: {
+            **row, "status": "SCREENED", "momentum_score": 90,
+            "updated_at": time.time(),
+        }
+        return scanner, queued, mint
+
+    def test_old_blocked_candidate_is_rechecked_and_queued(self):
+        from unittest.mock import patch
+        scanner, queued, mint = self._scanner("blocked")
+        candidate = {
+            "mint": mint, "liquidity_usd": 20000, "volume_1h_usd": 15000,
+            "momentum_score": 90, "updated_at": 1,
+        }
+        with patch("trending_scanner.parse_gecko_trending", return_value=[candidate]):
+            scanner.scan_once()
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["mint"], mint)
+        self.assertEqual(scanner.store.get_state(f"trending_live_status:{mint}"), "queued")
+
+    def test_uncertain_candidate_is_never_queued_again(self):
+        from unittest.mock import patch
+        scanner, queued, mint = self._scanner("uncertain")
+        candidate = {
+            "mint": mint, "liquidity_usd": 20000, "volume_1h_usd": 15000,
+            "momentum_score": 90, "updated_at": 1,
+        }
+        with patch("trending_scanner.parse_gecko_trending", return_value=[candidate]):
+            scanner.scan_once()
+        self.assertEqual(queued, [])
+        self.assertEqual(scanner.store.get_state(f"trending_live_status:{mint}"), "uncertain")
+
+
 class StorageTests(unittest.TestCase):
     def test_position_and_daily_pause_persist(self):
         with tempfile.TemporaryDirectory() as temp:
