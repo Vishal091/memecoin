@@ -561,6 +561,13 @@ class TrendingTokenScanner:
                 })
                 item.setdefault("risk_flags", []).append("Risk check exception; fail closed")
                 checked.append(item)
+        queue_for_live: list[dict] = []
+        live_active = (
+            self.on_screened is not None
+            and str(getattr(self.settings, "mode", "paper")).lower() == "live"
+            and self.enabled
+            and bool(getattr(self.settings, "trending_discovery_live_enabled", False))
+        )
         with self._lock:
             self._last_scan_at = time.time()
             self._last_error = ""
@@ -575,10 +582,29 @@ class TrendingTokenScanner:
                     item["live_entry_reason"] = live_reason
                     item["live_entry_status_updated_at"] = live_updated_at
                 self._candidates[item["mint"]] = item
+                if (
+                    live_active
+                    and item.get("status") == "SCREENED"
+                    and int(item.get("momentum_score") or 0) >= int(getattr(self.settings, "trending_min_score", 75))
+                    and not live_status
+                ):
+                    self.set_live_status(
+                        item["mint"], "queued",
+                        "Passed first-pass screens; checking fresh pool, on-chain and RugCheck data",
+                    )
+                    queue_for_live.append(dict(item))
             cutoff = time.time() - 6 * 3600
             self._candidates = {m: c for m, c in self._candidates.items() if _num(c.get("updated_at")) >= cutoff}
-        logger.info("Trending scan complete: pools=%d checked=%d screened=%d rejected/filtered=%d",
-                    len(raw), len(checked), self._screened_count, self._rejected_count)
+        for candidate in queue_for_live:
+            try:
+                self.on_screened(candidate)
+            except Exception as exc:
+                self.set_live_status(
+                    str(candidate.get("mint") or ""), "failed",
+                    f"Could not enqueue candidate ({type(exc).__name__})",
+                )
+        logger.info("Trending scan complete: pools=%d checked=%d screened=%d queued=%d rejected/filtered=%d",
+                    len(raw), len(checked), self._screened_count, len(queue_for_live), self._rejected_count)
 
     def dashboard_snapshot(self) -> dict:
         with self._lock:
@@ -587,14 +613,19 @@ class TrendingTokenScanner:
                 key=lambda c: (_num(c.get("momentum_score")), _num(c.get("liquidity_usd"))),
                 reverse=True,
             )[:30]
+            live_active = (
+                str(getattr(self.settings, "mode", "paper")).lower() == "live"
+                and self.enabled
+                and bool(getattr(self.settings, "trending_discovery_live_enabled", False))
+            )
             return {
-                "enabled": self.enabled, "analysis_only": True, "last_scan_at": self._last_scan_at,
+                "enabled": self.enabled, "analysis_only": not live_active, "last_scan_at": self._last_scan_at,
                 "last_error": self._last_error, "poll_seconds": self.poll_seconds,
                 "min_liquidity_usd": self.min_liquidity_usd, "min_volume_1h_usd": self.min_volume_1h_usd,
                 "pool_count": self._pool_count, "checked_count": self._checked_count,
                 "screened_count": self._screened_count, "rejected_count": self._rejected_count,
                 "scan_count": self._scan_count, "candidates": candidates,
-                "live_enabled": bool(getattr(self.settings, "trending_discovery_live_enabled", False)),
+                "live_enabled": live_active,
                 "live_entry_cap_usd": min(0.50, float(getattr(self.settings, "trending_discovery_max_entry_usd", 0.50))),
                 "min_score": int(getattr(self.settings, "trending_min_score", 75)),
                 "max_price_impact_pct": float(getattr(self.settings, "trending_max_price_impact_pct", 5.0)),
