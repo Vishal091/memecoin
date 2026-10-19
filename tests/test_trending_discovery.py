@@ -163,6 +163,32 @@ class RugCheckDecisionTests(unittest.TestCase):
         self.assertTrue(flags)
 
 
+class TrendingScannerSafetyTests(unittest.TestCase):
+    def test_missing_token_2022_extension_list_stays_review(self):
+        from trending_scanner import TrendingTokenScanner
+        from native_pump import TOKEN_2022_PROGRAM_ID
+
+        mint = "TokenMint33333333333333333333333333333333"
+
+        class FakeRPC:
+            def call(self, method, params):
+                return {"value": {
+                    "owner": TOKEN_2022_PROGRAM_ID,
+                    "data": {"parsed": {"info": {
+                        "decimals": 6,
+                        "supply": "1000",
+                        "mintAuthority": None,
+                        "freezeAuthority": None,
+                    }}},
+                }}
+
+        scanner = object.__new__(TrendingTokenScanner)
+        scanner.rpc = FakeRPC()
+        status, flags = scanner._check_mint(mint)
+        self.assertEqual(status, "REVIEW")
+        self.assertIn("extension list is missing", " ".join(flags))
+
+
 class TrendingScannerConfigTests(unittest.TestCase):
     def test_scanner_is_opt_in_and_thresholds_cannot_be_lowered(self):
         env = {
