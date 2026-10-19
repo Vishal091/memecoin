@@ -81,17 +81,18 @@ class LossStreakCircuitBreakerTests(unittest.TestCase):
         bot.s = SimpleNamespace(max_consecutive_losses=3)
         return bot
 
-    def test_three_losing_exits_warn_but_do_not_pause_new_entries(self):
+    def test_three_losing_exits_pause_new_entries_for_utc_day(self):
         bot = self._bot()
         with self.assertLogs("pumpfun", level="WARNING") as logs:
             bot._record_realized_exit_risk(-0.10)
             bot._record_realized_exit_risk(-0.05)
             bot._record_realized_exit_risk(-0.02)
 
+        today = datetime.now(timezone.utc).date().isoformat()
         self.assertEqual(bot.store.get_state("consecutive_losing_exits"), "3")
-        self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), "")
-        self.assertIn("recording warning only", "\n".join(logs.output))
-        self.assertEqual(bot._copy_block_reason(), "")
+        self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), today)
+        self.assertIn("pausing new entries", "\n".join(logs.output))
+        self.assertIn("paused until the next UTC day", bot._copy_block_reason())
 
     def test_positive_realized_exit_resets_the_loss_streak(self):
         bot = self._bot()
@@ -101,7 +102,7 @@ class LossStreakCircuitBreakerTests(unittest.TestCase):
         self.assertEqual(bot.store.get_state("consecutive_losing_exits"), "0")
         self.assertEqual(bot.store.get_state("consecutive_loss_pause_day"), "")
 
-    def test_profitable_exit_resets_loss_streak_without_any_pause(self):
+    def test_profitable_exit_resets_loss_streak_and_pause(self):
         bot = self._bot()
         bot._record_realized_exit_risk(-0.10)
         bot._record_realized_exit_risk(-0.05)
@@ -706,6 +707,69 @@ class NativeBuildFailureHandlingTests(unittest.TestCase):
             60,
         )
 
+
+
+class EntryDrawdownCircuitBreakerTests(unittest.TestCase):
+    class FakeStore:
+        def __init__(self, state):
+            self.state = dict(state)
+        def get_state(self, key, default=""):
+            return self.state.get(key, default)
+        def set_state(self, key, value):
+            self.state[str(key)] = str(value)
+        def daily_entries(self):
+            return 0
+        def list_positions(self):
+            return []
+
+    def _bot(self, *, equity=10.0, initial=10.0, day_start=10.0):
+        bot = object.__new__(PumpFunBot)
+        bot.store = self.FakeStore({
+            "initial_equity": str(initial),
+            "day_start_equity": str(day_start),
+            "consecutive_losing_exits": "0",
+        })
+        bot.s = SimpleNamespace(
+            starting_paper_cash_usd=10.0,
+            max_entries_per_day=3,
+            max_open_positions=1,
+            max_entry_usd=0.50,
+            max_total_exposure_usd=1.0,
+            token_discovery_max_entry_usd=0.50,
+            trending_discovery_max_entry_usd=0.50,
+            daily_loss_limit_usd=0.50,
+            total_loss_limit_usd=1.00,
+            mode="paper",
+            paper_swap_cost_usd=0.02,
+        )
+        bot._current_positions_value = lambda: 0.0
+        bot.store.set_state("paper_cash", "10")
+        return bot
+
+    def test_daily_loss_limit_blocks_leader_and_discovery_entries(self):
+        bot = self._bot(equity=9.50)
+        for strategy in ("leader_copy", "token_discovery", "trending_discovery"):
+            allowed, reason = bot._can_enter(9.50, strategy=strategy)
+            self.assertFalse(allowed)
+            self.assertIn("Daily-loss limit", reason)
+
+    def test_total_loss_limit_blocks_entries_even_when_daily_loss_is_small(self):
+        bot = self._bot(equity=8.99, day_start=9.40)
+        allowed, reason = bot._can_enter(8.99, strategy="trending_discovery")
+        self.assertFalse(allowed)
+        self.assertIn("Total-loss limit", reason)
+
+    def test_entries_are_allowed_below_both_loss_limits(self):
+        bot = self._bot(equity=9.70, initial=10.0, day_start=9.80)
+        allowed, reason = bot._can_enter(9.70, strategy="trending_discovery")
+        self.assertTrue(allowed, reason)
+
+    def test_invalid_loss_baseline_fails_closed(self):
+        bot = self._bot(equity=10.0)
+        bot.store.set_state("initial_equity", "not-a-number")
+        allowed, reason = bot._can_enter(10.0, strategy="trending_discovery")
+        self.assertFalse(allowed)
+        self.assertIn("Risk baseline is invalid", reason)
 
 
 class CopySafetyGateTests(unittest.TestCase):
