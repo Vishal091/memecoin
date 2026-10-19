@@ -134,14 +134,14 @@ class PumpFunSettings:
             min_liquidity_usd=max(5000.0, _float("MIN_LIQUIDITY_USD", 5000.0)),
             min_pair_age_seconds=max(90, _int("MIN_PAIR_AGE_SECONDS", 90)),
             slippage_bps=_int("SLIPPAGE_BPS", 300),
-            max_marked_loss_pct=_float("MAX_MARKED_LOSS_PCT", 0.25),
-            # Extreme price collapses can bypass the grace period; keep the threshold between 40% and 90%.
+            max_marked_loss_pct=_float("MAX_MARKED_LOSS_PCT", 0.18),
+            # Leader-follow loss exits can bypass their grace period after an extreme price collapse; keep the threshold between 40% and 90%.
             emergency_loss_bypass_pct=max(0.40, min(0.90, _float("EMERGENCY_LOSS_BYPASS_PCT", 0.50))),
-            # Loss exits are held for at least two minutes; local configuration may only increase this.
+            # The two-minute grace applies to loss-making leader-follow exits; algorithmic stops are immediate.
             min_hold_before_loss_exit_seconds=max(120, _int("MIN_HOLD_BEFORE_LOSS_EXIT_SECONDS", 120)),
-            trailing_stop_pct=_float("TRAILING_STOP_PCT", 0.20),
-            take_profit_1_pct=_float("TAKE_PROFIT_1_PCT", 0.30),
-            take_profit_2_pct=_float("TAKE_PROFIT_2_PCT", 0.60),
+            trailing_stop_pct=_float("TRAILING_STOP_PCT", 0.12),
+            take_profit_1_pct=_float("TAKE_PROFIT_1_PCT", 0.20),
+            take_profit_2_pct=_float("TAKE_PROFIT_2_PCT", 0.45),
             take_profit_1_sell_fraction=_float("TAKE_PROFIT_1_SELL_FRACTION", 0.40),
             take_profit_2_sell_fraction=_float("TAKE_PROFIT_2_SELL_FRACTION", 0.30),
             poll_seconds=max(2, _int("POLL_SECONDS", 4)),
@@ -154,7 +154,7 @@ class PumpFunSettings:
             token_discovery_live_enabled=os.getenv("TOKEN_DISCOVERY_LIVE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
             # Hard ceiling: configuration can reduce this but never raise it above $0.50.
             token_discovery_max_entry_usd=min(0.50, _float("TOKEN_DISCOVERY_MAX_ENTRY_USD", 0.50)),
-            token_discovery_max_watched_tokens=max(1, min(10, _int("TOKEN_DISCOVERY_MAX_WATCHED_TOKENS", 5))),
+            token_discovery_max_watched_tokens=max(1, min(10, _int("TOKEN_DISCOVERY_MAX_WATCHED_TOKENS", 8))),
             # Observe flow for at least five minutes even if an older local .env says 180 seconds.
             token_discovery_watch_seconds=max(300, min(600, _int("TOKEN_DISCOVERY_WATCH_SECONDS", 300))),
             token_discovery_max_launches_per_minute=max(1, min(60, _int("TOKEN_DISCOVERY_MAX_LAUNCHES_PER_MINUTE", 30))),
@@ -174,7 +174,7 @@ class PumpFunSettings:
             trending_discovery_live_enabled=os.getenv("TRENDING_DISCOVERY_LIVE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
             trending_discovery_max_entry_usd=min(0.50, _float("TRENDING_DISCOVERY_MAX_ENTRY_USD", 0.50)),
             trending_discovery_poll_seconds=max(60, min(900, _int("TRENDING_DISCOVERY_POLL_SECONDS", 60))),
-            trending_discovery_max_candidates=max(1, min(20, _int("TRENDING_DISCOVERY_MAX_CANDIDATES", 8))),
+            trending_discovery_max_candidates=max(1, min(20, _int("TRENDING_DISCOVERY_MAX_CANDIDATES", 20))),
             trending_min_liquidity_usd=max(15000.0, _float("TRENDING_MIN_LIQUIDITY_USD", 15000.0)),
             trending_min_volume_1h_usd=max(10000.0, _float("TRENDING_MIN_VOLUME_1H_USD", 10000.0)),
             trending_min_score=max(75, min(100, _int("TRENDING_MIN_SCORE", 75))),
