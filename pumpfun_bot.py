@@ -229,34 +229,43 @@ class PumpFunBot:
             logger.error("Operational warning (automatic global halts disabled): %s", incoming[:500])
 
     def _loss_streak_pause_reason(self) -> str:
-        """Clear legacy loss-pause state; loss streaks never block new entries."""
-        if self.store.get_state("consecutive_loss_pause_day", ""):
+        """Persist a same-UTC-day entry pause after the configured consecutive-loss threshold."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        pause_day = str(self.store.get_state("consecutive_loss_pause_day", "") or "")
+        if pause_day and pause_day != today:
             self.store.set_state("consecutive_loss_pause_day", "")
             self.store.set_state("consecutive_losing_exits", "0")
+            self.store.set_state("consecutive_loss_warning_day", "")
+            pause_day = ""
+        if pause_day == today:
+            return f"Consecutive losing-exit limit reached; new entries paused until the next UTC day ({today})"
         return ""
 
     def _record_realized_exit_risk(self, realized_pnl: float) -> None:
-        """Track losing exits for diagnostics without pausing the bot."""
+        """Track losing exits and pause new entries for the UTC day at the threshold."""
         try:
             streak = int(self.store.get_state("consecutive_losing_exits", "0") or 0)
         except (TypeError, ValueError):
             streak = 0
-        streak = streak + 1 if float(realized_pnl) <= 0 else 0
+        streak = streak + 1 if float(realized_pnl) < 0 else 0
         self.store.set_state("consecutive_losing_exits", str(streak))
-        self.store.set_state("consecutive_loss_pause_day", "")
         threshold = max(2, int(getattr(self.s, "max_consecutive_losses", 3)))
         today = datetime.now(timezone.utc).date().isoformat()
-        if streak >= threshold and self.store.get_state("consecutive_loss_warning_day", "") != today:
-            self.store.set_state("consecutive_loss_warning_day", today)
-            logger.warning(
-                "Consecutive losing exits reached %d (threshold %d); recording warning only, "
-                "automatic entry pauses are disabled",
-                streak, threshold,
-            )
+        if streak >= threshold:
+            self.store.set_state("consecutive_loss_pause_day", today)
+            if self.store.get_state("consecutive_loss_warning_day", "") != today:
+                self.store.set_state("consecutive_loss_warning_day", today)
+                logger.warning(
+                    "Consecutive losing exits reached %d (threshold %d); pausing new entries until the next UTC day",
+                    streak, threshold,
+                )
+        elif streak == 0:
+            self.store.set_state("consecutive_loss_pause_day", "")
+            self.store.set_state("consecutive_loss_warning_day", "")
 
     def _copy_block_reason(self) -> str:
-        """Legacy global halt flags are diagnostics only; they do not block entries."""
-        return ""
+        """Report the persisted loss-streak circuit breaker to the dashboard and feed logic."""
+        return self._loss_streak_pause_reason()
 
     def _refresh_feed_subscriptions(self) -> None:
         held_leaders = {
@@ -944,26 +953,27 @@ class PumpFunBot:
         logger.warning("Recorded live starting equity baseline %.4f USD", value)
 
     def _refresh_risk_state(self, equity: float):
-        """Report configured loss thresholds without globally halting entries or forcing liquidation."""
+        """Refresh drawdown baselines and warn when an entry circuit breaker is active."""
         self.store.reset_day_if_needed(equity)
         initial = float(self.store.get_state("initial_equity", str(self.s.starting_paper_cash_usd)))
-        total_loss = initial - equity
+        total_loss = max(0.0, initial - equity)
         today = datetime.now(timezone.utc).date().isoformat()
         if total_loss >= self.s.total_loss_limit_usd:
             if self.store.get_state("total_loss_warning_day", "") != today:
                 self.store.set_state("total_loss_warning_day", today)
                 logger.warning(
-                    "Configured total-loss threshold reached (drawdown %.2f USD); "
-                    "automatic global halts and forced liquidation are disabled",
+                    "Configured total-loss limit reached (drawdown %.2f USD); new entries are blocked. "
+                    "Existing positions remain managed; no automatic mass liquidation is performed.",
                     total_loss,
                 )
-        daily_loss = float(self.store.get_state("day_start_equity", str(equity))) - equity
+        daily_start = float(self.store.get_state("day_start_equity", str(equity)))
+        daily_loss = max(0.0, daily_start - equity)
         if daily_loss >= self.s.daily_loss_limit_usd:
             if self.store.get_state("daily_loss_warning_day", "") != today:
                 self.store.set_state("daily_loss_warning_day", today)
                 logger.warning(
-                    "Configured daily-loss threshold reached (%.2f USD); "
-                    "recording warning only, automatic entry pauses are disabled",
+                    "Configured daily-loss limit reached (drawdown %.2f USD); new entries are blocked "
+                    "until the next UTC day. Existing positions remain managed.",
                     daily_loss,
                 )
 
@@ -979,6 +989,26 @@ class PumpFunBot:
             return False, "Open position cap reached"
         if equity <= 0:
             return False, "Equity is zero or less"
+        loss_streak_reason = self._loss_streak_pause_reason()
+        if loss_streak_reason:
+            return False, loss_streak_reason
+        try:
+            initial_equity = float(self.store.get_state("initial_equity", str(self.s.starting_paper_cash_usd)))
+            day_start_equity = float(self.store.get_state("day_start_equity", str(equity)))
+        except (TypeError, ValueError, OverflowError):
+            return False, "Risk baseline is invalid; refusing new entry until reconciled"
+        total_drawdown = max(0.0, initial_equity - equity)
+        if total_drawdown >= float(self.s.total_loss_limit_usd):
+            return False, (
+                f"Total-loss limit reached: drawdown ${total_drawdown:.2f} >= "
+                f"${float(self.s.total_loss_limit_usd):.2f}; new entries blocked"
+            )
+        daily_drawdown = max(0.0, day_start_equity - equity)
+        if daily_drawdown >= float(self.s.daily_loss_limit_usd):
+            return False, (
+                f"Daily-loss limit reached: drawdown ${daily_drawdown:.2f} >= "
+                f"${float(self.s.daily_loss_limit_usd):.2f}; new entries blocked until next UTC day"
+            )
         exposure = self._current_positions_value()
         room = self.s.max_total_exposure_usd - exposure
         configured_cap = self.s.max_entry_usd if entry_cap_usd is None else float(entry_cap_usd)
