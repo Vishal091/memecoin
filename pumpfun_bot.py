@@ -1142,7 +1142,7 @@ class PumpFunBot:
             or signal.get("source") != "trending_discovery"
         ):
             self.trending_scanner.set_live_status(
-                mint, "blocked", "Trending live opt-in or freshly verified security checks are missing"
+                mint, "blocked", "Trending live opt-in is off or candidate source is invalid"
             )
             return
         try:
