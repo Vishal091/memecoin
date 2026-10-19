@@ -328,9 +328,47 @@ class TrendingScannerConfigTests(unittest.TestCase):
             "TOKEN_DISCOVERY_ENABLED": "false",
             "TOKEN_DISCOVERY_LIVE_ENABLED": "false",
             "TRENDING_DISCOVERY_ENABLED": "false",
+            "TRENDING_DISCOVERY_LIVE_ENABLED": "false",
         }, clear=False):
             settings = PumpFunSettings.load()
         self.assertFalse(settings.trending_discovery_enabled)
+        self.assertFalse(settings.trending_discovery_live_enabled)
+
+    def test_trending_live_cap_cannot_exceed_fifty_cents(self):
+        with patch.dict(os.environ, {
+            "BOT_MODE": "paper",
+            "TOKEN_DISCOVERY_ENABLED": "false",
+            "TOKEN_DISCOVERY_LIVE_ENABLED": "false",
+            "TRENDING_DISCOVERY_ENABLED": "true",
+            "TRENDING_DISCOVERY_LIVE_ENABLED": "false",
+            "TRENDING_DISCOVERY_MAX_ENTRY_USD": "20",
+        }, clear=False):
+            settings = PumpFunSettings.load()
+        self.assertEqual(settings.trending_discovery_max_entry_usd, 0.50)
+
+    def test_trending_live_mode_requires_jupiter_api_key(self):
+        with patch.dict(os.environ, {
+            "BOT_MODE": "live",
+            "TOKEN_DISCOVERY_ENABLED": "false",
+            "TOKEN_DISCOVERY_LIVE_ENABLED": "false",
+            "TRENDING_DISCOVERY_ENABLED": "true",
+            "TRENDING_DISCOVERY_LIVE_ENABLED": "true",
+            "JUPITER_API_KEY": "",
+        }, clear=False):
+            with self.assertRaisesRegex(ValueError, "JUPITER_API_KEY"):
+                PumpFunSettings.load()
+
+    def test_trending_live_mode_requires_scanner_opt_in(self):
+        with patch.dict(os.environ, {
+            "BOT_MODE": "live",
+            "TOKEN_DISCOVERY_ENABLED": "false",
+            "TOKEN_DISCOVERY_LIVE_ENABLED": "false",
+            "TRENDING_DISCOVERY_ENABLED": "false",
+            "TRENDING_DISCOVERY_LIVE_ENABLED": "true",
+            "JUPITER_API_KEY": "test-api-key",
+        }, clear=False):
+            with self.assertRaisesRegex(ValueError, "requires TRENDING_DISCOVERY_ENABLED=true"):
+                PumpFunSettings.load()
 
 
 if __name__ == "__main__":
