@@ -141,10 +141,14 @@ class JupiterUltraExecutor:
         if order.get("errorCode") not in (None, "", 0, "0"):
             detail = str(order.get("errorMessage") or order.get("errorCode") or "route unavailable")
             raise TransactionBuildFailed(f"Jupiter order rejected: {detail[:250]}")
-        if order.get("inputMint") != input_mint or order.get("outputMint") != output_mint:
+        # Swap API V2's order schema may omit echoed input/output fields; when
+        # present, they must match exactly. The transaction's own SOL funding
+        # instruction is separately inspected before signing.
+        if order.get("inputMint") not in (None, input_mint) or order.get("outputMint") not in (None, output_mint):
             raise TransactionBuildFailed("Jupiter order mint mismatch; refusing to sign")
         try:
-            in_amount = int(order.get("inAmount") or 0)
+            input_echo = order.get("inAmount")
+            in_amount = int(input_echo) if input_echo not in (None, "") else amount_raw
             out_amount = int(order.get("outAmount") or 0)
             threshold_raw = order.get("otherAmountThreshold")
             threshold = int(threshold_raw) if threshold_raw not in (None, "") else None
