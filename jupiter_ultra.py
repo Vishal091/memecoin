@@ -270,6 +270,7 @@ class JupiterUltraExecutor:
         saw_compute_limit = False
         saw_compute_price = False
         ata_creations = 0
+        saw_swap_route = False
         owner_key = Pubkey.from_string(owner)
         associated_program = Pubkey.from_string(ASSOCIATED_TOKEN_PROGRAM_ID)
 
@@ -286,6 +287,8 @@ class JupiterUltraExecutor:
                 raise TransactionBuildFailed(
                     f"Jupiter transaction contains unrecognized program {program_id}; no signature made"
                 )
+            if program_id == JUPITER_AGGREGATOR_PROGRAM_ID or program_id in allowed_dex_programs:
+                saw_swap_route = True
 
             if program_id == COMPUTE_BUDGET_ID:
                 if len(data) != 5:
@@ -385,6 +388,10 @@ class JupiterUltraExecutor:
                 if ata_creations > 2:
                     raise TransactionBuildFailed("Jupiter route would create more than two token accounts; rent risk exceeds policy")
 
+        if not saw_swap_route:
+            raise TransactionBuildFailed(
+                "Jupiter transaction contains no allowlisted swap route instruction"
+            )
         # Jupiter's route may omit threshold fields in its V2 JSON response, but the
         # signed transaction must still contain an on-chain spend cap.
         if input_mint == WSOL_MINT and (
