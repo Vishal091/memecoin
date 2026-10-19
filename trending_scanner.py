@@ -249,7 +249,10 @@ def evaluate_rugcheck_report(report: Any, pool_address: str = "") -> tuple[str, 
     lp = metrics.get("lp_locked_pct")
 
     if level in BAD_LEVELS:
-        return "REJECTED", [f"RugCheck risk level: {level}"]
+        flags = [f"RugCheck risk level: {level}"]
+        if score is not None and score > 35:
+            flags.append(f"RugCheck normalized risk score {score:.1f} exceeds 35")
+        return "REJECTED", flags
     if score is not None and score > 35:
         return "REJECTED", [f"RugCheck normalized risk score {score:.1f} exceeds 35"]
 
