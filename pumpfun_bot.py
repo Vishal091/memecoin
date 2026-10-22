@@ -3068,6 +3068,7 @@ class PumpFunBot:
         self._refresh_risk_state(self.equity())
         next_rpc_poll = 0.0
         next_position_check = 0.0
+        next_equity_refresh = 0.0
 
         try:
             while True:
@@ -3125,20 +3126,16 @@ class PumpFunBot:
                             "experiment-expiry liquidation are disabled."
                         )
 
-                    if now >= next_position_check:
-                        # Usually unreachable because exits are checked at the top of
-                        # the cycle; this is a catch-up guard after unusually slow work.
-                        self.manage_positions()
-                        next_position_check = time.time() + 1.5
-
-                    equity = self.equity()
-                    self.last_equity_usd = equity
-                    self._refresh_risk_state(equity)
-                    self._refresh_feed_subscriptions()
-                    self._publish_dashboard_state(equity)
-                    open_count = len(self.store.list_positions())
-                    logger.info("Heartbeat equity=%.4f positions=%d auto_copy=%s active_wallets=%d",
-                                equity, open_count, self.auto_copy_enabled, len(self.active_wallets))
+                    if now >= next_equity_refresh:
+                        equity = self.equity()
+                        self.last_equity_usd = equity
+                        self._refresh_risk_state(equity)
+                        self._refresh_feed_subscriptions()
+                        self._publish_dashboard_state(equity)
+                        open_count = len(self.store.list_positions())
+                        logger.info("Heartbeat equity=%.4f positions=%d auto_copy=%s active_wallets=%d",
+                                    equity, open_count, self.auto_copy_enabled, len(self.active_wallets))
+                        next_equity_refresh = time.time() + 1.5
 
                     self._publish_dashboard_state(self.last_equity_usd)
                 except KeyboardInterrupt:
