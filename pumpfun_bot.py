@@ -197,6 +197,9 @@ class PumpFunBot:
         self.market_price_cache_at = {}
         self.curve_price_cache = {}
         self.curve_price_cache_at = {}
+        self.curve_mark_checked_at = {}
+        self.curve_completed_cache = set()
+        self.curve_unpriced_cache = set()
         self._market_cap_supply_retry_at = {}
         self.state_lock = threading.RLock()
         self.commands = queue.Queue()
@@ -1054,36 +1057,58 @@ class PumpFunBot:
             preferred_pool = self.store.get_state(f"pool:{mint}", "pump")
         except Exception:
             preferred_pool = "pump"
+        curve_price = 0.0
         if preferred_pool == "pump":
             curve_price = float(getattr(self, "curve_price_cache", {}).get(mint, 0) or 0)
             curve_age = now - float(getattr(self, "curve_price_cache_at", {}).get(mint, 0) or 0)
             if curve_price > 0 and 0 <= curve_age <= 1.0:
                 return curve_price
-            try:
-                curve = fetch_pump_curve(
-                    self.rpc, mint,
-                    timeout=min(2.0, float(getattr(self.s, "request_timeout_seconds", 2))),
-                )
-                if (
-                    curve is not None
-                    and not curve.complete
-                    and (not curve.quote_mint or curve.quote_mint == WSOL_MINT)
-                ):
-                    position = self.store.get_position(mint) or {}
-                    decimals = int(position.get("decimals") or 6)
-                    sol_price = self.market.sol_price_usd(
-                        timeout=min(2.0, float(getattr(self.s, "request_timeout_seconds", 2)))
+
+            # Do not hammer RPC on every dashboard refresh if a curve is migrated,
+            # unsupported, or temporarily unavailable. Completed curves stay completed.
+            completed_cache = getattr(self, "curve_completed_cache", set())
+            unpriced_cache = getattr(self, "curve_unpriced_cache", set())
+            checked_cache = getattr(self, "curve_mark_checked_at", {})
+            last_checked = float(checked_cache.get(mint, 0) or 0)
+            should_read_curve = (
+                mint not in completed_cache
+                and mint not in unpriced_cache
+                and now - last_checked >= 1.0
+            )
+            if should_read_curve:
+                if not hasattr(self, "curve_mark_checked_at"):
+                    self.curve_mark_checked_at = {}
+                self.curve_mark_checked_at[mint] = now
+                try:
+                    curve = fetch_pump_curve(
+                        self.rpc, mint,
+                        timeout=min(2.0, float(getattr(self.s, "request_timeout_seconds", 2))),
                     )
-                    candidate = float(curve.price_usd(sol_price, decimals=decimals) or 0)
-                    if candidate > 0:
-                        if not hasattr(self, "curve_price_cache"):
-                            self.curve_price_cache = {}
-                            self.curve_price_cache_at = {}
-                        self.curve_price_cache[mint] = candidate
-                        self.curve_price_cache_at[mint] = time.time()
-                        return candidate
-            except Exception as exc:
-                logger.debug("On-chain Pump curve mark unavailable for %s (%s)", mint[:8], type(exc).__name__)
+                    if curve is not None and curve.complete:
+                        completed_cache.add(mint)
+                        curve_price = 0.0
+                        getattr(self, "curve_price_cache", {}).pop(mint, None)
+                        getattr(self, "curve_price_cache_at", {}).pop(mint, None)
+                    elif curve is not None and curve.quote_mint and curve.quote_mint != WSOL_MINT:
+                        # This bot's curve pricing only supports SOL-quoted curves.
+                        unpriced_cache.add(mint)
+                        curve_price = 0.0
+                    elif curve is not None:
+                        position = self.store.get_position(mint) or {}
+                        decimals = int(position.get("decimals") or 6)
+                        sol_price = self.market.sol_price_usd(
+                            timeout=min(2.0, float(getattr(self.s, "request_timeout_seconds", 2)))
+                        )
+                        candidate = float(curve.price_usd(sol_price, decimals=decimals) or 0)
+                        if candidate > 0:
+                            if not hasattr(self, "curve_price_cache"):
+                                self.curve_price_cache = {}
+                                self.curve_price_cache_at = {}
+                            self.curve_price_cache[mint] = candidate
+                            self.curve_price_cache_at[mint] = time.time()
+                            return candidate
+                except Exception as exc:
+                    logger.debug("On-chain Pump curve mark unavailable for %s (%s)", mint[:8], type(exc).__name__)
 
         market_price = float(self.market_price_cache.get(mint, 0) or 0)
         market_age = now - float(self.market_price_cache_at.get(mint, 0) or 0)
@@ -1105,6 +1130,8 @@ class PumpFunBot:
         # When a coin is not indexed by a market-data provider, this falls back to
         # the last observed trade or prior mark; the dashboard still exposes the mark
         # as an estimate rather than a guaranteed executable exit price.
+        if curve_price > 0:
+            return curve_price
         if feed_price > 0:
             return feed_price
         if market_price > 0:
