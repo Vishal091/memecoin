@@ -527,24 +527,22 @@ class LossExitGracePeriodTests(unittest.TestCase):
         self.assertEqual(bot.store.trades[0]["action"], "SELL")
         self.assertEqual(bot.market.token_market_calls, 0)
 
-    def test_losing_leader_sell_preserves_its_partial_amount_while_deferred(self):
+    def test_losing_leader_sell_exits_immediately_and_preserves_partial_quantity(self):
         bot = self._bot_with_fresh_position()
         reason = "followed wallet leader-wallet partial/full sell on pump"
-        self.assertFalse(
+        self.assertTrue(
             bot.sell(
                 "test-mint", 300, reason,
                 "leader-wallet", "leader-sell-signature",
             )
         )
-        self.assertEqual(bot.store.get_state("exit_pending:test-mint"), reason)
-        self.assertEqual(bot.store.get_state("exit_pending_amount_raw:test-mint"), "300")
-        self.assertEqual(
-            bot.store.get_state("exit_pending_source_wallet:test-mint"), "leader-wallet"
-        )
-        self.assertEqual(
-            bot.store.get_state("exit_pending_source_signature:test-mint"),
-            "leader-sell-signature",
-        )
+        position = bot.store.get_position("test-mint")
+        self.assertEqual(position["amount_raw"], "700")
+        self.assertAlmostEqual(position["invested_usd"], 0.7)
+        self.assertEqual(bot.store.trades[-1]["action"], "SELL")
+        self.assertEqual(bot.store.trades[-1]["amount_raw"], "300")
+        self.assertEqual(bot.store.get_state("exit_pending:test-mint", ""), "")
+        self.assertEqual(bot.market.token_market_calls, 0)
 
 
 class DashboardErrorRefreshTests(unittest.TestCase):
@@ -626,6 +624,36 @@ class NativeBuildFailureHandlingTests(unittest.TestCase):
         self.assertGreater(float(bot.store.get_state("native_build_retry_after:test-mint")), 0)
         self.assertIn("Associated token account not found", bot.store.get_state("native_build_failure:test-mint"))
         self.assertNotIn("manual_review_halt", bot.store.state)
+
+    def test_sell_builder_cooldown_preserves_new_leader_exit_for_retry(self):
+        position = {
+            "mint": "test-mint", "amount_raw": "1000", "decimals": 6,
+            "invested_usd": 1.0, "last_price_usd": 1.0,
+            "source_wallet": "leader-wallet", "source_signature": "leader-signature",
+        }
+        bot = object.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(mode="live", slippage_bps=100)
+        bot.store = self.FakeStore(position)
+        bot.market = self.FakeMarket()
+        bot.executor = self.FakeExecutor()
+        bot.wallet_address = "test-wallet"
+        bot.keypair = object()
+        bot.store.set_state("native_build_retry_after:test-mint", str(__import__("time").time() + 120))
+
+        result = bot.sell(
+            "test-mint", 300,
+            "followed wallet leader-wallet partial/full sell on pump",
+            "leader-wallet", "leader-sell-signature",
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(
+            bot.store.get_state("exit_pending:test-mint"),
+            "followed wallet leader-wallet partial/full sell on pump",
+        )
+        self.assertEqual(bot.store.get_state("exit_pending_amount_raw:test-mint"), "300")
+        self.assertEqual(bot.store.get_state("exit_pending_source_wallet:test-mint"), "leader-wallet")
+        self.assertEqual(bot.store.get_state("exit_pending_source_signature:test-mint"), "leader-sell-signature")
 
     def test_pending_exit_reason_does_not_accumulate_wrappers_on_retry(self):
         position = {
