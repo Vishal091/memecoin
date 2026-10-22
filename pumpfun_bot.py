@@ -1849,21 +1849,6 @@ class PumpFunBot:
             if manual_exit:
                 self.message = f"Manual exit for {mint[:8]} stopped: no tracked open position remains."
             return False
-        if self._native_build_retry_deferred(mint):
-            if manual_exit:
-                try:
-                    retry_at = float(self.store.get_state(f"native_build_retry_after:{mint}", "0") or 0)
-                except (TypeError, ValueError):
-                    retry_at = time.time()
-                remaining = max(0, int(retry_at - time.time()))
-                last_failure = str(self.store.get_state(f"native_build_failure:{mint}", "") or "")
-                detail = f" Last builder error: {last_failure[:180]}" if last_failure else ""
-                self.message = (
-                    f"Manual exit for {mint[:8]} remains pending; retry cooldown {remaining}s, "
-                    f"no transaction submitted.{detail}"
-                )
-            logger.debug("Sell builder for mint=%s is in pre-submission cooldown", mint[:8])
-            return False
         full_exit = (was_pending_exit or manual_exit or
                      reason in {"marked loss stop", "trailing stop"} or
                      reason.startswith("followed wallet ") or reason.startswith("experiment expiry") or
@@ -1887,8 +1872,24 @@ class PumpFunBot:
         if requested_raw <= 0:
             return False
         if full_exit:
-            # Preserve partial leader sells if the exit must wait for the grace period.
+            # Persist the desired amount before any cooldown or other retry guard so
+            # a leader sell cannot be consumed and forgotten before submission.
             self.store.set_state(pending_amount_key, str(requested_raw))
+        if self._native_build_retry_deferred(mint):
+            if manual_exit:
+                try:
+                    retry_at = float(self.store.get_state(f"native_build_retry_after:{mint}", "0") or 0)
+                except (TypeError, ValueError):
+                    retry_at = time.time()
+                remaining = max(0, int(retry_at - time.time()))
+                last_failure = str(self.store.get_state(f"native_build_failure:{mint}", "") or "")
+                detail = f" Last builder error: {last_failure[:180]}" if last_failure else ""
+                self.message = (
+                    f"Manual exit for {mint[:8]} remains pending; retry cooldown {remaining}s, "
+                    f"no transaction submitted.{detail}"
+                )
+            logger.debug("Sell builder for mint=%s is in pre-submission cooldown; pending exit retained", mint[:8])
+            return False
         decimals = int(position["decimals"])
         # A sell must not wait on a fresh DexScreener HTTP request. For live exits,
         # confirmed SOL proceeds determine realized P&L; this mark is only a fallback
