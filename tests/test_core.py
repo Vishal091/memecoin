@@ -338,6 +338,84 @@ class DiscoveryQueueTests(unittest.TestCase):
 
 
 
+class PumpCurveMarkPriceTests(unittest.TestCase):
+    def _bot(self):
+        bot = object.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(request_timeout_seconds=12)
+        bot.price_cache = {}
+        bot.price_cache_at = {}
+        bot.market_price_cache = {}
+        bot.market_price_cache_at = {}
+        bot.curve_price_cache = {}
+        bot.curve_price_cache_at = {}
+        bot.rpc = object()
+
+        class FakeStore:
+            def get_state(self, key, default=""):
+                return "pump" if key == "pool:test-mint" else default
+
+            def get_position(self, mint):
+                return {"mint": mint, "decimals": 6}
+
+        class FakeMarket:
+            def __init__(self):
+                self.dex_calls = 0
+                self.sol_timeouts = []
+
+            def sol_price_usd(self, timeout=None):
+                self.sol_timeouts.append(timeout)
+                return 150.0
+
+            def token_market(self, mint, timeout=None):
+                self.dex_calls += 1
+                return {"price_usd": 9.0}
+
+        bot.store = FakeStore()
+        bot.market = FakeMarket()
+        return bot
+
+    def test_unindexed_pump_position_uses_bounded_on_chain_curve_mark(self):
+        from unittest.mock import patch
+
+        bot = self._bot()
+
+        class FakeCurve:
+            complete = False
+            quote_mint = WSOL_MINT
+
+            def price_usd(self, sol_price_usd, decimals=6):
+                self.seen_sol_price = sol_price_usd
+                self.seen_decimals = decimals
+                return 0.000123
+
+        with patch("pumpfun_bot.fetch_pump_curve", return_value=FakeCurve()) as fetch:
+            mark = bot._mark_price("test-mint", 0.0002)
+
+        self.assertAlmostEqual(mark, 0.000123)
+        fetch.assert_called_once_with(bot.rpc, "test-mint", timeout=2.0)
+        self.assertEqual(bot.market.sol_timeouts, [2.0])
+        self.assertEqual(bot.market.dex_calls, 0)
+        self.assertEqual(bot.curve_price_cache["test-mint"], 0.000123)
+
+    def test_completed_curve_falls_back_to_indexed_market_quote(self):
+        from unittest.mock import patch
+
+        bot = self._bot()
+
+        class CompletedCurve:
+            complete = True
+            quote_mint = WSOL_MINT
+
+            def price_usd(self, sol_price_usd, decimals=6):
+                return None
+
+        with patch("pumpfun_bot.fetch_pump_curve", return_value=CompletedCurve()):
+            mark = bot._mark_price("test-mint", 0.0002)
+
+        self.assertAlmostEqual(mark, 9.0)
+        self.assertEqual(bot.market.dex_calls, 1)
+
+
 class LossExitGracePeriodTests(unittest.TestCase):
     def test_marked_loss_stop_bypasses_minimum_hold_immediately(self):
         now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
