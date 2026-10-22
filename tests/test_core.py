@@ -511,6 +511,10 @@ class LossExitGracePeriodTests(unittest.TestCase):
         )
         bot.store = self.FakeStore(position)
         bot.market = self.FakeMarket()
+        bot.price_cache = {}
+        bot.price_cache_at = {}
+        bot.market_price_cache = {}
+        bot.market_price_cache_at = {}
         # The sale behavior is under test; avoid exercising the unrelated feed-subscription loop.
         bot._refresh_feed_subscriptions = lambda: None
         return bot
