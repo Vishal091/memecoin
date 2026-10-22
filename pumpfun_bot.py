@@ -21,7 +21,7 @@ from solders.pubkey import Pubkey
 
 from dashboard import DashboardServer
 from leaderboard import LeaderboardError, PumpFunLeaderboard
-from market_data import MarketData
+from market_data import MarketData, WSOL_MINT
 from pumpfun_config import PumpFunSettings
 from pumpportal_feed import PumpPortalAccountFeed
 from solana_logs_feed import SolanaLogsFeed
@@ -195,6 +195,8 @@ class PumpFunBot:
         self.price_cache_at = {}
         self.market_price_cache = {}
         self.market_price_cache_at = {}
+        self.curve_price_cache = {}
+        self.curve_price_cache_at = {}
         self._market_cap_supply_retry_at = {}
         self.state_lock = threading.RLock()
         self.commands = queue.Queue()
@@ -1045,9 +1047,47 @@ class PumpFunBot:
         if feed_price > 0 and feed_age <= 10:
             return feed_price
 
+        # Pump bonding curves are directly observable on-chain before DEX indexers
+        # list the token. Prefer a canonical curve quote for those positions; otherwise
+        # the stop manager can keep using the stale entry mark until indexing catches up.
+        try:
+            preferred_pool = self.store.get_state(f"pool:{mint}", "pump")
+        except Exception:
+            preferred_pool = "pump"
+        if preferred_pool == "pump":
+            curve_price = float(getattr(self, "curve_price_cache", {}).get(mint, 0) or 0)
+            curve_age = now - float(getattr(self, "curve_price_cache_at", {}).get(mint, 0) or 0)
+            if curve_price > 0 and 0 <= curve_age <= 1.0:
+                return curve_price
+            try:
+                curve = fetch_pump_curve(
+                    self.rpc, mint,
+                    timeout=min(2.0, float(getattr(self.s, "request_timeout_seconds", 2))),
+                )
+                if (
+                    curve is not None
+                    and not curve.complete
+                    and (not curve.quote_mint or curve.quote_mint == WSOL_MINT)
+                ):
+                    position = self.store.get_position(mint) or {}
+                    decimals = int(position.get("decimals") or 6)
+                    sol_price = self.market.sol_price_usd(
+                        timeout=min(2.0, float(getattr(self.s, "request_timeout_seconds", 2)))
+                    )
+                    candidate = float(curve.price_usd(sol_price, decimals=decimals) or 0)
+                    if candidate > 0:
+                        if not hasattr(self, "curve_price_cache"):
+                            self.curve_price_cache = {}
+                            self.curve_price_cache_at = {}
+                        self.curve_price_cache[mint] = candidate
+                        self.curve_price_cache_at[mint] = time.time()
+                        return candidate
+            except Exception as exc:
+                logger.debug("On-chain Pump curve mark unavailable for %s (%s)", mint[:8], type(exc).__name__)
+
         market_price = float(self.market_price_cache.get(mint, 0) or 0)
         market_age = now - float(self.market_price_cache_at.get(mint, 0) or 0)
-        if market_price > 0 and market_age <= 3:
+        if market_price > 0 and 0 <= market_age <= 3:
             return market_price
 
         try:
