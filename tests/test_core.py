@@ -365,6 +365,20 @@ class LossExitGracePeriodTests(unittest.TestCase):
             0.0,
         )
 
+    def test_losing_leader_sell_bypasses_minimum_hold_immediately(self):
+        now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
+        position = {
+            "entry_price_usd": 1.0,
+            "opened_at": (now - timedelta(seconds=5)).isoformat(timespec="seconds"),
+        }
+        self.assertEqual(
+            loss_exit_hold_remaining_seconds(
+                position, 0.75, "followed wallet leader partial/full sell on pump",
+                120, now=now.timestamp(),
+            ),
+            0.0,
+        )
+
     def test_other_losing_exits_still_use_remaining_grace_period(self):
         now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
         position = {
@@ -373,7 +387,7 @@ class LossExitGracePeriodTests(unittest.TestCase):
         }
         self.assertEqual(
             loss_exit_hold_remaining_seconds(
-                position, 0.75, "followed wallet leader partial sell", 120,
+                position, 0.75, "strategy discretionary sell", 120,
                 now=now.timestamp()
             ),
             90.0,
@@ -467,7 +481,11 @@ class LossExitGracePeriodTests(unittest.TestCase):
             self.position = position
 
     class FakeMarket:
-        def token_market(self, mint):
+        def __init__(self):
+            self.token_market_calls = 0
+
+        def token_market(self, mint, timeout=None):
+            self.token_market_calls += 1
             return {"price_usd": 0.75}
 
     def _bot_with_fresh_position(self):
@@ -507,6 +525,7 @@ class LossExitGracePeriodTests(unittest.TestCase):
         self.assertEqual(bot.store.get_state("exit_pending_amount_raw:test-mint", ""), "")
         self.assertEqual(len(bot.store.trades), 1)
         self.assertEqual(bot.store.trades[0]["action"], "SELL")
+        self.assertEqual(bot.market.token_market_calls, 0)
 
     def test_losing_leader_sell_preserves_its_partial_amount_while_deferred(self):
         bot = self._bot_with_fresh_position()
