@@ -348,6 +348,9 @@ class PumpCurveMarkPriceTests(unittest.TestCase):
         bot.market_price_cache_at = {}
         bot.curve_price_cache = {}
         bot.curve_price_cache_at = {}
+        bot.curve_mark_checked_at = {}
+        bot.curve_completed_cache = set()
+        bot.curve_unpriced_cache = set()
         bot.rpc = object()
 
         class FakeStore:
@@ -409,11 +412,15 @@ class PumpCurveMarkPriceTests(unittest.TestCase):
             def price_usd(self, sol_price_usd, decimals=6):
                 return None
 
-        with patch("pumpfun_bot.fetch_pump_curve", return_value=CompletedCurve()):
+        with patch("pumpfun_bot.fetch_pump_curve", return_value=CompletedCurve()) as fetch:
             mark = bot._mark_price("test-mint", 0.0002)
+            second_mark = bot._mark_price("test-mint", 0.0002)
 
         self.assertAlmostEqual(mark, 9.0)
+        self.assertAlmostEqual(second_mark, 9.0)
         self.assertEqual(bot.market.dex_calls, 1)
+        self.assertEqual(fetch.call_count, 1)
+        self.assertIn("test-mint", bot.curve_completed_cache)
 
 
 class LossExitGracePeriodTests(unittest.TestCase):
