@@ -12,14 +12,15 @@ class MarketData:
         self.session = requests.Session()
         self.sol_price_cache: tuple[float,float] | None = None
 
-    def token_pairs(self, mint: str) -> list[dict]:
-        r = self.session.get(f"{self.BASE}/latest/dex/tokens/{mint}", timeout=self.timeout)
+    def token_pairs(self, mint: str, timeout: float | None = None) -> list[dict]:
+        request_timeout = self.timeout if timeout is None else max(0.1, float(timeout))
+        r = self.session.get(f"{self.BASE}/latest/dex/tokens/{mint}", timeout=request_timeout)
         if r.status_code == 404: return []
         r.raise_for_status()
         return [p for p in (r.json().get("pairs") or []) if p.get("chainId") == "solana"]
 
-    def best_pair(self, mint: str) -> dict | None:
-        pairs = self.token_pairs(mint)
+    def best_pair(self, mint: str, timeout: float | None = None) -> dict | None:
+        pairs = self.token_pairs(mint, timeout=timeout)
         if not pairs: return None
         # Dexscreener's priceUsd is the USD price of the pair's base token.
         # Prefer a pair where the queried mint is base, to avoid treating a quote-token price as this token's price.
@@ -28,8 +29,8 @@ class MarketData:
         chosen.sort(key=lambda p: float(((p.get("liquidity") or {}).get("usd")) or 0), reverse=True)
         return chosen[0]
 
-    def token_market(self, mint: str) -> dict | None:
-        pair = self.best_pair(mint)
+    def token_market(self, mint: str, timeout: float | None = None) -> dict | None:
+        pair = self.best_pair(mint, timeout=timeout)
         if not pair: return None
         try:
             price = float(pair.get("priceUsd") or 0)
