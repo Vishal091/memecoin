@@ -54,10 +54,14 @@ class MarketData:
             return False, f"Pair too new ({market['pair_age_seconds']}s)"
         return True,"market filters passed"
 
-    def sol_price_usd(self) -> float:
+    def sol_price_usd(self, timeout: float | None = None) -> float:
         now = time.time()
         if self.sol_price_cache and now-self.sol_price_cache[1] < 30: return self.sol_price_cache[0]
-        pairs = self.token_pairs(WSOL_MINT)
+        pairs = (
+            self.token_pairs(WSOL_MINT)
+            if timeout is None
+            else self.token_pairs(WSOL_MINT, timeout=timeout)
+        )
         # We need priceUsd for SOL itself, so use only pairs where wrapped SOL is the base token.
         valid=[]
         for p in pairs:
