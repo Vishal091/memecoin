@@ -60,13 +60,12 @@ def loss_exit_hold_remaining_seconds(
     """Seconds remaining in the minimum holding period for a loss-making exit."""
     entry_price = float(position.get("entry_price_usd") or 0)
     normalized_reason = str(reason or "").strip().lower()
-    # A triggered algorithmic stop must attempt an exit immediately. Deferring it
-    # for the minimum-hold grace period can turn a defined stop into a much larger
-    # loss during a fast dump. Leader-triggered sells still use the grace period
-    # unless there is a portfolio emergency or explicit human exit.
+    # Risk stops and leader-triggered sells must attempt an exit immediately.
+    # A hold grace after the followed wallet sells can leave this bot exposed
+    # while the leader is already out, amplifying divergence during fast dumps.
     if normalized_reason.startswith((
         "total loss limit", "experiment expiry", "manual exit",
-        "marked loss stop", "trailing stop",
+        "marked loss stop", "trailing stop", "followed wallet ",
     )):
         return 0.0
     if entry_price <= 0 or mark_price <= 0 or mark_price >= entry_price:
@@ -1052,7 +1051,9 @@ class PumpFunBot:
             return market_price
 
         try:
-            market = self.market.token_market(mint)
+            market = self.market.token_market(
+                mint, timeout=min(2.0, float(getattr(self.s, "request_timeout_seconds", 2)))
+            )
             candidate = float((market or {}).get("price_usd") or 0)
             if candidate > 0:
                 self.market_price_cache[mint] = candidate
@@ -1889,19 +1890,37 @@ class PumpFunBot:
             # Preserve partial leader sells if the exit must wait for the grace period.
             self.store.set_state(pending_amount_key, str(requested_raw))
         decimals = int(position["decimals"])
-        market = self.market.token_market(mint)
-        mark_price = float(market["price_usd"]) if market else float(position["last_price_usd"])
+        # A sell must not wait on a fresh DexScreener HTTP request. For live exits,
+        # confirmed SOL proceeds determine realized P&L; this mark is only a fallback
+        # for stop bookkeeping and the dashboard. Prefer a fresh trade tick, then a
+        # recent market cache, then the last persisted mark/entry price.
+        mark_now = time.time()
+        price_cache = getattr(self, "price_cache", {})
+        price_cache_at = getattr(self, "price_cache_at", {})
+        market_price_cache = getattr(self, "market_price_cache", {})
+        market_price_cache_at = getattr(self, "market_price_cache_at", {})
+        try:
+            feed_price = float(price_cache.get(mint, 0) or 0)
+            feed_age = mark_now - float(price_cache_at.get(mint, 0) or 0)
+            cached_market_price = float(market_price_cache.get(mint, 0) or 0)
+            cached_market_age = mark_now - float(market_price_cache_at.get(mint, 0) or 0)
+            stored_price = max(
+                0.0,
+                float(position.get("last_price_usd") or position.get("entry_price_usd") or 0.0),
+            )
+        except (TypeError, ValueError, OverflowError):
+            feed_price, feed_age, cached_market_price, cached_market_age = 0.0, float("inf"), 0.0, float("inf")
+            stored_price = 0.0
+        if feed_price > 0 and 0 <= feed_age <= 10:
+            mark_price = feed_price
+        elif cached_market_price > 0 and 0 <= cached_market_age <= 3:
+            mark_price = cached_market_price
+        else:
+            mark_price = stored_price
         if mark_price <= 0 and manual_exit:
-            # A manual live exit does not need a live quote to submit a sell: the
-            # confirmed SOL proceeds determine realized P&L. Use the best stored
-            # price only for bookkeeping if the market-data quote is unavailable.
-            try:
-                mark_price = max(
-                    0.0,
-                    float(position.get("last_price_usd") or position.get("entry_price_usd") or 0.0),
-                )
-            except (TypeError, ValueError):
-                mark_price = 0.0
+            # Live execution does not require a market quote; a stored entry mark is
+            # only for bookkeeping. Never invent proceeds from this fallback.
+            mark_price = max(0.0, stored_price)
         if mark_price <= 0:
             if manual_exit:
                 self.message = (
@@ -3056,6 +3075,13 @@ class PumpFunBot:
                     self._process_dashboard_commands()
                     self._consume_feed_events()
                     self._consume_solana_log_events()
+                    now = time.time()
+                    # Manage exits before discovery/scanner work can consume time.
+                    # Network-heavy tasks below must not get first priority over stops.
+                    if now >= next_position_check:
+                        self.manage_positions()
+                        next_position_check = time.time() + 1.5
+
                     self.token_discovery.tick()
                     self._process_discovery_live_entries()
                     self._process_trending_live_entries()
@@ -3100,16 +3126,19 @@ class PumpFunBot:
                         )
 
                     if now >= next_position_check:
+                        # Usually unreachable because exits are checked at the top of
+                        # the cycle; this is a catch-up guard after unusually slow work.
                         self.manage_positions()
-                        equity = self.equity()
-                        self.last_equity_usd = equity
-                        self._refresh_risk_state(equity)
-                        self._refresh_feed_subscriptions()
-                        self._publish_dashboard_state(equity)
-                        open_count = len(self.store.list_positions())
-                        logger.info("Heartbeat equity=%.4f positions=%d auto_copy=%s active_wallets=%d",
-                                    equity, open_count, self.auto_copy_enabled, len(self.active_wallets))
-                        next_position_check = now + 1.5
+                        next_position_check = time.time() + 1.5
+
+                    equity = self.equity()
+                    self.last_equity_usd = equity
+                    self._refresh_risk_state(equity)
+                    self._refresh_feed_subscriptions()
+                    self._publish_dashboard_state(equity)
+                    open_count = len(self.store.list_positions())
+                    logger.info("Heartbeat equity=%.4f positions=%d auto_copy=%s active_wallets=%d",
+                                equity, open_count, self.auto_copy_enabled, len(self.active_wallets))
 
                     self._publish_dashboard_state(self.last_equity_usd)
                 except KeyboardInterrupt:
