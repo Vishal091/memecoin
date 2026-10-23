@@ -361,6 +361,8 @@ class TrendingTokenScanner:
         self._candidates: dict[str, dict] = {}
         self._last_scan_at = 0.0
         self._last_error = ""
+        self._shadow_observation_errors = 0
+        self._last_shadow_observation_error_at = 0.0
         self._pool_count = self._checked_count = self._screened_count = self._rejected_count = self._scan_count = 0
 
     def start(self) -> None:
@@ -453,6 +455,19 @@ class TrendingTokenScanner:
                     c["symbol"] = str(chosen["symbol"]).upper()
                 c["dexscreener_pair_address"] = str(pair.get("pairAddress") or "")
                 c["dexscreener_url"] = str(pair.get("url") or "")
+                # A USD mark is only valid when the candidate mint is the pair's base
+                # token and the exact GeckoTerminal pool matched the DEX pair. A quote-side
+                # price would describe a different token, so leave it unavailable.
+                base_address = str((pair.get("baseToken") or {}).get("address") or "")
+                pair_price_usd = _num(pair.get("priceUsd"))
+                if same_pool and base_address == str(c.get("mint") or "") and pair_price_usd > 0:
+                    c["price_usd"] = pair_price_usd
+                    c["market_price_source"] = "DEX Screener priceUsd; exact pool, candidate mint is base token"
+                else:
+                    c["price_usd"] = None
+                    c["market_price_source"] = (
+                        "Unavailable: exact pool price is not denominated for the candidate mint"
+                    )
                 dex_liq = _num((pair.get("liquidity") or {}).get("usd"))
                 volume, change = pair.get("volume") or {}, pair.get("priceChange") or {}
                 c["dexscreener_liquidity_usd"] = dex_liq
@@ -536,6 +551,7 @@ class TrendingTokenScanner:
         item["updated_at"] = time.time()
         item["execution_mode"] = "analysis_only"
         item["trade_eligible"] = False
+        item["shadow_eligible"] = False
         liquidity, vol1 = _num(item.get("liquidity_usd")), _num(item.get("volume_1h_usd"))
         if liquidity < self.min_liquidity_usd:
             item.update({"status": "FILTERED", "decision": f"Liquidity ${liquidity:,.0f} below ${self.min_liquidity_usd:,.0f} minimum"})
@@ -589,6 +605,7 @@ class TrendingTokenScanner:
                 "status": "SCREENED",
                 "execution_mode": "live_opt_in" if live_active else "analysis_only",
                 "trade_eligible": bool(live_active and score_eligible),
+                "shadow_eligible": bool(score_eligible and _num(item.get("price_usd")) > 0),
                 "decision": (
                     "Passed initial market, on-chain mint and RugCheck screens; "
                     "live entry still requires fresh pre-trade checks"
@@ -783,6 +800,36 @@ class TrendingTokenScanner:
                     item.get("status") == "SCREENED"
                     and int(item.get("momentum_score") or 0) >= int(getattr(self.settings, "trending_min_score", 75))
                 )
+                record_observation = getattr(self.store, "record_shadow_observation", None)
+                # Persist scan history for screened candidates; rejected/review rows
+                # remain available in current scanner diagnostics without being sampled
+                # repeatedly into the multi-day performance dataset.
+                if callable(record_observation) and str(item.get("status") or "").upper() == "SCREENED":
+                    try:
+                        record_observation(
+                            strategy="trending_discovery",
+                            mint=str(item.get("mint") or ""),
+                            observed_at=_num(item.get("updated_at")) or time.time(),
+                            status=str(item.get("status") or "UNKNOWN"),
+                            price_usd=item.get("price_usd"),
+                            liquidity_usd=item.get("liquidity_usd"),
+                            volume_1h_usd=item.get("volume_1h_usd"),
+                            score=item.get("momentum_score"),
+                            shadow_eligible=bool(item.get("shadow_eligible", False)),
+                            market_source=str(item.get("market_price_source") or "") or
+                                "+".join(item.get("market_data_sources") or [])
+                                or "GeckoTerminal candidate data",
+                            payload=item,
+                        )
+                    except Exception as exc:
+                        self._shadow_observation_errors += 1
+                        now = time.time()
+                        if now - self._last_shadow_observation_error_at >= 60:
+                            logger.warning(
+                                "Could not persist trending shadow observation (%s)",
+                                type(exc).__name__,
+                            )
+                            self._last_shadow_observation_error_at = now
                 retry_allowed = live_candidate_retry_allowed(live_status, live_updated_at)
                 if live_active and is_trade_candidate and live_status and not retry_allowed:
                     retry_suppressed += 1
@@ -835,7 +882,9 @@ class TrendingTokenScanner:
                 "min_liquidity_usd": self.min_liquidity_usd, "min_volume_1h_usd": self.min_volume_1h_usd,
                 "pool_count": self._pool_count, "checked_count": self._checked_count,
                 "screened_count": self._screened_count, "rejected_count": self._rejected_count,
-                "scan_count": self._scan_count, "candidates": candidates,
+                "scan_count": self._scan_count,
+                "shadow_observation_errors": self._shadow_observation_errors,
+                "candidates": candidates,
                 "live_enabled": live_active,
                 "live_entry_cap_usd": min(0.50, float(getattr(self.settings, "trending_discovery_max_entry_usd", 0.50))),
                 "min_score": int(getattr(self.settings, "trending_min_score", 75)),

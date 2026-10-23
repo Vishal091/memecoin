@@ -327,6 +327,7 @@ class TrendingScannerIntegrationTests(unittest.TestCase):
             "url": "https://dexscreener.com/solana/VerifiedPair111111111111111111111111111",
             "baseToken": {"address": mint, "name": "Crosschecked Trend", "symbol": "CTREND"},
             "quoteToken": {"address": "So11111111111111111111111111111111111111112", "name": "Wrapped SOL", "symbol": "SOL"},
+            "priceUsd": "0.00001",
             "liquidity": {"usd": 5000},
             "volume": {"h1": 90000, "h24": 150000},
             "priceChange": {"h1": -50, "h24": -30},
@@ -352,6 +353,8 @@ class TrendingScannerIntegrationTests(unittest.TestCase):
         self.assertTrue(candidate["dexscreener_confirmed"])
         self.assertTrue(candidate["market_data_discrepancy"])
         self.assertTrue(candidate["same_pool_crosscheck"])
+        self.assertAlmostEqual(candidate["price_usd"], 0.00001)
+        self.assertIn("candidate mint is base token", candidate["market_price_source"])
         self.assertGreaterEqual(len(candidate["risk_flags"]), 3)
 
         different_pool = {
@@ -365,6 +368,7 @@ class TrendingScannerIntegrationTests(unittest.TestCase):
         scanner._dexscreener_enrich([different_pool])
         self.assertFalse(different_pool["dexscreener_confirmed"])
         self.assertFalse(different_pool["same_pool_crosscheck"])
+        self.assertIsNone(different_pool["price_usd"])
         self.assertIn(
             "not directly comparable",
             " ".join(different_pool["risk_flags"]),
@@ -579,6 +583,134 @@ class TrendingScannerConfigTests(unittest.TestCase):
         }, clear=False):
             with self.assertRaisesRegex(ValueError, "requires TRENDING_DISCOVERY_ENABLED=true"):
                 PumpFunSettings.load()
+
+
+
+
+class TrendingShadowPersistenceTests(unittest.TestCase):
+    def test_scan_persists_screened_candidate_and_quality_flag_without_live_execution(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from trending_scanner import TrendingTokenScanner
+
+        class RecordingStore:
+            def __init__(self):
+                self.state = {}
+                self.observations = []
+            def get_state(self, key, default=""):
+                return self.state.get(key, default)
+            def set_state(self, key, value):
+                self.state[key] = str(value)
+            def record_shadow_observation(self, **kwargs):
+                self.observations.append(kwargs)
+
+        candidate = {
+            "mint": "TrendShadowPersistMint00000000000000001",
+            "name": "Shadow fixture",
+            "symbol": "SHDW",
+            "liquidity_usd": 20000.0,
+            "volume_1h_usd": 15000.0,
+            "volume_24h_usd": 50000.0,
+            "change_5m_pct": 2.0,
+            "change_1h_pct": 5.0,
+            "change_6h_pct": 8.0,
+            "change_24h_pct": 10.0,
+            "buys_1h": 30,
+            "sells_1h": 8,
+            "market_data_sources": ["GeckoTerminal", "DEX Screener"],
+        }
+        settings = SimpleNamespace(
+            mode="paper",
+            trending_discovery_enabled=True,
+            trending_discovery_live_enabled=False,
+            trending_discovery_poll_seconds=60,
+            trending_discovery_max_candidates=10,
+            trending_min_liquidity_usd=15000.0,
+            trending_min_volume_1h_usd=10000.0,
+            trending_min_score=75,
+        )
+        store = RecordingStore()
+        scanner = TrendingTokenScanner(settings, rpc=object(), store=store)
+        scanner._get_json = lambda url, gecko=False: {"data": []}
+        scanner._dexscreener_enrich = lambda rows: None
+        scanner._evaluate = lambda row: dict(
+            row,
+            status="SCREENED",
+            price_usd=0.01,
+            market_price_source="exact pool fixture",
+            shadow_eligible=True,
+            trade_eligible=False,
+        )
+
+        with patch("trending_scanner.parse_gecko_trending", return_value=[candidate]):
+            scanner.scan_once()
+
+        self.assertEqual(len(store.observations), 1)
+        observed = store.observations[0]
+        self.assertEqual(observed["strategy"], "trending_discovery")
+        self.assertEqual(observed["mint"], candidate["mint"])
+        self.assertEqual(observed["status"], "SCREENED")
+        self.assertAlmostEqual(observed["price_usd"], 0.01)
+        self.assertTrue(observed["shadow_eligible"])
+        self.assertEqual(observed["market_source"], "exact pool fixture")
+        self.assertFalse(scanner.dashboard_snapshot()["live_enabled"])
+
+    def test_screened_candidate_with_no_valid_price_is_recorded_but_not_eligible(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from trending_scanner import TrendingTokenScanner
+
+        class RecordingStore:
+            def __init__(self):
+                self.state = {}
+                self.observations = []
+            def get_state(self, key, default=""):
+                return self.state.get(key, default)
+            def set_state(self, key, value):
+                self.state[key] = str(value)
+            def record_shadow_observation(self, **kwargs):
+                self.observations.append(kwargs)
+
+        candidate = {
+            "mint": "TrendShadowNoPriceMint000000000000001",
+            "liquidity_usd": 20000.0,
+            "volume_1h_usd": 15000.0,
+            "volume_24h_usd": 50000.0,
+            "change_5m_pct": 2.0,
+            "change_1h_pct": 5.0,
+            "change_6h_pct": 8.0,
+            "change_24h_pct": 10.0,
+            "buys_1h": 30,
+            "sells_1h": 8,
+            "market_data_sources": ["GeckoTerminal", "DEX Screener"],
+        }
+        settings = SimpleNamespace(
+            mode="paper",
+            trending_discovery_enabled=True,
+            trending_discovery_live_enabled=False,
+            trending_discovery_poll_seconds=60,
+            trending_discovery_max_candidates=10,
+            trending_min_liquidity_usd=15000.0,
+            trending_min_volume_1h_usd=10000.0,
+            trending_min_score=75,
+        )
+        store = RecordingStore()
+        scanner = TrendingTokenScanner(settings, rpc=object(), store=store)
+        scanner._get_json = lambda url, gecko=False: {"data": []}
+        scanner._dexscreener_enrich = lambda rows: None
+        scanner._evaluate = lambda row: dict(
+            row,
+            status="SCREENED",
+            price_usd=None,
+            market_price_source="no valid USD price",
+            shadow_eligible=False,
+            trade_eligible=False,
+        )
+        with patch("trending_scanner.parse_gecko_trending", return_value=[candidate]):
+            scanner.scan_once()
+        self.assertEqual(len(store.observations), 1)
+        self.assertIsNone(store.observations[0]["price_usd"])
+        self.assertFalse(store.observations[0]["shadow_eligible"])
 
 
 if __name__ == "__main__":

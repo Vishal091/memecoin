@@ -93,6 +93,26 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS idx_risk_reservations_status
                 ON risk_reservations(status, created_at);
+            CREATE TABLE IF NOT EXISTS shadow_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                observed_at REAL NOT NULL,
+                observed_minute INTEGER NOT NULL,
+                strategy TEXT NOT NULL,
+                mint TEXT NOT NULL,
+                status TEXT NOT NULL,
+                price_usd REAL,
+                liquidity_usd REAL,
+                volume_1h_usd REAL,
+                score REAL,
+                shadow_eligible INTEGER NOT NULL DEFAULT 0,
+                market_source TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(strategy, mint, observed_minute, status)
+            );
+            CREATE INDEX IF NOT EXISTS idx_shadow_observations_time
+                ON shadow_observations(observed_at, strategy);
+            CREATE INDEX IF NOT EXISTS idx_shadow_observations_candidate
+                ON shadow_observations(strategy, mint, observed_at);
             """)
             self.db.execute("INSERT OR IGNORE INTO state(key,value) VALUES('paper_cash',?)", (str(starting_cash),))
             self.db.execute("INSERT OR IGNORE INTO state(key,value) VALUES('initial_equity',?)", (str(starting_cash),))
@@ -533,6 +553,189 @@ class Store:
                 "ORDER BY created_at ASC"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def record_shadow_observation(
+        self,
+        *,
+        strategy: str,
+        mint: str,
+        observed_at: float,
+        status: str,
+        price_usd: float | None,
+        liquidity_usd: float | None = None,
+        volume_1h_usd: float | None = None,
+        score: float | None = None,
+        shadow_eligible: bool = False,
+        market_source: str = "",
+        payload: dict | None = None,
+    ) -> None:
+        """Persist read-only market observations for chronological paper/shadow evaluation.
+
+        Records are coalesced by candidate, strategy, minute and status: multiple
+        updates inside a minute update that bucket instead of growing the database
+        without bound. The payload retains source fields needed for later audit.
+        """
+        import math
+
+        strategy_value = str(strategy or "").strip()
+        mint_value = str(mint or "").strip()
+        status_value = str(status or "").strip()
+        timestamp = float(observed_at)
+        if (
+            not strategy_value
+            or not mint_value
+            or not status_value
+            or not math.isfinite(timestamp)
+            or timestamp <= 0
+        ):
+            raise ValueError("Shadow observation requires strategy, mint, status and a valid timestamp.")
+
+        def finite_or_none(value):
+            if value is None or value == "":
+                return None
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return number if math.isfinite(number) else None
+
+        source_payload = payload if isinstance(payload, dict) else {}
+        if strategy_value == "token_discovery":
+            allow = {
+                "mint", "name", "symbol", "created_at", "last_updated_at", "status", "reason",
+                "security_passed", "security_checks", "real_liquidity_usd", "price_usd",
+                "total_supply_tokens", "score", "score_components", "unique_buyers",
+                "buy_trades", "sell_trades", "buy_volume_sol", "sell_volume_sol",
+                "shadow_entry_price_usd", "shadow_entry_at", "shadow_exit_price_usd",
+                "shadow_exit_at", "current_return_pct", "max_return_pct", "min_return_pct",
+                "return_1m_pct", "return_5m_pct", "return_15m_pct", "shadow_return_pct",
+                "market_cap_usd", "market_cap_source", "shadow_mark_source", "shadow_eligible",
+                "entry_market_cap_usd", "entry_market_cap_source",
+            }
+        elif strategy_value == "trending_discovery":
+            allow = {
+                "mint", "name", "symbol", "status", "price_usd", "shadow_eligible",
+                "momentum_score", "liquidity_usd", "volume_1h_usd", "volume_24h_usd",
+                "change_5m_pct", "change_1h_pct", "change_6h_pct", "change_24h_pct",
+                "same_pool_crosscheck", "dexscreener_confirmed", "market_price_source",
+                "market_data_sources", "market_data_discrepancy", "risk_flags",
+                "onchain_status", "rugcheck_status", "updated_at", "decision",
+                "pool_address", "pool_created_at", "dexscreener_pair_address",
+            }
+        else:
+            allow = {"mint", "status", "price_usd", "shadow_eligible", "score", "reason"}
+        safe_payload = {key: source_payload[key] for key in allow if key in source_payload}
+
+        def json_safe(value):
+            import math
+            if value is None or isinstance(value, (str, bool, int)):
+                return value[:500] if isinstance(value, str) else value
+            if isinstance(value, float):
+                return value if math.isfinite(value) else None
+            if isinstance(value, list):
+                return [json_safe(item) for item in value[:20]]
+            if isinstance(value, dict):
+                return {
+                    str(key)[:80]: json_safe(item)
+                    for key, item in list(value.items())[:40]
+                }
+            return str(value)[:300]
+
+        payload_json = json.dumps(
+            json_safe(safe_payload), sort_keys=True, separators=(",", ":"),
+            default=str, allow_nan=False,
+        )
+        minute = int(timestamp // 60)
+        with self.db:
+            self.db.execute(
+                """
+                INSERT INTO shadow_observations (
+                    observed_at, observed_minute, strategy, mint, status,
+                    price_usd, liquidity_usd, volume_1h_usd, score,
+                    shadow_eligible, market_source, payload_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(strategy,mint,observed_minute,status) DO UPDATE SET
+                    observed_at=excluded.observed_at,
+                    price_usd=excluded.price_usd,
+                    liquidity_usd=excluded.liquidity_usd,
+                    volume_1h_usd=excluded.volume_1h_usd,
+                    score=excluded.score,
+                    shadow_eligible=excluded.shadow_eligible,
+                    market_source=excluded.market_source,
+                    payload_json=excluded.payload_json
+                """,
+                (
+                    timestamp, minute, strategy_value, mint_value, status_value,
+                    finite_or_none(price_usd), finite_or_none(liquidity_usd),
+                    finite_or_none(volume_1h_usd), finite_or_none(score),
+                    1 if shadow_eligible else 0, str(market_source or "")[:160],
+                    payload_json,
+                ),
+            )
+            # Bound retention so a long-running observation trial cannot grow
+            # the local database without limit. Keep up to 500k newest rows.
+            wallclock_hour = int(datetime.now(timezone.utc).timestamp() // 3600)
+            prune_key = "shadow_observations_prune_hour"
+            prune_row = self.db.execute(
+                "SELECT value FROM state WHERE key=?", (prune_key,)
+            ).fetchone()
+            if not prune_row or str(prune_row["value"]) != str(wallclock_hour):
+                total_rows = int(self.db.execute(
+                    "SELECT COUNT(*) FROM shadow_observations"
+                ).fetchone()[0])
+                excess = max(0, total_rows - 500000)
+                if excess:
+                    self.db.execute(
+                        "DELETE FROM shadow_observations WHERE id IN ("
+                        "SELECT id FROM shadow_observations ORDER BY observed_at ASC, id ASC LIMIT ?)",
+                        (excess,),
+                    )
+                self.db.execute(
+                    "INSERT INTO state(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (prune_key, str(wallclock_hour)),
+                )
+
+    def list_shadow_observations(
+        self,
+        *,
+        strategies: tuple[str, ...] | list[str] | None = None,
+        start_at: float | None = None,
+        end_at: float | None = None,
+        limit: int = 100000,
+    ) -> list[dict]:
+        """Read a bounded, chronologically ordered sample of shadow observations."""
+        clauses = []
+        params: list[Any] = []
+        if strategies:
+            chosen = tuple(str(item) for item in strategies if str(item))
+            if chosen:
+                clauses.append("strategy IN (" + ",".join("?" for _ in chosen) + ")")
+                params.extend(chosen)
+        if start_at is not None:
+            clauses.append("observed_at >= ?")
+            params.append(float(start_at))
+        if end_at is not None:
+            clauses.append("observed_at <= ?")
+            params.append(float(end_at))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        bounded_limit = max(1, min(500000, int(limit)))
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT * FROM shadow_observations" + where +
+                " ORDER BY observed_at ASC, strategy ASC, mint ASC LIMIT ?",
+                (*params, bounded_limit),
+            ).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["payload"] = json.loads(item.pop("payload_json"))
+            except (TypeError, ValueError):
+                item["payload"] = {}
+            item["shadow_eligible"] = bool(item.get("shadow_eligible"))
+            results.append(item)
+        return results
 
     def claim_once(self, key: str) -> bool:
         """Atomically add a one-time action key; returns False if it was already claimed."""
