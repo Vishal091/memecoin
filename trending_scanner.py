@@ -799,7 +799,6 @@ class TrendingTokenScanner:
                 is_trade_candidate = (
                     item.get("status") == "SCREENED"
                     and int(item.get("momentum_score") or 0) >= int(getattr(self.settings, "trending_min_score", 75))
-                    and _num(item.get("price_usd")) > 0
                 )
                 record_observation = getattr(self.store, "record_shadow_observation", None)
                 if callable(record_observation):
@@ -813,8 +812,9 @@ class TrendingTokenScanner:
                             liquidity_usd=item.get("liquidity_usd"),
                             volume_1h_usd=item.get("volume_1h_usd"),
                             score=item.get("momentum_score"),
-                            shadow_eligible=bool(item.get("shadow_eligible", False) and is_trade_candidate),
-                            market_source="+".join(item.get("market_data_sources") or [])
+                            shadow_eligible=bool(item.get("shadow_eligible", False)),
+                            market_source=str(item.get("market_price_source") or "") or
+                                "+".join(item.get("market_data_sources") or [])
                                 or "GeckoTerminal candidate data",
                             payload=item,
                         )
