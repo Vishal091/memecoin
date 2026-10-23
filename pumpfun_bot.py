@@ -1595,6 +1595,14 @@ class PumpFunBot:
             self.trending_scanner.set_live_status(mint, "blocked", "SOL input rounds to zero")
             return
 
+        reservation_id, reserve_reason = self.risk_engine.reserve_entry(
+            mint, "trending_discovery", spend,
+            exposure_usd=spend + (0.05 if self.s.mode == "live" else self.s.paper_swap_cost_usd),
+        )
+        if not reservation_id:
+            self.trending_scanner.set_live_status(mint, "blocked", "Risk reservation denied: " + reserve_reason)
+            return
+
         self.trending_scanner.set_live_status(
             mint, "submitting", f"Submitting Jupiter Ultra buy with swap input capped at ${spend:.2f}"
         )
@@ -1603,9 +1611,18 @@ class PumpFunBot:
             before_token = self.executor.token_balance_raw(self.wallet_address, mint)
             before_sol = self.rpc.sol_balance_lamports(self.wallet_address)
         except Exception as exc:
+            self.risk_engine.release_entry(
+                reservation_id, status="failed",
+                detail=f"Pre-trade balance read failed ({type(exc).__name__}).",
+            )
             self.trending_scanner.set_live_status(
                 mint, "blocked", f"Could not establish pre-trade wallet balances ({type(exc).__name__})"
             )
+            return
+        admitted, admission_reason = self.risk_engine.mark_submitting(reservation_id)
+        if not admitted:
+            self.risk_engine.release_entry(reservation_id, status="released", detail=admission_reason)
+            self.trending_scanner.set_live_status(mint, "blocked", admission_reason)
             return
         try:
             result = self.trending_executor.swap(
@@ -1627,16 +1644,32 @@ class PumpFunBot:
             )
             return
         except TransactionFailedOnChain as exc:
+            self.risk_engine.release_entry(
+                reservation_id, status="failed",
+                detail=f"Jupiter confirmed on-chain failure: {str(exc.detail)[:300]}",
+            )
             self.trending_scanner.set_live_status(
                 mint, "failed", f"Jupiter confirmed on-chain failure: {str(exc.detail)[:350]}"
             )
             logger.warning("Trending live buy failed on-chain mint=%s signature=%s", mint[:8], exc.signature)
             return
         except (TransactionBuildFailed, TransactionSimulationFailed) as exc:
+            self.risk_engine.release_entry(
+                reservation_id, status="failed",
+                detail=f"Jupiter pre-submit checks blocked the order: {str(exc)[:300]}",
+            )
             self.trending_scanner.set_live_status(
                 mint, "failed", f"Jupiter pre-submit checks blocked the order: {str(exc)[:350]}"
             )
             logger.warning("Trending live buy blocked before submission mint=%s: %s", mint[:8], exc)
+            return
+        except Exception as exc:
+            uncertain = TransactionOutcomeUncertain(
+                "signature-unavailable", "buy", mint,
+                f"Unclassified execution exception after submission boundary ({type(exc).__name__}); reconcile before retry.",
+            )
+            self._handle_uncertain_trade(uncertain, source_wallet=None, source_signature=source_signature)
+            self.trending_scanner.set_live_status(mint, "uncertain", "Unclassified execution exception; global entry gate engaged.")
             return
 
         tx_sig = str(result.get("signature") or "")
@@ -1684,15 +1717,32 @@ class PumpFunBot:
                 if total_supply_tokens > 0 else ""
             ),
         }
-        self.store.upsert_position(position)
-        self.store.set_state(f"pool:{mint}", "jupiter")
-        self.store.increment_daily_entries()
-        self.store.add_trade(
-            mode=self.s.mode, action="BUY", mint=mint, amount_raw=str(raw_out),
-            price_usd=effective_price, value_usd=cost_basis,
-            reason="trending-token Jupiter Ultra buy",
-            source_wallet=None, source_signature=source_signature,
-            tx_signature=tx_sig, strategy="trending_discovery",
+        try:
+            self.store.upsert_position(position)
+            self.store.set_state(f"pool:{mint}", "jupiter")
+            self.store.increment_daily_entries()
+            self.store.add_trade(
+                mode=self.s.mode, action="BUY", mint=mint, amount_raw=str(raw_out),
+                price_usd=effective_price, value_usd=cost_basis,
+                reason="trending-token Jupiter Ultra buy",
+                source_wallet=None, source_signature=source_signature,
+                tx_signature=tx_sig, strategy="trending_discovery",
+            )
+        except Exception as exc:
+            self._handle_uncertain_trade(
+                TransactionOutcomeUncertain(
+                    tx_sig, "buy", mint,
+                    f"Confirmed swap could not be persisted to the local ledger ({type(exc).__name__}).",
+                ),
+                source_wallet=None, source_signature=source_signature,
+            )
+            self.trending_scanner.set_live_status(
+                mint, "uncertain", "Swap confirmed but ledger persistence failed; reconcile before resuming."
+            )
+            return
+        self.risk_engine.release_entry(
+            reservation_id, status="completed",
+            detail="Swap and wallet balance deltas reconciled into the position/trade ledger.",
         )
         self.price_cache[mint] = effective_price
         self.price_cache_at[mint] = time.time()
