@@ -801,7 +801,10 @@ class TrendingTokenScanner:
                     and int(item.get("momentum_score") or 0) >= int(getattr(self.settings, "trending_min_score", 75))
                 )
                 record_observation = getattr(self.store, "record_shadow_observation", None)
-                if callable(record_observation):
+                # Persist scan history for screened candidates; rejected/review rows
+                # remain available in current scanner diagnostics without being sampled
+                # repeatedly into the multi-day performance dataset.
+                if callable(record_observation) and str(item.get("status") or "").upper() == "SCREENED":
                     try:
                         record_observation(
                             strategy="trending_discovery",
