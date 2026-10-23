@@ -40,6 +40,7 @@ from storage import Store
 from token_discovery import TokenDiscoveryShadow
 from trending_scanner import TrendingTokenScanner
 from jupiter_ultra import JupiterUltraExecutor
+from risk_engine import RiskEngine
 
 logger = logging.getLogger("pumpfun")
 
@@ -140,6 +141,8 @@ class PumpFunBot:
         if not db_path.is_absolute():
             db_path = Path(__file__).resolve().parent / db_path
         self.store = Store(db_path, self.s.starting_paper_cash_usd, mode=self.s.mode)
+        self.risk_engine = RiskEngine(self.store, self.s)
+        self.risk_engine.engage_on_startup()
         self.rpc = SolanaRPC(self.s.rpc_url, self.s.request_timeout_seconds)
         # Aggressive launchpad filters; still require a tracked market pair for price marks.
         self.market = MarketData(self.s.request_timeout_seconds, self.s.min_liquidity_usd, self.s.min_pair_age_seconds)
@@ -263,7 +266,7 @@ class PumpFunBot:
             }), default=str))
 
     def _activate_manual_review_halt(self, reason: str, *, append_reason: bool = False) -> None:
-        """Record an operational warning; automatic global entry halts are disabled."""
+        """Persist the diagnosis and engage the independent global entry gate."""
         incoming = " ".join(str(reason or "").split()).strip()
         existing = self.store.get_state("manual_review_reason", "").strip()
         if existing and incoming and incoming not in existing and append_reason:
@@ -272,11 +275,12 @@ class PumpFunBot:
             # Preserve the first diagnosis unless an explicitly appended transaction
             # outcome provides additional detail.
             combined = existing or incoming
-        # Keep the reason for diagnosis, but never latch a global trading halt.
+        # Preserve the old state marker for compatibility; enforce a separate entry gate.
         self.store.set_state("manual_review_halt", "0")
         self.store.set_state("manual_review_reason", combined)
         if incoming:
-            logger.error("Operational warning (automatic global halts disabled): %s", incoming[:500])
+            self.risk_engine.activate_kill_switch(incoming)
+            logger.error("Global entry kill switch engaged: %s", incoming[:500])
 
     def _loss_streak_pause_reason(self) -> str:
         """Persist a same-UTC-day entry pause after the configured consecutive-loss threshold."""
@@ -314,7 +318,10 @@ class PumpFunBot:
             self.store.set_state("consecutive_loss_warning_day", "")
 
     def _copy_block_reason(self) -> str:
-        """Report persisted entry circuit breakers to dashboard/feed logic."""
+        """Report the global entry gate and persisted circuit breakers."""
+        gate_reason = self.risk_engine.gate_reason()
+        if gate_reason:
+            return gate_reason
         if self.store.get_state("daily_paused", "0") == "1":
             return "Daily-loss circuit breaker is active; new entries resume after the next UTC day"
         return self._loss_streak_pause_reason()
@@ -487,6 +494,7 @@ class PumpFunBot:
             "trades": trades,
             "token_discovery": token_discovery_state,
             "trending_discovery": self.trending_scanner.dashboard_snapshot(),
+            "risk_control": self.risk_engine.snapshot(),
             "feed_connected": bool(self.feed and self.feed.connected.is_set()),
             "feed_error": self.feed.last_error if self.feed else "",
             "feed_stats": ({
@@ -588,6 +596,35 @@ class PumpFunBot:
             except queue.Empty:
                 break
             action = command.get("action")
+            if action == "set_entry_kill_switch":
+                requested = command.get("enabled")
+                if not isinstance(requested, bool):
+                    self.message = "Invalid entry-gate toggle; expected true or false."
+                    continue
+                if requested:
+                    self.risk_engine.activate_kill_switch("Operator engaged the global entry kill switch from the dashboard.")
+                    self.message = "Global entry kill switch engaged. Existing positions remain managed."
+                else:
+                    ok, detail = self.risk_engine.resume_entries()
+                    self.message = detail if ok else "Entries remain halted: " + detail
+                self._refresh_feed_subscriptions()
+                logger.warning("%s", self.message)
+                continue
+            if action == "acknowledge_reconciled_trade":
+                ok, detail = self.risk_engine.acknowledge_reconciled_trade(
+                    str(command.get("mint") or ""), str(command.get("signature") or ""),
+                    str(command.get("confirmation") or ""),
+                )
+                self.message = detail
+                logger.warning("Reconciliation acknowledgement: %s", detail)
+                continue
+            if action == "acknowledge_risk_reservation":
+                ok, detail = self.risk_engine.acknowledge_uncertain_reservation(
+                    str(command.get("reservation_id") or ""), str(command.get("confirmation") or ""),
+                )
+                self.message = detail
+                logger.warning("Reservation reconciliation acknowledgement: %s", detail)
+                continue
             discovery_actions = {
                 "set_token_discovery_enabled", "set_token_discovery_live_enabled",
                 "set_trending_discovery_enabled", "set_trending_discovery_live_enabled",
@@ -1184,6 +1221,23 @@ class PumpFunBot:
                     "Existing positions remain managed; no automatic mass liquidation is performed.",
                     total_loss,
                 )
+        # Independent persistent peak-to-trough equity circuit breaker.
+        try:
+            peak_equity = float(self.store.get_state("equity_high_watermark", str(max(0.0, equity))))
+        except (TypeError, ValueError, OverflowError):
+            peak_equity = max(0.0, equity)
+        if equity > peak_equity:
+            peak_equity = equity
+            self.store.set_state("equity_high_watermark", peak_equity)
+        elif not self.store.get_state("equity_high_watermark", ""):
+            self.store.set_state("equity_high_watermark", peak_equity)
+        if peak_equity > 0:
+            peak_drawdown_pct = max(0.0, (peak_equity - equity) / peak_equity)
+            if peak_drawdown_pct >= float(self.s.max_portfolio_drawdown_pct):
+                self.risk_engine.activate_kill_switch(
+                    "Portfolio peak-to-trough drawdown reached configured "
+                    f"{self.s.max_portfolio_drawdown_pct:.1%} ceiling (observed {peak_drawdown_pct:.1%})."
+                )
         daily_start = float(self.store.get_state("day_start_equity", str(equity)))
         daily_loss = max(0.0, daily_start - equity)
         if daily_loss >= self.s.daily_loss_limit_usd:
@@ -1200,6 +1254,9 @@ class PumpFunBot:
         self, equity: float, *, strategy: str = "leader_copy",
         entry_cap_usd: float | None = None,
     ) -> tuple[bool, str]:
+        gate_reason = self.risk_engine.gate_reason()
+        if gate_reason:
+            return False, gate_reason
         if strategy not in {"token_discovery", "trending_discovery"} and self.store.get_state("copy_paused", "0") == "1":
             return False, "Copying is paused from the dashboard"
         if self.store.daily_entries() >= self.s.max_entries_per_day:
@@ -1362,13 +1419,17 @@ class PumpFunBot:
             f"unresolved_trade:{exc.mint}",
             json.dumps(record, sort_keys=True, separators=(",", ":")),
         )
+        self.risk_engine.mark_uncertain(
+            exc.mint,
+            f"{exc.action.upper()} outcome unresolved for mint {exc.mint}; signature {exc.signature}.",
+        )
         self._activate_manual_review_halt(
             f"{exc.action.upper()} outcome unresolved for mint {exc.mint}; "
             f"signature {exc.signature}; reconcile wallet/transaction before resuming",
             append_reason=True,
         )
-        # Do not pause unrelated mints or disable the whole bot. The unresolved
-        # trade record above continues to block duplicate submissions for this mint.
+        # The independent global entry gate now blocks every new buy until the
+        # ambiguity is reconciled. Existing position monitoring and exit handling remain active.
         # Consume the triggering leader event so it cannot be replayed as a stale signal.
         if source_wallet and source_signature:
             self.store.mark_signature_seen(
@@ -1534,6 +1595,14 @@ class PumpFunBot:
             self.trending_scanner.set_live_status(mint, "blocked", "SOL input rounds to zero")
             return
 
+        reservation_id, reserve_reason = self.risk_engine.reserve_entry(
+            mint, "trending_discovery", spend,
+            exposure_usd=spend + (0.05 if self.s.mode == "live" else self.s.paper_swap_cost_usd),
+        )
+        if not reservation_id:
+            self.trending_scanner.set_live_status(mint, "blocked", "Risk reservation denied: " + reserve_reason)
+            return
+
         self.trending_scanner.set_live_status(
             mint, "submitting", f"Submitting Jupiter Ultra buy with swap input capped at ${spend:.2f}"
         )
@@ -1542,9 +1611,18 @@ class PumpFunBot:
             before_token = self.executor.token_balance_raw(self.wallet_address, mint)
             before_sol = self.rpc.sol_balance_lamports(self.wallet_address)
         except Exception as exc:
+            self.risk_engine.release_entry(
+                reservation_id, status="failed",
+                detail=f"Pre-trade balance read failed ({type(exc).__name__}).",
+            )
             self.trending_scanner.set_live_status(
                 mint, "blocked", f"Could not establish pre-trade wallet balances ({type(exc).__name__})"
             )
+            return
+        admitted, admission_reason = self.risk_engine.mark_submitting(reservation_id)
+        if not admitted:
+            self.risk_engine.release_entry(reservation_id, status="released", detail=admission_reason)
+            self.trending_scanner.set_live_status(mint, "blocked", admission_reason)
             return
         try:
             result = self.trending_executor.swap(
@@ -1566,16 +1644,32 @@ class PumpFunBot:
             )
             return
         except TransactionFailedOnChain as exc:
+            self.risk_engine.release_entry(
+                reservation_id, status="failed",
+                detail=f"Jupiter confirmed on-chain failure: {str(exc.detail)[:300]}",
+            )
             self.trending_scanner.set_live_status(
                 mint, "failed", f"Jupiter confirmed on-chain failure: {str(exc.detail)[:350]}"
             )
             logger.warning("Trending live buy failed on-chain mint=%s signature=%s", mint[:8], exc.signature)
             return
         except (TransactionBuildFailed, TransactionSimulationFailed) as exc:
+            self.risk_engine.release_entry(
+                reservation_id, status="failed",
+                detail=f"Jupiter pre-submit checks blocked the order: {str(exc)[:300]}",
+            )
             self.trending_scanner.set_live_status(
                 mint, "failed", f"Jupiter pre-submit checks blocked the order: {str(exc)[:350]}"
             )
             logger.warning("Trending live buy blocked before submission mint=%s: %s", mint[:8], exc)
+            return
+        except Exception as exc:
+            uncertain = TransactionOutcomeUncertain(
+                "signature-unavailable", "buy", mint,
+                f"Unclassified execution exception after submission boundary ({type(exc).__name__}); reconcile before retry.",
+            )
+            self._handle_uncertain_trade(uncertain, source_wallet=None, source_signature=source_signature)
+            self.trending_scanner.set_live_status(mint, "uncertain", "Unclassified execution exception; global entry gate engaged.")
             return
 
         tx_sig = str(result.get("signature") or "")
@@ -1623,15 +1717,32 @@ class PumpFunBot:
                 if total_supply_tokens > 0 else ""
             ),
         }
-        self.store.upsert_position(position)
-        self.store.set_state(f"pool:{mint}", "jupiter")
-        self.store.increment_daily_entries()
-        self.store.add_trade(
-            mode=self.s.mode, action="BUY", mint=mint, amount_raw=str(raw_out),
-            price_usd=effective_price, value_usd=cost_basis,
-            reason="trending-token Jupiter Ultra buy",
-            source_wallet=None, source_signature=source_signature,
-            tx_signature=tx_sig, strategy="trending_discovery",
+        try:
+            self.store.upsert_position(position)
+            self.store.set_state(f"pool:{mint}", "jupiter")
+            self.store.increment_daily_entries()
+            self.store.add_trade(
+                mode=self.s.mode, action="BUY", mint=mint, amount_raw=str(raw_out),
+                price_usd=effective_price, value_usd=cost_basis,
+                reason="trending-token Jupiter Ultra buy",
+                source_wallet=None, source_signature=source_signature,
+                tx_signature=tx_sig, strategy="trending_discovery",
+            )
+        except Exception as exc:
+            self._handle_uncertain_trade(
+                TransactionOutcomeUncertain(
+                    tx_sig, "buy", mint,
+                    f"Confirmed swap could not be persisted to the local ledger ({type(exc).__name__}).",
+                ),
+                source_wallet=None, source_signature=source_signature,
+            )
+            self.trending_scanner.set_live_status(
+                mint, "uncertain", "Swap confirmed but ledger persistence failed; reconcile before resuming."
+            )
+            return
+        self.risk_engine.release_entry(
+            reservation_id, status="completed",
+            detail="Swap and wallet balance deltas reconciled into the position/trade ledger.",
         )
         self.price_cache[mint] = effective_price
         self.price_cache_at[mint] = time.time()
@@ -1776,6 +1887,14 @@ class PumpFunBot:
         if spend < minimum_practical_spend:
             return
 
+        reservation_id, reserve_reason = self.risk_engine.reserve_entry(
+            mint, strategy, spend,
+            exposure_usd=spend + (self.s.paper_swap_cost_usd if self.s.mode == "paper" else 0.05),
+        )
+        if not reservation_id:
+            logger.warning("Reject buy %s: risk reservation denied: %s", str(mint)[:8], reserve_reason)
+            return
+
         decimals = int(signal.get("decimals") or 6)
         total_supply_tokens = float(signal.get("total_supply_tokens") or 0)
         if total_supply_tokens <= 0:
@@ -1789,7 +1908,15 @@ class PumpFunBot:
             cost = self.s.paper_swap_cost_usd
             raw_out = int(spend / observed_price * (10 ** decimals))
             if raw_out <= 0:
+                self.risk_engine.release_entry(
+                    reservation_id, status="failed", detail="Paper output amount rounded to zero."
+                )
                 logger.info("Reject %s: estimated output rounds to zero", mint)
+                return
+            admitted, admission_reason = self.risk_engine.mark_submitting(reservation_id)
+            if not admitted:
+                self.risk_engine.release_entry(reservation_id, status="released", detail=admission_reason)
+                logger.warning("Reject %s: %s", str(mint)[:8], admission_reason)
                 return
             cash = float(self.store.get_state("paper_cash", "0"))
             self.store.set_state("paper_cash", cash - spend - cost)
@@ -1800,6 +1927,11 @@ class PumpFunBot:
             effective_price = spend / raw_to_units(raw_out, decimals)
             used_pool = venue
         else:
+            admitted, admission_reason = self.risk_engine.mark_submitting(reservation_id)
+            if not admitted:
+                self.risk_engine.release_entry(reservation_id, status="released", detail=admission_reason)
+                logger.warning("Reject %s: %s", str(mint)[:8], admission_reason)
+                return
             assert self.keypair is not None and self.wallet_address is not None
             try:
                 result = self.executor.trade(
@@ -1813,6 +1945,10 @@ class PumpFunBot:
                     source_wallet=source_wallet,
                     source_signature=source_signature,
                 )
+                self.risk_engine.release_entry(
+                    reservation_id, status="failed",
+                    detail="Transaction was verified expired and not landed.",
+                )
                 return
             except TransactionOutcomeUncertain as exc:
                 self._handle_uncertain_trade(
@@ -1822,6 +1958,10 @@ class PumpFunBot:
                 )
                 return
             except TransactionBuildFailed as exc:
+                self.risk_engine.release_entry(
+                    reservation_id, status="failed",
+                    detail=f"Transaction was blocked before submission: {str(exc)[:250]}",
+                )
                 # Discovery slippage failures are known pre-submit events. Let the
                 # discovery controller redo fresh checks while the candidate remains
                 # inside its short freshness window; do not turn them into a global halt.
@@ -1839,17 +1979,40 @@ class PumpFunBot:
                     mint[:8], " ".join(str(exc).split())[:220], delay,
                 )
                 return
-            tx_sig = result["signature"]
-            used_pool = result["pool"]
-            raw_out = int(result["total_output_amount"])
-            if raw_out <= 0:
-                raise RuntimeError("PumpPortal confirmed a buy without a positive token balance delta")
-            # Wallet SOL delta includes swap input plus network/priority fees and
-            # account rent. Keep that all-in amount in P&L basis, but never treat
-            # fixed overhead as token price movement for the stop thresholds.
-            effective_spend = max(0, -int(result["sol_delta_lamports"])) / 1_000_000_000 * sol_price
-            cost_basis = effective_spend if effective_spend > 0 else spend
-            effective_price = spend / raw_to_units(raw_out, decimals)
+            except Exception as exc:
+                self._handle_uncertain_trade(
+                    TransactionOutcomeUncertain(
+                        "signature-unavailable", "buy", mint,
+                        f"Unclassified executor exception after submission boundary ({type(exc).__name__}); reconcile before retry.",
+                    ),
+                    source_wallet=source_wallet,
+                    source_signature=source_signature,
+                )
+                return
+            tx_sig = ""
+            try:
+                if not isinstance(result, dict):
+                    raise ValueError("Executor returned a non-object result")
+                tx_sig = str(result.get("signature") or "")
+                used_pool = str(result.get("pool") or venue)
+                raw_out = int(result.get("total_output_amount") or 0)
+                if not tx_sig or raw_out <= 0:
+                    raise ValueError("Missing signature or non-positive token output")
+                # Wallet SOL delta includes swap input plus network/priority fees
+                # and account rent; retain its all-in amount in P&L basis.
+                effective_spend = max(0, -int(result.get("sol_delta_lamports") or 0)) / 1_000_000_000 * sol_price
+                cost_basis = effective_spend if effective_spend > 0 else spend
+                effective_price = spend / raw_to_units(raw_out, decimals)
+            except Exception as exc:
+                self._handle_uncertain_trade(
+                    TransactionOutcomeUncertain(
+                        tx_sig or "signature-unavailable", "buy", mint,
+                        f"Executor returned but fill details could not be safely reconciled ({type(exc).__name__}).",
+                    ),
+                    source_wallet=source_wallet,
+                    source_signature=source_signature,
+                )
+                return
 
         # Start the hold timer only after the buy has succeeded and its fill is known.
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -1867,19 +2030,33 @@ class PumpFunBot:
                 if total_supply_tokens > 0 else ""
             ),
         }
-        self.store.upsert_position(position)
-        self.store.set_state(f"pool:{mint}", used_pool)
-        self.store.increment_daily_entries()
-        trade_reason = (
-            f"independent token discovery {used_pool} buy"
-            if strategy == "token_discovery"
-            else f"copied Pump.fun {used_pool} buy"
-        )
-        self.store.add_trade(
-            mode=self.s.mode, action="BUY", mint=mint, amount_raw=str(raw_out),
-            price_usd=effective_price, value_usd=cost_basis, reason=trade_reason,
-            source_wallet=source_wallet, source_signature=source_signature,
-            tx_signature=tx_sig, strategy=strategy,
+        try:
+            self.store.upsert_position(position)
+            self.store.set_state(f"pool:{mint}", used_pool)
+            self.store.increment_daily_entries()
+            trade_reason = (
+                f"independent token discovery {used_pool} buy"
+                if strategy == "token_discovery"
+                else f"copied Pump.fun {used_pool} buy"
+            )
+            self.store.add_trade(
+                mode=self.s.mode, action="BUY", mint=mint, amount_raw=str(raw_out),
+                price_usd=effective_price, value_usd=cost_basis, reason=trade_reason,
+                source_wallet=source_wallet, source_signature=source_signature,
+                tx_signature=tx_sig, strategy=strategy,
+            )
+        except Exception as exc:
+            self._handle_uncertain_trade(
+                TransactionOutcomeUncertain(
+                    str(tx_sig), "buy", mint,
+                    f"Buy fill exists but local position/trade persistence failed ({type(exc).__name__}).",
+                ),
+                source_wallet=source_wallet,
+                source_signature=source_signature,
+            )
+            return
+        self.risk_engine.release_entry(
+            reservation_id, status="completed", detail="Buy fill and ledger record completed."
         )
         # Do not overwrite a fresher trade tick that arrived while the swap was
         # being built/submitted. Otherwise seed the mark from the actual swap fill.
@@ -3150,7 +3327,7 @@ class PumpFunBot:
                 logger.error("RPC fallback monitor failed for %s: %s", wallet[:8], exc)
                 if self.s.mode == "live":
                     self._activate_manual_review_halt(
-                        f"RPC wallet monitoring error for {wallet}; polling will retry without a global halt"
+                        f"RPC wallet monitoring error for {wallet}; polling will retry; new entries are halted pending review"
                     )
 
     def run(self, once=False):
@@ -3259,7 +3436,7 @@ class PumpFunBot:
                     logger.exception("Loop error; this cycle failed; next cycle will retry")
                     if self.s.mode == "live":
                         self._activate_manual_review_halt(
-                            f"Runtime exception: {exc}; logged for diagnosis without a global entry halt"
+                            f"Runtime exception: {exc}; new entries halted pending diagnosis and operator review"
                         )
                     self.message = "Runtime error logged; the main loop will retry and automatic global halts are disabled."
                     # The normal refresh at the bottom of the loop is skipped when

@@ -132,6 +132,19 @@ class LiveDiscoveryBuyTests(unittest.TestCase):
             pumpportal_priority_fee_sol=0.00001,
         )
         bot.store = FakeStore(positions)
+        bot.risk_engine = SimpleNamespace(
+            gate_reason=lambda: "",
+            reserve_entry=lambda mint, strategy, amount_usd, exposure_usd=None: (
+                ("test-reservation-" + str(mint), "")
+                if 0 < float(amount_usd) <= 0.50
+                else (None, "test risk cap exceeded")
+            ),
+            mark_submitting=lambda reservation_id: (True, ""),
+            release_entry=lambda reservation_id, status="released", detail="": None,
+            mark_uncertain=lambda mint, reason: None,
+            activate_kill_switch=lambda reason: None,
+            snapshot=lambda: {"kill_switch_active": False, "active_reservations": [], "unresolved_trades": []},
+        )
         bot.market = FakeMarket()
         bot.executor = FakeExecutor()
         bot.rpc = SimpleNamespace()

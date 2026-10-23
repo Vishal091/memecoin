@@ -173,3 +173,13 @@ The app blocks new live entries after ambiguous runtime errors and requires manu
 - `PUMPFUN_SETUP.md`: step-by-step setup.
 - `bot.py` and `jupiter.py`: earlier generic/Jupiter prototype; use `pumpfun_bot.py` for Pump.fun.
 
+
+## Phase 4: entry-risk controls
+
+The risk-control branch adds a persistent global entry kill switch, atomic SQLite risk reservations, a reservation/submission lifecycle, unresolved-transaction visibility, and explicit reconciliation controls in the local dashboard. New process starts default to **new entries halted**; an operator must deliberately resume entry admission. This is separate from turning copying or scanners on.
+
+The enforced experiment ceilings are maximum $0.50 swap input, $1.00 total tracked/pending exposure, one open position, at most four entries per UTC day, $0.50 daily loss, $1.00 total loss, at least 0.025 SOL reserved for fees, and a 15% peak-to-trough equity drawdown gate. These limits are operational caps, not evidence of a profitable strategy; actual wallet debits can exceed swap input due to fees and rent. The separate `LIVE_ENTRIES_APPROVED=false` setting defaults to off and prevents any live-mode entry from being authorized on this Phase 4 branch; changing it requires a separate rollout approval.
+
+An uncertain submitted transaction blocks new entries and remains visible in the dashboard. Before acknowledging reconciliation, independently inspect transaction history and actual wallet token/SOL balances. The dashboard phrase is an operator attestation only; the software does not infer that on-chain reconciliation has occurred. Acknowledgement does not automatically resume entries, and existing position management/exits continue while entry admission is halted. See [docs/risk_policy.md](docs/risk_policy.md).
+
+This work is not an authorization for live trading or deployment. Keep live discovery opt-ins disabled and validate tests, CI and a controlled end-to-end execution/reconciliation path before any separate production approval.

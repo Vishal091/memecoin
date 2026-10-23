@@ -33,6 +33,7 @@ def _int(name: str, default: int) -> int:
 class PumpFunSettings:
     mode: str
     live_confirmation: str
+    live_entries_approved: bool
     watch_wallets: tuple[str, ...]
     pumpfun_auth_token: str
     pumpportal_api_key: str
@@ -53,6 +54,7 @@ class PumpFunSettings:
     max_consecutive_losses: int
     daily_loss_limit_usd: float
     total_loss_limit_usd: float
+    max_portfolio_drawdown_pct: float
     min_sol_reserve: float
     starting_paper_cash_usd: float
     min_liquidity_usd: float
@@ -108,6 +110,8 @@ class PumpFunSettings:
         obj = cls(
             mode=mode,
             live_confirmation=os.getenv("LIVE_CONFIRMATION", "").strip(),
+            # Phase 4 is never live-authorized by default; a later approved rollout must opt in.
+            live_entries_approved=os.getenv("LIVE_ENTRIES_APPROVED", "false").strip().lower() in {"1", "true", "yes", "on"},
             watch_wallets=wallets,
             pumpfun_auth_token=(os.getenv("PUMPFUN_AUTH_TOKEN", "").strip() or os.getenv("PUMPFUN_BEARER_TOKEN", "").strip()),
             pumpportal_api_key=os.getenv("PUMPPORTAL_API_KEY", "").strip(),
@@ -121,15 +125,17 @@ class PumpFunSettings:
             rpc_url=os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip(),
             solana_logs_ws_enabled=os.getenv("SOLANA_LOGS_WS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
             keypair_path=Path(os.getenv("KEYPAIR_PATH", "./wallet.json")).expanduser(),
-            max_entry_usd=_float("MAX_ENTRY_USD", 2.0),
-            max_total_exposure_usd=_float("MAX_TOTAL_EXPOSURE_USD", 3.0),
-            max_open_positions=_int("MAX_OPEN_POSITIONS", 3),
-            max_entries_per_day=_int("MAX_ENTRIES_PER_DAY", 3),
+            # Enforced trial ceilings: local settings can only make this profile stricter.
+            max_entry_usd=min(0.50, _float("MAX_ENTRY_USD", 0.50)),
+            max_total_exposure_usd=min(1.00, _float("MAX_TOTAL_EXPOSURE_USD", 1.00)),
+            max_open_positions=1,
+            max_entries_per_day=max(1, min(4, _int("MAX_ENTRIES_PER_DAY", 4))),
             # Pause new entries after three losing exits in a row; allow only a narrow safe override range.
             max_consecutive_losses=max(2, min(10, _int("MAX_CONSECUTIVE_LOSSES", 3))),
-            daily_loss_limit_usd=_float("DAILY_LOSS_LIMIT_USD", 1.5),
-            total_loss_limit_usd=_float("TOTAL_LOSS_LIMIT_USD", 3.0),
-            min_sol_reserve=_float("MIN_SOL_RESERVE", 0.008),
+            daily_loss_limit_usd=min(0.50, _float("DAILY_LOSS_LIMIT_USD", 0.50)),
+            total_loss_limit_usd=min(1.00, _float("TOTAL_LOSS_LIMIT_USD", 1.00)),
+            max_portfolio_drawdown_pct=min(0.15, max(0.01, _float("MAX_PORTFOLIO_DRAWDOWN_PCT", 0.15))),
+            min_sol_reserve=max(0.025, _float("MIN_SOL_RESERVE", 0.025)),
             starting_paper_cash_usd=_float("STARTING_PAPER_CASH_USD", 10.0),
             min_liquidity_usd=max(5000.0, _float("MIN_LIQUIDITY_USD", 5000.0)),
             min_pair_age_seconds=max(90, _int("MIN_PAIR_AGE_SECONDS", 90)),
@@ -194,6 +200,12 @@ class PumpFunSettings:
             raise ValueError("DEFAULT_LEADERBOARD_WINDOW must be overall, day, week or month")
         if self.max_entry_usd <= 0 or self.max_total_exposure_usd <= 0:
             raise ValueError("Entry and exposure limits must be positive")
+        if self.max_entry_usd > 0.50 or self.max_total_exposure_usd > 1.00:
+            raise ValueError("This trial profile caps entries at $0.50 and total exposure at $1.00")
+        if self.max_open_positions != 1:
+            raise ValueError("This trial profile permits one open position at a time")
+        if not (0 < self.max_portfolio_drawdown_pct <= 0.15):
+            raise ValueError("MAX_PORTFOLIO_DRAWDOWN_PCT must be greater than 0 and no more than 0.15")
         if not (0 <= self.slippage_bps <= 500):
             raise ValueError("SLIPPAGE_BPS must be between 0 and 500 (5%)")
         if not (0 < self.trailing_stop_pct < 1):
@@ -225,5 +237,11 @@ class PumpFunSettings:
                 raise ValueError("PUMPFUN_AUTH_TOKEN is required for automatic top-trader discovery in live mode")
             if not self.pumpportal_api_key:
                 raise ValueError("PUMPPORTAL_API_KEY is required for the near-real-time account-trade feed in live mode")
+        if self.mode == "live" and not self.live_entries_approved and (
+            self.token_discovery_live_enabled or self.trending_discovery_live_enabled
+        ):
+            raise ValueError(
+                "Live discovery switches require LIVE_ENTRIES_APPROVED=true after separate rollout approval"
+            )
         if self.mode == "paper" and self.starting_paper_cash_usd <= 0:
             raise ValueError("STARTING_PAPER_CASH_USD must be positive")

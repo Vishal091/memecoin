@@ -31,6 +31,7 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px 8px
 <body><main>
 <header><div><h1>Memecoin <span class="muted">/ Pump.fun</span></h1><div class="muted">Top traders · automatic copy · manual exits</div></div><div><span class="pill" id="mode">MODE</span> <button id="refresh">Refresh</button></div></header>
 <div id="message" class="status">Connecting to local bot...</div>
+<section class="panel"><div class="toolbar"><div><h2>Global entry safety gate <span class="pill" id="entryGateStatus">HALTED</span></h2><div class="muted">Blocks new buys across all strategies. Existing positions continue to be managed; the switch does not auto-liquidate holdings. Every process startup requires an explicit resume.</div></div><button id="entryGateToggle" class="primary">Resume new entries</button></div><div id="entryGateDetail" class="status">Risk-control state is loading…</div><div id="unresolvedTransactions" class="status">Checking unresolved transactions and reservations…</div><div class="footer">Only acknowledge after independently checking transaction history and actual wallet balances. Acknowledgement does not enable entries; use the separate resume control afterwards.</div></section>
 <div class="grid"><div class="metric"><small>Estimated equity</small><strong id="equity">—</strong></div>
 <div class="metric"><small>Open positions</small><strong id="posCount">0</strong></div><div class="metric"><small>Auto-copy</small><strong id="copyStatus">OFF</strong></div>
 <div class="metric"><small>Active traders</small><strong id="walletCount">0</strong></div></div>
@@ -111,6 +112,60 @@ function render(d){
     : "SCANNER DISABLED · Set TOKEN_DISCOVERY_ENABLED=true to enable screening. Live execution additionally requires TOKEN_DISCOVERY_LIVE_ENABLED=true, BOT_MODE=live and explicit live confirmation.";
   el("opportunityFunnel").textContent = "Tracked launches: "+(td.tracked_candidates||0)+" · Queued: "+(td.queue_count||0)+" · On-chain safety passed: "+(td.safety_passed_count||0)+" · Entry gates passed: "+(td.qualified_count||0)+" · Live attempts: "+(td.live_attempted_count||0)+" · Confirmed live buys: "+(td.live_confirmed_count||0)+" · Failed/blocked/stale: "+(td.live_failed_count||0)+" · Unfilled shadow candidates later peaking +20% or more: "+(td.unfilled_peak_20_count||0)+" (hypothetical movement, not realized profit).";
   function esc(v){return String(v===undefined||v===null?"":v).replace(/[&<>"']/g,function(ch){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]})}
+  var rc=d.risk_control||{};
+  el("entryGateStatus").textContent=rc.kill_switch_active?"NEW ENTRIES HALTED":"ENTRY GATE OPEN";
+  el("entryGateToggle").textContent=rc.kill_switch_active?"Resume new entries":"Engage kill switch";
+  el("entryGateToggle").className=rc.kill_switch_active?"primary":"danger";
+  el("entryGateDetail").textContent=(rc.kill_switch_active?"HALTED: "+(rc.kill_switch_reason||"explicit resume required"):"Entry gate is open")+
+    " · max input $"+num(rc.max_entry_usd||0.50)+" · max total exposure $"+num(rc.max_total_exposure_usd||1.00)+
+    " · open positions "+(rc.max_open_positions||1)+" · entries/day "+(rc.max_entries_per_day||4)+
+    " · drawdown ceiling "+(100*Number(rc.max_portfolio_drawdown_pct||0.15)).toFixed(1)+"%"+
+    " · mode "+String(rc.mode||"unknown").toUpperCase()+" · live approval "+(rc.live_entries_approved?"ON":"OFF (separate approval required)")+
+    " · active reservations "+(rc.active_reservation_count||0)+" · unresolved "+(rc.unresolved_trade_count||0);
+  el("entryGateToggle").onclick=function(){
+    if(rc.kill_switch_active){
+      if(!confirm("Resume new entries? This explicit action is refused while unresolved transactions or active reservations remain."))return;
+      action({action:"set_entry_kill_switch",enabled:false});
+    }else{
+      if(!confirm("ENGAGE GLOBAL ENTRY KILL SWITCH? New buys from all strategies will be blocked. Existing holdings remain managed and are not automatically sold."))return;
+      action({action:"set_entry_kill_switch",enabled:true});
+    }
+  };
+  var unresolved=rc.unresolved_trades||[], reservations=rc.active_reservations||[];
+  var reconHtml="";
+  unresolved.forEach(function(x){
+    reconHtml+="<div class='status'><strong>Unresolved "+esc(x.action||"transaction")+"</strong> · mint <span class='addr'>"+esc(x.mint||"")+"</span>"+
+      "<div>Signature: <span class='addr'>"+esc(x.signature||"missing")+"</span></div><div>"+esc(x.detail||"")+"</div>"+
+      "<button class='danger resolveTrade' data-mint='"+esc(x.mint||"")+"' data-signature='"+esc(x.signature||"")+"'>Acknowledge verified reconciliation</button></div>";
+  });
+  reservations.forEach(function(x){
+    reconHtml+="<div class='status'><strong>Reservation "+esc(x.status||"unknown")+"</strong> · mint <span class='addr'>"+esc(x.mint||"")+"</span> · exposure $"+num(x.amount_usd||0)+
+      "<div>Reservation ID: <span class='addr'>"+esc(x.reservation_id||"")+"</span></div><div>"+esc(x.detail||"")+"</div>"+
+      (x.status==="reserved"?"<button class='primary resolveReservation' data-id='"+esc(x.reservation_id||"")+"' data-status='reserved'>Release unused pre-submit reservation</button>":((x.status==="submitting"||x.status==="uncertain")?"<button class='danger resolveReservation' data-id='"+esc(x.reservation_id||"")+"' data-status='"+esc(x.status)+"'>Acknowledge verified reservation reconciliation</button>":""))+"</div>";
+  });
+  el("unresolvedTransactions").innerHTML=reconHtml||"No unresolved transactions or active reservations.";
+  document.querySelectorAll(".resolveTrade").forEach(function(b){b.onclick=function(){
+    var mint=b.dataset.mint, sig=b.dataset.signature;
+    if(!sig||sig==="missing"){el("message").textContent="Cannot acknowledge: no transaction signature is recorded.";return}
+    if(sig==="signature-unavailable"){
+      if(!confirm("No transaction signature was recorded. Review recent on-chain history and actual wallet balances for this mint before continuing."))return;
+    }else if(prompt("After independently checking the transaction, type the exact recorded signature:")!==sig)return;
+    var phrase="I_VERIFIED_THE_ONCHAIN_TRANSACTION_AND_WALLET_BALANCES";
+    if(prompt("Type "+phrase+" to confirm you reviewed on-chain history and actual wallet balances.")!==phrase)return;
+    action({action:"acknowledge_reconciled_trade",mint:mint,signature:sig,confirmation:phrase});
+  }});
+  document.querySelectorAll(".resolveReservation").forEach(function(b){b.onclick=function(){
+    var phrase="I_VERIFIED_THE_ONCHAIN_TRANSACTION_AND_WALLET_BALANCES";
+    if(b.dataset.status==="reserved"){
+      if(!confirm("The saved reservation is still in the pre-submit state, so the executor was not allowed to submit an order from it. Release this unused reservation?"))return;
+      action({action:"acknowledge_risk_reservation",reservation_id:b.dataset.id,confirmation:""});
+      return;
+    }
+    if(!confirm("Only continue after independently reviewing recent wallet transactions and actual token/SOL balances for this interrupted reservation."))return;
+    if(prompt("Type "+phrase+" to acknowledge the reconciliation review.")!==phrase)return;
+    action({action:"acknowledge_risk_reservation",reservation_id:b.dataset.id,confirmation:phrase});
+  }});
+
   var dc=td.candidates||[];
   el("discoveryCandidates").innerHTML=dc.length?dc.map(function(x){
     var move=x.shadow_entry_price_usd?Number(x.current_return_pct||0):null;
@@ -229,10 +284,20 @@ class DashboardServer:
                         "copy_top10", "stop_copy", "manual_exit", "exit_all",
                         "set_token_discovery_enabled", "set_token_discovery_live_enabled",
                         "set_trending_discovery_enabled", "set_trending_discovery_live_enabled",
+                        "set_entry_kill_switch", "acknowledge_reconciled_trade",
+                        "acknowledge_risk_reservation",
                     }:
                         raise ValueError("Unknown action")
                     if str(command.get("action", "")).startswith("set_") and not isinstance(command.get("enabled"), bool):
-                        raise ValueError("Discovery toggle enabled value must be true or false")
+                        raise ValueError("Toggle enabled value must be true or false")
+                    if command.get("action") == "acknowledge_reconciled_trade":
+                        if not all(isinstance(command.get(key), str) and command.get(key) for key in ("mint", "signature", "confirmation")):
+                            raise ValueError("Mint, signature, and reconciliation confirmation are required")
+                    if command.get("action") == "acknowledge_risk_reservation":
+                        if (not isinstance(command.get("reservation_id"), str)
+                                or not command.get("reservation_id")
+                                or not isinstance(command.get("confirmation"), str)):
+                            raise ValueError("Reservation ID and reconciliation confirmation are required")
                     commands.put(command)
                     self.send_body(202, "application/json; charset=utf-8",
                                    json.dumps({"message":"Command queued; check status and trade log."}).encode())
