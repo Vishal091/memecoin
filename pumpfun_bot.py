@@ -3327,7 +3327,7 @@ class PumpFunBot:
                 logger.error("RPC fallback monitor failed for %s: %s", wallet[:8], exc)
                 if self.s.mode == "live":
                     self._activate_manual_review_halt(
-                        f"RPC wallet monitoring error for {wallet}; polling will retry without a global halt"
+                        f"RPC wallet monitoring error for {wallet}; polling will retry; new entries are halted pending review"
                     )
 
     def run(self, once=False):
@@ -3436,7 +3436,7 @@ class PumpFunBot:
                     logger.exception("Loop error; this cycle failed; next cycle will retry")
                     if self.s.mode == "live":
                         self._activate_manual_review_halt(
-                            f"Runtime exception: {exc}; logged for diagnosis without a global entry halt"
+                            f"Runtime exception: {exc}; new entries halted pending diagnosis and operator review"
                         )
                     self.message = "Runtime error logged; the main loop will retry and automatic global halts are disabled."
                     # The normal refresh at the bottom of the loop is skipped when
