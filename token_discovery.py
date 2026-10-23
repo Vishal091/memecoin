@@ -133,7 +133,9 @@ class TokenDiscoveryShadow:
         self._last_chain_check: dict[str, float] = {}
         self._last_skip_log_at = 0.0
         self._last_subscription_refresh = 0.0
+        self._last_shadow_observation_error_at = 0.0
         self.stats = {
+            "shadow_observation_errors": 0,
             "launch_events": 0,
             "safety_scans": 0,
             "safety_rejected": 0,
@@ -172,6 +174,37 @@ class TokenDiscoveryShadow:
             self._key(str(candidate["mint"])),
             json.dumps(candidate, sort_keys=True, separators=(",", ":")),
         )
+        # The shadow ledger is append/upsert-only and never calls an executor.
+        # Coalescing happens in SQLite by minute/status to keep observation growth bounded.
+        record_observation = getattr(self.store, "record_shadow_observation", None)
+        if callable(record_observation):
+            try:
+                record_observation(
+                    strategy="token_discovery",
+                    mint=str(candidate["mint"]),
+                    observed_at=float(candidate["last_updated_at"]),
+                    status=str(candidate.get("status") or "unknown"),
+                    price_usd=candidate.get("price_usd"),
+                    liquidity_usd=candidate.get("real_liquidity_usd"),
+                    volume_1h_usd=None,
+                    score=candidate.get("score"),
+                    shadow_eligible=bool(float(candidate.get("shadow_entry_at") or 0) > 0),
+                    market_source=str(
+                        candidate.get("shadow_mark_source")
+                        or candidate.get("market_cap_source")
+                        or "Pump.fun bonding-curve mark"
+                    ),
+                    payload=candidate,
+                )
+            except Exception as exc:
+                self.stats["shadow_observation_errors"] += 1
+                now = float(candidate["last_updated_at"])
+                if now - self._last_shadow_observation_error_at >= 60:
+                    logger.warning(
+                        "Could not persist token-discovery shadow observation (%s)",
+                        type(exc).__name__,
+                    )
+                    self._last_shadow_observation_error_at = now
 
     def _market_cap_from_event(self, event: dict) -> tuple[float, str]:
         """Read explicitly named USD market-cap fields or convert PumpPortal SOL market cap."""
