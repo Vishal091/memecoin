@@ -1428,8 +1428,8 @@ class PumpFunBot:
             f"signature {exc.signature}; reconcile wallet/transaction before resuming",
             append_reason=True,
         )
-        # Do not pause unrelated mints or disable the whole bot. The unresolved
-        # trade record above continues to block duplicate submissions for this mint.
+        # The independent global entry gate now blocks every new buy until the
+        # ambiguity is reconciled. Existing position monitoring and exit handling remain active.
         # Consume the triggering leader event so it cannot be replayed as a stale signal.
         if source_wallet and source_signature:
             self.store.mark_signature_seen(
