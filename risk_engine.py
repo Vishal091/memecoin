@@ -46,6 +46,14 @@ class RiskEngine:
     def gate_reason(self) -> str:
         """Return a rejection reason, or an empty string if entry admission is open."""
         try:
+            if (
+                str(getattr(self.settings, "mode", "paper")).lower() == "live"
+                and not bool(getattr(self.settings, "live_entries_approved", False))
+            ):
+                return (
+                    "Live entries are disabled in this Phase 4 build: LIVE_ENTRIES_APPROVED=false. "
+                    "Use paper mode until a separate rollout is approved."
+                )
             if self.kill_switch_active():
                 return "Global entry kill switch is active: " + self.kill_switch_reason()
             unresolved = self.store.list_state_prefix("unresolved_trade:", limit=1)
@@ -69,6 +77,14 @@ class RiskEngine:
     def resume_entries(self) -> tuple[bool, str]:
         """Resume only after unresolved transactions and active reservations are gone."""
         try:
+            if (
+                str(getattr(self.settings, "mode", "paper")).lower() == "live"
+                and not bool(getattr(self.settings, "live_entries_approved", False))
+            ):
+                return False, (
+                    "Live entry gate cannot be resumed: LIVE_ENTRIES_APPROVED=false. "
+                    "Use paper mode until a separate rollout is approved."
+                )
             unresolved = self.store.list_state_prefix("unresolved_trade:", limit=1000)
             if unresolved:
                 return False, "Unresolved transactions remain. Reconcile each transaction first."
@@ -129,8 +145,11 @@ class RiskEngine:
             return None, "Risk reservation failed; refusing to submit an order."
 
     def mark_submitting(self, reservation_id: str) -> tuple[bool, str]:
-        """Last local admission check; fails if the kill switch was engaged meanwhile."""
+        """Last local admission check; fails closed on live-policy or kill-switch changes."""
         try:
+            policy_reason = self.gate_reason()
+            if policy_reason:
+                return False, policy_reason
             return self.store.mark_entry_reservation_submitting(reservation_id)
         except Exception:
             return False, "Could not persist pre-submission state; refusing order."
@@ -243,6 +262,8 @@ class RiskEngine:
         except Exception:
             active = []
         return {
+            "mode": str(getattr(self.settings, "mode", "paper")),
+            "live_entries_approved": bool(getattr(self.settings, "live_entries_approved", False)),
             "kill_switch_active": self.kill_switch_active(),
             "kill_switch_reason": self.kill_switch_reason(),
             "active_reservation_count": len(active),
