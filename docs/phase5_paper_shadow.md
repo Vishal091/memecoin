@@ -40,6 +40,8 @@ If you also want to observe copy-trading behavior, ensure your existing paper-mo
 4. Leave the process collecting shadow marks. Token discovery records its observed candidate marks and 1/5/15-minute outcomes. Trending discovery records first-pass screened observations only when an exact pool match supplies a valid USD price with the candidate mint as the base token.
 5. After collection, run the read-only evaluator below. It does not alter the database and never signs or submits a transaction.
 
+Observation storage is coalesced by candidate, minute and status, stores a bounded subset of source fields, and retains at most the 500,000 newest observation rows. If a busy trial reaches that cap, older rows are pruned; the report's actual observed span must still meet the coverage target before review readiness can be reported. Persistence failures are surfaced in the dashboard rather than silently treated as successful collection.
+
 ```powershell
 python shadow_evaluation.py --db memecoin-phase5-paper.db --json-out reports/phase5-shadow-report.json --csv-out reports/phase5-shadow-trades.csv
 ```
