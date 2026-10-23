@@ -21,6 +21,7 @@ from native_pump import (
     TransactionSimulationFailed,
 )
 from solana_rpc import SolanaRPC
+from solana_logs_feed import SolanaLogsFeed
 from storage import Store
 from token_discovery import TokenDiscoveryShadow
 
@@ -1268,6 +1269,62 @@ class StaleWalletSignalTests(unittest.TestCase):
         self.assertEqual(bot.store.cursor, "fresh-signature")
         self.assertEqual(handled, 13)
         self.assertEqual(len(bot.store.seen), 13)
+
+
+class SolanaLogsFeedSubscriptionTests(unittest.TestCase):
+    def test_watched_wallet_subscriptions_wait_for_each_ack(self):
+        import json
+        from contextlib import contextmanager
+        from unittest.mock import patch
+
+        class FakeWebSocket:
+            def __init__(self):
+                self.feed = None
+                self.sent = []
+                self.replies = queue.Queue()
+                self.in_flight = 0
+                self.max_in_flight = 0
+
+            def send(self, raw):
+                message = json.loads(raw)
+                self.sent.append(message)
+                if message.get("method") == "logsSubscribe":
+                    self.in_flight += 1
+                    self.max_in_flight = max(self.max_in_flight, self.in_flight)
+                    self.replies.put(json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "result": 1000 + message["id"],
+                    }))
+
+            def recv(self, timeout=1):
+                try:
+                    reply = self.replies.get_nowait()
+                    self.in_flight -= 1
+                    return reply
+                except queue.Empty:
+                    if self.feed and self.feed.subscribed_wallet_count == 10:
+                        self.feed.stop()
+                    raise TimeoutError()
+
+        feed = SolanaLogsFeed("https://rpc.example.invalid/?api-key=not-real", queue.Queue(), timeout=1)
+        feed.set_subscriptions([f"wallet-{n}" for n in range(10)])
+        ws = FakeWebSocket()
+        ws.feed = feed
+
+        @contextmanager
+        def fake_connect(*args, **kwargs):
+            yield ws
+
+        with patch("solana_logs_feed.connect", fake_connect):
+            feed.run()
+
+        requests = [message for message in ws.sent if message.get("method") == "logsSubscribe"]
+        self.assertEqual(len(requests), 10)
+        self.assertEqual(feed.subscription_acks_received, 10)
+        self.assertEqual(feed.subscription_requests_sent, 10)
+        self.assertEqual(feed.subscription_errors, 0)
+        self.assertEqual(ws.max_in_flight, 1)
 
 
 class ParserTests(unittest.TestCase):
