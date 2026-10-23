@@ -33,7 +33,8 @@ def _int(name: str, default: int) -> int:
 class PumpFunSettings:
     mode: str
     live_confirmation: str
-    watch_wallets: tuple[str, ...]
+    live_entries_approved: bool
+    watch_wallets: tuple[str, ...>
     pumpfun_auth_token: str
     pumpportal_api_key: str
     leaderboard_refresh_seconds: int
@@ -109,6 +110,8 @@ class PumpFunSettings:
         obj = cls(
             mode=mode,
             live_confirmation=os.getenv("LIVE_CONFIRMATION", "").strip(),
+            # Phase 4 is never live-authorized by default; a later approved rollout must opt in.
+            live_entries_approved=os.getenv("LIVE_ENTRIES_APPROVED", "false").strip().lower() in {"1", "true", "yes", "on"},
             watch_wallets=wallets,
             pumpfun_auth_token=(os.getenv("PUMPFUN_AUTH_TOKEN", "").strip() or os.getenv("PUMPFUN_BEARER_TOKEN", "").strip()),
             pumpportal_api_key=os.getenv("PUMPPORTAL_API_KEY", "").strip(),
@@ -195,6 +198,12 @@ class PumpFunSettings:
             raise ValueError("SOLANA_RPC_URL must use HTTPS")
         if self.default_leaderboard_window not in {"overall", "day", "week", "month"}:
             raise ValueError("DEFAULT_LEADERBOARD_WINDOW must be overall, day, week or month")
+        if self.mode == "live" and not self.live_entries_approved and (
+            self.token_discovery_live_enabled or self.trending_discovery_live_enabled
+        ):
+            raise ValueError(
+                "Live discovery switches require LIVE_ENTRIES_APPROVED=true after separate rollout approval"
+            )
         if self.max_entry_usd <= 0 or self.max_total_exposure_usd <= 0:
             raise ValueError("Entry and exposure limits must be positive")
         if self.max_entry_usd > 0.50 or self.max_total_exposure_usd > 1.00:
