@@ -23,10 +23,13 @@ class RiskEngine:
 
     def engage_on_startup(self) -> None:
         """Require an explicit operator resume after every process startup."""
-        self.store.set_entry_kill_switch(
-            True,
-            "Process startup: new entries remain halted until explicitly resumed from the local dashboard.",
-        )
+        previous_active = self.store.get_state("entry_kill_switch_active", "1") != "0"
+        previous_reason = self.store.get_state("entry_kill_switch_reason", "")
+        if previous_active and previous_reason:
+            reason = previous_reason + "; process restarted, so new entries remain halted pending operator review."
+        else:
+            reason = "Process startup: new entries remain halted until explicitly resumed from the local dashboard."
+        self.store.set_entry_kill_switch(True, reason)
         self.store.recover_entry_reservations_on_startup(
             mode=str(getattr(self.settings, "mode", "paper"))
         )
@@ -195,19 +198,28 @@ class RiskEngine:
     def acknowledge_uncertain_reservation(
         self, reservation_id: str, confirmation: str
     ) -> tuple[bool, str]:
-        """Resolve a startup-interrupted reservation after operator chain/balance review."""
-        if confirmation != RECONCILIATION_CONFIRMATION:
-            return False, "The exact reconciliation confirmation phrase was not supplied."
+        """Resolve an interrupted reservation without confusing pre-submit and ambiguous orders."""
         row = self.store.get_entry_reservation(reservation_id)
-        if not row or row.get("status") != "uncertain":
-            return False, "Only an uncertain reservation can be acknowledged here."
+        if not row or row.get("status") not in {"reserved", "submitting", "uncertain"}:
+            return False, "Only an active reservation can be resolved here."
         mint = str(row.get("mint") or "")
         if self.store.get_state(f"unresolved_trade:{mint}", ""):
-            return False, "A recorded unresolved transaction exists for this mint; acknowledge its exact signature instead."
+            return False, "A recorded unresolved transaction exists for this mint; acknowledge its recorded signature instead."
+        if row.get("status") == "reserved":
+            # The lifecycle status proves mark_submitting never succeeded; executor
+            # invocation is not permitted until that state transition commits.
+            self.release_entry(
+                reservation_id,
+                status="released",
+                detail="Operator released an unused pre-submit reservation.",
+            )
+            return True, "Pre-submit reservation released. The global entry gate state is unchanged."
+        if confirmation != RECONCILIATION_CONFIRMATION:
+            return False, "The exact reconciliation confirmation phrase was not supplied."
         self.release_entry(
             reservation_id,
             status="reconciled",
-            detail="Operator acknowledged transaction history and wallet balances.",
+            detail="Operator acknowledged review of transaction history and wallet balances.",
         )
         return True, "Reservation marked reconciled. Entries remain halted until explicitly resumed."
 
