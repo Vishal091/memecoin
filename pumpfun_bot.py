@@ -1887,6 +1887,14 @@ class PumpFunBot:
         if spend < minimum_practical_spend:
             return
 
+        reservation_id, reserve_reason = self.risk_engine.reserve_entry(
+            mint, strategy, spend,
+            exposure_usd=spend + (self.s.paper_swap_cost_usd if self.s.mode == "paper" else 0.05),
+        )
+        if not reservation_id:
+            logger.warning("Reject buy %s: risk reservation denied: %s", str(mint)[:8], reserve_reason)
+            return
+
         decimals = int(signal.get("decimals") or 6)
         total_supply_tokens = float(signal.get("total_supply_tokens") or 0)
         if total_supply_tokens <= 0:
@@ -1900,7 +1908,15 @@ class PumpFunBot:
             cost = self.s.paper_swap_cost_usd
             raw_out = int(spend / observed_price * (10 ** decimals))
             if raw_out <= 0:
+                self.risk_engine.release_entry(
+                    reservation_id, status="failed", detail="Paper output amount rounded to zero."
+                )
                 logger.info("Reject %s: estimated output rounds to zero", mint)
+                return
+            admitted, admission_reason = self.risk_engine.mark_submitting(reservation_id)
+            if not admitted:
+                self.risk_engine.release_entry(reservation_id, status="released", detail=admission_reason)
+                logger.warning("Reject %s: %s", str(mint)[:8], admission_reason)
                 return
             cash = float(self.store.get_state("paper_cash", "0"))
             self.store.set_state("paper_cash", cash - spend - cost)
@@ -1911,6 +1927,11 @@ class PumpFunBot:
             effective_price = spend / raw_to_units(raw_out, decimals)
             used_pool = venue
         else:
+            admitted, admission_reason = self.risk_engine.mark_submitting(reservation_id)
+            if not admitted:
+                self.risk_engine.release_entry(reservation_id, status="released", detail=admission_reason)
+                logger.warning("Reject %s: %s", str(mint)[:8], admission_reason)
+                return
             assert self.keypair is not None and self.wallet_address is not None
             try:
                 result = self.executor.trade(
@@ -1924,6 +1945,10 @@ class PumpFunBot:
                     source_wallet=source_wallet,
                     source_signature=source_signature,
                 )
+                self.risk_engine.release_entry(
+                    reservation_id, status="failed",
+                    detail="Transaction was verified expired and not landed.",
+                )
                 return
             except TransactionOutcomeUncertain as exc:
                 self._handle_uncertain_trade(
@@ -1933,6 +1958,10 @@ class PumpFunBot:
                 )
                 return
             except TransactionBuildFailed as exc:
+                self.risk_engine.release_entry(
+                    reservation_id, status="failed",
+                    detail=f"Transaction was blocked before submission: {str(exc)[:250]}",
+                )
                 # Discovery slippage failures are known pre-submit events. Let the
                 # discovery controller redo fresh checks while the candidate remains
                 # inside its short freshness window; do not turn them into a global halt.
@@ -1950,11 +1979,29 @@ class PumpFunBot:
                     mint[:8], " ".join(str(exc).split())[:220], delay,
                 )
                 return
+            except Exception as exc:
+                self._handle_uncertain_trade(
+                    TransactionOutcomeUncertain(
+                        "signature-unavailable", "buy", mint,
+                        f"Unclassified executor exception after submission boundary ({type(exc).__name__}); reconcile before retry.",
+                    ),
+                    source_wallet=source_wallet,
+                    source_signature=source_signature,
+                )
+                return
             tx_sig = result["signature"]
             used_pool = result["pool"]
             raw_out = int(result["total_output_amount"])
             if raw_out <= 0:
-                raise RuntimeError("PumpPortal confirmed a buy without a positive token balance delta")
+                self._handle_uncertain_trade(
+                    TransactionOutcomeUncertain(
+                        str(tx_sig), "buy", mint,
+                        "Executor returned a successful buy without positive token output.",
+                    ),
+                    source_wallet=source_wallet,
+                    source_signature=source_signature,
+                )
+                return
             # Wallet SOL delta includes swap input plus network/priority fees and
             # account rent. Keep that all-in amount in P&L basis, but never treat
             # fixed overhead as token price movement for the stop thresholds.
@@ -1978,19 +2025,33 @@ class PumpFunBot:
                 if total_supply_tokens > 0 else ""
             ),
         }
-        self.store.upsert_position(position)
-        self.store.set_state(f"pool:{mint}", used_pool)
-        self.store.increment_daily_entries()
-        trade_reason = (
-            f"independent token discovery {used_pool} buy"
-            if strategy == "token_discovery"
-            else f"copied Pump.fun {used_pool} buy"
-        )
-        self.store.add_trade(
-            mode=self.s.mode, action="BUY", mint=mint, amount_raw=str(raw_out),
-            price_usd=effective_price, value_usd=cost_basis, reason=trade_reason,
-            source_wallet=source_wallet, source_signature=source_signature,
-            tx_signature=tx_sig, strategy=strategy,
+        try:
+            self.store.upsert_position(position)
+            self.store.set_state(f"pool:{mint}", used_pool)
+            self.store.increment_daily_entries()
+            trade_reason = (
+                f"independent token discovery {used_pool} buy"
+                if strategy == "token_discovery"
+                else f"copied Pump.fun {used_pool} buy"
+            )
+            self.store.add_trade(
+                mode=self.s.mode, action="BUY", mint=mint, amount_raw=str(raw_out),
+                price_usd=effective_price, value_usd=cost_basis, reason=trade_reason,
+                source_wallet=source_wallet, source_signature=source_signature,
+                tx_signature=tx_sig, strategy=strategy,
+            )
+        except Exception as exc:
+            self._handle_uncertain_trade(
+                TransactionOutcomeUncertain(
+                    str(tx_sig), "buy", mint,
+                    f"Buy fill exists but local position/trade persistence failed ({type(exc).__name__}).",
+                ),
+                source_wallet=source_wallet,
+                source_signature=source_signature,
+            )
+            return
+        self.risk_engine.release_entry(
+            reservation_id, status="completed", detail="Buy fill and ledger record completed."
         )
         # Do not overwrite a fresher trade tick that arrived while the swap was
         # being built/submitted. Otherwise seed the mark from the actual swap fill.
