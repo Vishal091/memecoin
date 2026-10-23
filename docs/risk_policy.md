@@ -6,6 +6,10 @@ The loader enforces a conservative experiment ceiling: maximum $0.50 swap input,
 
 These are operational caps, not evidence of a profitable strategy. Swap input is not identical to total wallet debit: network fees, provider/protocol fees, priority fees and token-account rent can increase the debit.
 
+## Separate live-entry approval
+
+`LIVE_ENTRIES_APPROVED=false` is the example/default setting in this Phase 4 branch. In `BOT_MODE=live`, the risk engine refuses entry admission and refuses the dashboard resume action unless this separate flag is enabled. This is deliberately independent of the operator kill switch and the scanners' live opt-ins. Do not set it to true as part of routine Phase 4 testing; any later enablement requires a separate rollout decision, review of current CI, and a provider-backed execution/reconciliation smoke test. Paper mode remains available for the next validation stage.
+
 ## Global entry kill switch
 
 - A new process starts with new entries halted.
