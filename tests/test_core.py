@@ -26,6 +26,34 @@ from storage import Store
 from token_discovery import TokenDiscoveryShadow, _safe_exception_message
 
 
+class _FakeRiskEngine:
+    """Permissive unit-test seam; production bots always construct the real RiskEngine."""
+    def __init__(self):
+        self.last_reason = ""
+
+    def gate_reason(self):
+        return ""
+
+    def activate_kill_switch(self, reason):
+        self.last_reason = str(reason)
+
+    def mark_uncertain(self, mint, reason):
+        self.last_reason = str(reason)
+
+    def reserve_entry(self, mint, strategy, amount_usd, *, exposure_usd=None):
+        if amount_usd <= 0:
+            return None, "invalid test amount"
+        return "test-reservation-" + str(mint), ""
+
+    def mark_submitting(self, reservation_id):
+        return True, ""
+
+    def release_entry(self, reservation_id, *, status="released", detail=""):
+        return None
+
+    def snapshot(self):
+        return {"kill_switch_active": False, "active_reservations": [], "unresolved_trades": []}
+
 
 class NativeSimulationFailureTests(unittest.TestCase):
     class FakeTransaction:
@@ -82,6 +110,7 @@ class LossStreakCircuitBreakerTests(unittest.TestCase):
         bot = object.__new__(PumpFunBot)
         bot.store = self.FakeStore(state)
         bot.s = SimpleNamespace(max_consecutive_losses=3)
+        bot.risk_engine = _FakeRiskEngine()
         return bot
 
     def test_three_losing_exits_pause_new_entries_for_utc_day(self):
@@ -923,9 +952,11 @@ class EntryDrawdownCircuitBreakerTests(unittest.TestCase):
             trending_discovery_max_entry_usd=0.50,
             daily_loss_limit_usd=0.50,
             total_loss_limit_usd=1.00,
+            max_portfolio_drawdown_pct=0.15,
             mode="paper",
             paper_swap_cost_usd=0.02,
         )
+        bot.risk_engine = _FakeRiskEngine()
         bot._current_positions_value = lambda: 0.0
         bot.store.set_state("paper_cash", "10")
         return bot
@@ -1131,6 +1162,7 @@ class CopySafetyGateTests(unittest.TestCase):
     def _bot(self, state=None, positions=None):
         bot = object.__new__(PumpFunBot)
         bot.store = self.FakeStore(state, positions)
+        bot.risk_engine = _FakeRiskEngine()
         bot.s = SimpleNamespace(
             watch_wallets=(),
             top_traders_count=10,
@@ -1720,6 +1752,7 @@ class TransactionOutcomeHandlingTests(unittest.TestCase):
     def _bot(self):
         bot = object.__new__(PumpFunBot)
         bot.store = self.FakeStore()
+        bot.risk_engine = _FakeRiskEngine()
         bot.s = SimpleNamespace(
             watch_wallets=(),
             top_traders_count=10,
