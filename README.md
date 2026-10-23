@@ -183,3 +183,15 @@ The enforced experiment ceilings are maximum $0.50 swap input, $1.00 total track
 An uncertain submitted transaction blocks new entries and remains visible in the dashboard. Before acknowledging reconciliation, independently inspect transaction history and actual wallet token/SOL balances. The dashboard phrase is an operator attestation only; the software does not infer that on-chain reconciliation has occurred. Acknowledgement does not automatically resume entries, and existing position management/exits continue while entry admission is halted. See [docs/risk_policy.md](docs/risk_policy.md).
 
 This work is not an authorization for live trading or deployment. Keep live discovery opt-ins disabled and validate tests, CI and a controlled end-to-end execution/reconciliation path before any separate production approval.
+
+## Phase 5: paper/shadow evaluation
+
+Phase 5 adds persistent minute/status-coalesced observations for token-discovery and trending candidates plus a read-only evaluator. Use a separate paper database and keep `BOT_MODE=paper`, `LIVE_ENTRIES_APPROVED=false`, `TOKEN_DISCOVERY_LIVE_ENABLED=false`, and `TRENDING_DISCOVERY_LIVE_ENABLED=false`. Read the full [Phase 5 trial protocol](docs/phase5_paper_shadow.md).
+
+Run the bot locally in paper mode to collect real observations, then evaluate without changing the database:
+
+```powershell
+python shadow_evaluation.py --db memecoin-phase5-paper.db --json-out reports/phase5-shadow-report.json --csv-out reports/phase5-shadow-trades.csv
+```
+
+The evaluator uses first qualifying entries chronologically, measures 1/5/15-minute returns, reports adverse excursion and cost-sensitivity scenarios, and separates paper-ledger P&L from shadow marks. It reports insufficient data honestly; review readiness is not live-trading authorization. Initial review targets are at least 30 elapsed days and 100 evaluable 15-minute samples per strategy. No live orders are submitted by the evaluator.
