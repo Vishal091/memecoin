@@ -50,6 +50,17 @@ class RiskEngineTests(unittest.TestCase):
         self.assertIn("reservation", reason.lower())
         self.assertEqual(self.store.get_entry_reservation(first)["status"], "reserved")
 
+    def test_reservation_can_pass_its_own_submission_boundary(self):
+        self.assertTrue(self.risk.resume_entries()[0])
+        reservation, reason = self.risk.reserve_entry("MintA", "leader_copy", 0.40)
+        self.assertIsNotNone(reservation, reason)
+
+        admitted, reason = self.risk.mark_submitting(reservation)
+        self.assertTrue(admitted, reason)
+        self.assertEqual(self.store.get_entry_reservation(reservation)["status"], "submitting")
+
+        self.risk.release_entry(reservation, status="released", detail="Test cleanup")
+
     def test_switch_is_rechecked_at_submission_boundary(self):
         self.assertTrue(self.risk.resume_entries()[0])
         reservation, reason = self.risk.reserve_entry("MintA", "leader_copy", 0.40)
