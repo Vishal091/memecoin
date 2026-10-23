@@ -40,6 +40,7 @@ from storage import Store
 from token_discovery import TokenDiscoveryShadow
 from trending_scanner import TrendingTokenScanner
 from jupiter_ultra import JupiterUltraExecutor
+from risk_engine import RiskEngine
 
 logger = logging.getLogger("pumpfun")
 
@@ -140,6 +141,8 @@ class PumpFunBot:
         if not db_path.is_absolute():
             db_path = Path(__file__).resolve().parent / db_path
         self.store = Store(db_path, self.s.starting_paper_cash_usd, mode=self.s.mode)
+        self.risk_engine = RiskEngine(self.store, self.s)
+        self.risk_engine.engage_on_startup()
         self.rpc = SolanaRPC(self.s.rpc_url, self.s.request_timeout_seconds)
         # Aggressive launchpad filters; still require a tracked market pair for price marks.
         self.market = MarketData(self.s.request_timeout_seconds, self.s.min_liquidity_usd, self.s.min_pair_age_seconds)
@@ -263,7 +266,7 @@ class PumpFunBot:
             }), default=str))
 
     def _activate_manual_review_halt(self, reason: str, *, append_reason: bool = False) -> None:
-        """Record an operational warning; automatic global entry halts are disabled."""
+        """Persist the diagnosis and engage the independent global entry gate."""
         incoming = " ".join(str(reason or "").split()).strip()
         existing = self.store.get_state("manual_review_reason", "").strip()
         if existing and incoming and incoming not in existing and append_reason:
@@ -272,11 +275,12 @@ class PumpFunBot:
             # Preserve the first diagnosis unless an explicitly appended transaction
             # outcome provides additional detail.
             combined = existing or incoming
-        # Keep the reason for diagnosis, but never latch a global trading halt.
+        # Preserve the old state marker for compatibility; enforce a separate entry gate.
         self.store.set_state("manual_review_halt", "0")
         self.store.set_state("manual_review_reason", combined)
         if incoming:
-            logger.error("Operational warning (automatic global halts disabled): %s", incoming[:500])
+            self.risk_engine.activate_kill_switch(incoming)
+            logger.error("Global entry kill switch engaged: %s", incoming[:500])
 
     def _loss_streak_pause_reason(self) -> str:
         """Persist a same-UTC-day entry pause after the configured consecutive-loss threshold."""
@@ -314,7 +318,10 @@ class PumpFunBot:
             self.store.set_state("consecutive_loss_warning_day", "")
 
     def _copy_block_reason(self) -> str:
-        """Report persisted entry circuit breakers to dashboard/feed logic."""
+        """Report the global entry gate and persisted circuit breakers."""
+        gate_reason = self.risk_engine.gate_reason()
+        if gate_reason:
+            return gate_reason
         if self.store.get_state("daily_paused", "0") == "1":
             return "Daily-loss circuit breaker is active; new entries resume after the next UTC day"
         return self._loss_streak_pause_reason()
@@ -487,6 +494,7 @@ class PumpFunBot:
             "trades": trades,
             "token_discovery": token_discovery_state,
             "trending_discovery": self.trending_scanner.dashboard_snapshot(),
+            "risk_control": self.risk_engine.snapshot(),
             "feed_connected": bool(self.feed and self.feed.connected.is_set()),
             "feed_error": self.feed.last_error if self.feed else "",
             "feed_stats": ({
@@ -588,6 +596,35 @@ class PumpFunBot:
             except queue.Empty:
                 break
             action = command.get("action")
+            if action == "set_entry_kill_switch":
+                requested = command.get("enabled")
+                if not isinstance(requested, bool):
+                    self.message = "Invalid entry-gate toggle; expected true or false."
+                    continue
+                if requested:
+                    self.risk_engine.activate_kill_switch("Operator engaged the global entry kill switch from the dashboard.")
+                    self.message = "Global entry kill switch engaged. Existing positions remain managed."
+                else:
+                    ok, detail = self.risk_engine.resume_entries()
+                    self.message = detail if ok else "Entries remain halted: " + detail
+                self._refresh_feed_subscriptions()
+                logger.warning("%s", self.message)
+                continue
+            if action == "acknowledge_reconciled_trade":
+                ok, detail = self.risk_engine.acknowledge_reconciled_trade(
+                    str(command.get("mint") or ""), str(command.get("signature") or ""),
+                    str(command.get("confirmation") or ""),
+                )
+                self.message = detail
+                logger.warning("Reconciliation acknowledgement: %s", detail)
+                continue
+            if action == "acknowledge_risk_reservation":
+                ok, detail = self.risk_engine.acknowledge_uncertain_reservation(
+                    str(command.get("reservation_id") or ""), str(command.get("confirmation") or ""),
+                )
+                self.message = detail
+                logger.warning("Reservation reconciliation acknowledgement: %s", detail)
+                continue
             discovery_actions = {
                 "set_token_discovery_enabled", "set_token_discovery_live_enabled",
                 "set_trending_discovery_enabled", "set_trending_discovery_live_enabled",
@@ -1184,6 +1221,23 @@ class PumpFunBot:
                     "Existing positions remain managed; no automatic mass liquidation is performed.",
                     total_loss,
                 )
+        # Independent persistent peak-to-trough equity circuit breaker.
+        try:
+            peak_equity = float(self.store.get_state("equity_high_watermark", str(max(0.0, equity))))
+        except (TypeError, ValueError, OverflowError):
+            peak_equity = max(0.0, equity)
+        if equity > peak_equity:
+            peak_equity = equity
+            self.store.set_state("equity_high_watermark", peak_equity)
+        elif not self.store.get_state("equity_high_watermark", ""):
+            self.store.set_state("equity_high_watermark", peak_equity)
+        if peak_equity > 0:
+            peak_drawdown_pct = max(0.0, (peak_equity - equity) / peak_equity)
+            if peak_drawdown_pct >= float(self.s.max_portfolio_drawdown_pct):
+                self.risk_engine.activate_kill_switch(
+                    "Portfolio peak-to-trough drawdown reached configured "
+                    f"{self.s.max_portfolio_drawdown_pct:.1%} ceiling (observed {peak_drawdown_pct:.1%})."
+                )
         daily_start = float(self.store.get_state("day_start_equity", str(equity)))
         daily_loss = max(0.0, daily_start - equity)
         if daily_loss >= self.s.daily_loss_limit_usd:
@@ -1200,6 +1254,9 @@ class PumpFunBot:
         self, equity: float, *, strategy: str = "leader_copy",
         entry_cap_usd: float | None = None,
     ) -> tuple[bool, str]:
+        gate_reason = self.risk_engine.gate_reason()
+        if gate_reason:
+            return False, gate_reason
         if strategy not in {"token_discovery", "trending_discovery"} and self.store.get_state("copy_paused", "0") == "1":
             return False, "Copying is paused from the dashboard"
         if self.store.daily_entries() >= self.s.max_entries_per_day:
@@ -1361,6 +1418,10 @@ class PumpFunBot:
         self.store.set_state(
             f"unresolved_trade:{exc.mint}",
             json.dumps(record, sort_keys=True, separators=(",", ":")),
+        )
+        self.risk_engine.mark_uncertain(
+            exc.mint,
+            f"{exc.action.upper()} outcome unresolved for mint {exc.mint}; signature {exc.signature}.",
         )
         self._activate_manual_review_halt(
             f"{exc.action.upper()} outcome unresolved for mint {exc.mint}; "
