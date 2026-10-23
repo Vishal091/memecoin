@@ -197,9 +197,12 @@ class TokenDiscoveryShadow:
                     payload=candidate,
                 )
             except Exception as exc:
-                self.stats["shadow_observation_errors"] += 1
+                stats = getattr(self, "stats", None)
+                if isinstance(stats, dict):
+                    stats["shadow_observation_errors"] = int(stats.get("shadow_observation_errors", 0)) + 1
                 now = float(candidate["last_updated_at"])
-                if now - self._last_shadow_observation_error_at >= 60:
+                last_logged = float(getattr(self, "_last_shadow_observation_error_at", 0.0) or 0.0)
+                if now - last_logged >= 60:
                     logger.warning(
                         "Could not persist token-discovery shadow observation (%s)",
                         type(exc).__name__,
