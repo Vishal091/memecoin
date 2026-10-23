@@ -599,9 +599,51 @@ class Store:
                 return None
             return number if math.isfinite(number) else None
 
-        safe_payload = payload if isinstance(payload, dict) else {}
+        source_payload = payload if isinstance(payload, dict) else {}
+        if strategy_value == "token_discovery":
+            allow = {
+                "mint", "name", "symbol", "created_at", "last_updated_at", "status", "reason",
+                "security_passed", "security_checks", "real_liquidity_usd", "price_usd",
+                "total_supply_tokens", "score", "score_components", "unique_buyers",
+                "buy_trades", "sell_trades", "buy_volume_sol", "sell_volume_sol",
+                "shadow_entry_price_usd", "shadow_entry_at", "shadow_exit_price_usd",
+                "shadow_exit_at", "current_return_pct", "max_return_pct", "min_return_pct",
+                "return_1m_pct", "return_5m_pct", "return_15m_pct", "shadow_return_pct",
+                "market_cap_usd", "market_cap_source", "shadow_mark_source", "shadow_eligible",
+                "entry_market_cap_usd", "entry_market_cap_source",
+            }
+        elif strategy_value == "trending_discovery":
+            allow = {
+                "mint", "name", "symbol", "status", "price_usd", "shadow_eligible",
+                "momentum_score", "liquidity_usd", "volume_1h_usd", "volume_24h_usd",
+                "change_5m_pct", "change_1h_pct", "change_6h_pct", "change_24h_pct",
+                "same_pool_crosscheck", "dexscreener_confirmed", "market_price_source",
+                "market_data_sources", "market_data_discrepancy", "risk_flags",
+                "onchain_status", "rugcheck_status", "updated_at", "decision",
+                "pool_address", "pool_created_at", "dexscreener_pair_address",
+            }
+        else:
+            allow = {"mint", "status", "price_usd", "shadow_eligible", "score", "reason"}
+        safe_payload = {key: source_payload[key] for key in allow if key in source_payload}
+
+        def json_safe(value):
+            import math
+            if value is None or isinstance(value, (str, bool, int)):
+                return value[:500] if isinstance(value, str) else value
+            if isinstance(value, float):
+                return value if math.isfinite(value) else None
+            if isinstance(value, list):
+                return [json_safe(item) for item in value[:20]]
+            if isinstance(value, dict):
+                return {
+                    str(key)[:80]: json_safe(item)
+                    for key, item in list(value.items())[:40]
+                }
+            return str(value)[:300]
+
         payload_json = json.dumps(
-            safe_payload, sort_keys=True, separators=(",", ":"), default=str
+            json_safe(safe_payload), sort_keys=True, separators=(",", ":"),
+            default=str, allow_nan=False,
         )
         minute = int(timestamp // 60)
         with self.db:
@@ -630,6 +672,29 @@ class Store:
                     payload_json,
                 ),
             )
+            # Bound retention so a long-running observation trial cannot grow
+            # the local database without limit. Keep up to 500k newest rows.
+            wallclock_hour = int(datetime.now(timezone.utc).timestamp() // 3600)
+            prune_key = "shadow_observations_prune_hour"
+            prune_row = self.db.execute(
+                "SELECT value FROM state WHERE key=?", (prune_key,)
+            ).fetchone()
+            if not prune_row or str(prune_row["value"]) != str(wallclock_hour):
+                total_rows = int(self.db.execute(
+                    "SELECT COUNT(*) FROM shadow_observations"
+                ).fetchone()[0])
+                excess = max(0, total_rows - 500000)
+                if excess:
+                    self.db.execute(
+                        "DELETE FROM shadow_observations WHERE id IN ("
+                        "SELECT id FROM shadow_observations ORDER BY observed_at ASC, id ASC LIMIT ?)",
+                        (excess,),
+                    )
+                self.db.execute(
+                    "INSERT INTO state(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (prune_key, str(wallclock_hour)),
+                )
 
     def list_shadow_observations(
         self,
