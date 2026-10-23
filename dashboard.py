@@ -120,6 +120,7 @@ function render(d){
     " · max input $"+num(rc.max_entry_usd||0.50)+" · max total exposure $"+num(rc.max_total_exposure_usd||1.00)+
     " · open positions "+(rc.max_open_positions||1)+" · entries/day "+(rc.max_entries_per_day||4)+
     " · drawdown ceiling "+(100*Number(rc.max_portfolio_drawdown_pct||0.15)).toFixed(1)+"%"+
+    " · mode "+String(rc.mode||"unknown").toUpperCase()+" · live approval "+(rc.live_entries_approved?"ON":"OFF (separate approval required)")+
     " · active reservations "+(rc.active_reservation_count||0)+" · unresolved "+(rc.unresolved_trade_count||0);
   el("entryGateToggle").onclick=function(){
     if(rc.kill_switch_active){
