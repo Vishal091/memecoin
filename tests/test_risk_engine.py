@@ -105,6 +105,25 @@ class RiskEngineTests(unittest.TestCase):
         self.assertTrue(self.risk.kill_switch_active())
         self.assertTrue(self.risk.resume_entries()[0])
 
+    def test_unused_pre_submit_reservation_can_be_released_without_chain_ack(self):
+        self.assertTrue(self.risk.resume_entries()[0])
+        reservation, reason = self.risk.reserve_entry("MintUnused", "leader_copy", 0.25)
+        self.assertIsNotNone(reservation, reason)
+
+        ok, detail = self.risk.acknowledge_uncertain_reservation(reservation, "")
+        self.assertTrue(ok, detail)
+        self.assertEqual(self.store.get_entry_reservation(reservation)["status"], "released")
+        self.assertFalse(self.risk.kill_switch_active())
+        another, reason = self.risk.reserve_entry("MintNext", "leader_copy", 0.25)
+        self.assertIsNotNone(another, reason)
+
+    def test_startup_preserves_existing_kill_switch_reason(self):
+        self.risk.activate_kill_switch("Drawdown ceiling reached")
+        self.risk.engage_on_startup()
+        self.assertTrue(self.risk.kill_switch_active())
+        self.assertIn("Drawdown ceiling reached", self.risk.kill_switch_reason())
+        self.assertIn("process restarted", self.risk.kill_switch_reason())
+
     def test_store_reservation_transaction_enforces_exposure_atomically(self):
         self.assertTrue(self.risk.resume_entries()[0])
         first = self.store.try_reserve_entry_atomic(
