@@ -21,7 +21,7 @@ from solders.pubkey import Pubkey
 
 from dashboard import DashboardServer
 from leaderboard import LeaderboardError, PumpFunLeaderboard
-from market_data import MarketData
+from market_data import MarketData, WSOL_MINT
 from pumpfun_config import PumpFunSettings
 from pumpportal_feed import PumpPortalAccountFeed
 from solana_logs_feed import SolanaLogsFeed
@@ -60,13 +60,12 @@ def loss_exit_hold_remaining_seconds(
     """Seconds remaining in the minimum holding period for a loss-making exit."""
     entry_price = float(position.get("entry_price_usd") or 0)
     normalized_reason = str(reason or "").strip().lower()
-    # A triggered algorithmic stop must attempt an exit immediately. Deferring it
-    # for the minimum-hold grace period can turn a defined stop into a much larger
-    # loss during a fast dump. Leader-triggered sells still use the grace period
-    # unless there is a portfolio emergency or explicit human exit.
+    # Risk stops and leader-triggered sells must attempt an exit immediately.
+    # A hold grace after the followed wallet sells can leave this bot exposed
+    # while the leader is already out, amplifying divergence during fast dumps.
     if normalized_reason.startswith((
         "total loss limit", "experiment expiry", "manual exit",
-        "marked loss stop", "trailing stop",
+        "marked loss stop", "trailing stop", "followed wallet ",
     )):
         return 0.0
     if entry_price <= 0 or mark_price <= 0 or mark_price >= entry_price:
@@ -196,6 +195,11 @@ class PumpFunBot:
         self.price_cache_at = {}
         self.market_price_cache = {}
         self.market_price_cache_at = {}
+        self.curve_price_cache = {}
+        self.curve_price_cache_at = {}
+        self.curve_mark_checked_at = {}
+        self.curve_completed_cache = set()
+        self.curve_unpriced_cache = set()
         self._market_cap_supply_retry_at = {}
         self.state_lock = threading.RLock()
         self.commands = queue.Queue()
@@ -516,12 +520,17 @@ class PumpFunBot:
                 "last_notification_at": self.logs_feed.last_notification_at,
                 "last_signature": self.logs_feed.last_signature,
                 "subscription_errors": self.logs_feed.subscription_errors,
+                "subscription_requests_sent": self.logs_feed.subscription_requests_sent,
+                "subscription_acks_received": self.logs_feed.subscription_acks_received,
+                "pending_wallet_count": self.logs_feed.pending_wallet_count,
                 "error": self.logs_feed.last_error,
             } if self.logs_feed else {
                 "enabled": False, "connected": False, "subscribed_wallet_count": 0,
                 "messages_received": 0, "notifications_received": 0,
                 "last_message_at": 0, "last_notification_at": 0,
                 "last_signature": "", "subscription_errors": 0,
+                "subscription_requests_sent": 0, "subscription_acks_received": 0,
+                "pending_wallet_count": 0,
                 "error": "Disabled by SOLANA_LOGS_WS_ENABLED",
             }),
             "signal_stats": dict(self.signal_stats),
@@ -1046,13 +1055,75 @@ class PumpFunBot:
         if feed_price > 0 and feed_age <= 10:
             return feed_price
 
+        # Pump bonding curves are directly observable on-chain before DEX indexers
+        # list the token. Prefer a canonical curve quote for those positions; otherwise
+        # the stop manager can keep using the stale entry mark until indexing catches up.
+        try:
+            preferred_pool = self.store.get_state(f"pool:{mint}", "pump")
+        except Exception:
+            preferred_pool = "pump"
+        curve_price = 0.0
+        if preferred_pool == "pump":
+            curve_price = float(getattr(self, "curve_price_cache", {}).get(mint, 0) or 0)
+            curve_age = now - float(getattr(self, "curve_price_cache_at", {}).get(mint, 0) or 0)
+            if curve_price > 0 and 0 <= curve_age <= 1.0:
+                return curve_price
+
+            # Do not hammer RPC on every dashboard refresh if a curve is migrated,
+            # unsupported, or temporarily unavailable. Completed curves stay completed.
+            completed_cache = getattr(self, "curve_completed_cache", set())
+            unpriced_cache = getattr(self, "curve_unpriced_cache", set())
+            checked_cache = getattr(self, "curve_mark_checked_at", {})
+            last_checked = float(checked_cache.get(mint, 0) or 0)
+            should_read_curve = (
+                mint not in completed_cache
+                and mint not in unpriced_cache
+                and now - last_checked >= 1.0
+            )
+            if should_read_curve:
+                if not hasattr(self, "curve_mark_checked_at"):
+                    self.curve_mark_checked_at = {}
+                self.curve_mark_checked_at[mint] = now
+                try:
+                    curve = fetch_pump_curve(
+                        self.rpc, mint,
+                        timeout=min(2.0, float(getattr(self.s, "request_timeout_seconds", 2))),
+                    )
+                    if curve is not None and curve.complete:
+                        completed_cache.add(mint)
+                        curve_price = 0.0
+                        getattr(self, "curve_price_cache", {}).pop(mint, None)
+                        getattr(self, "curve_price_cache_at", {}).pop(mint, None)
+                    elif curve is not None and curve.quote_mint and curve.quote_mint != WSOL_MINT:
+                        # This bot's curve pricing only supports SOL-quoted curves.
+                        unpriced_cache.add(mint)
+                        curve_price = 0.0
+                    elif curve is not None:
+                        position = self.store.get_position(mint) or {}
+                        decimals = int(position.get("decimals") or 6)
+                        sol_price = self.market.sol_price_usd(
+                            timeout=min(2.0, float(getattr(self.s, "request_timeout_seconds", 2)))
+                        )
+                        candidate = float(curve.price_usd(sol_price, decimals=decimals) or 0)
+                        if candidate > 0:
+                            if not hasattr(self, "curve_price_cache"):
+                                self.curve_price_cache = {}
+                                self.curve_price_cache_at = {}
+                            self.curve_price_cache[mint] = candidate
+                            self.curve_price_cache_at[mint] = time.time()
+                            return candidate
+                except Exception as exc:
+                    logger.debug("On-chain Pump curve mark unavailable for %s (%s)", mint[:8], type(exc).__name__)
+
         market_price = float(self.market_price_cache.get(mint, 0) or 0)
         market_age = now - float(self.market_price_cache_at.get(mint, 0) or 0)
-        if market_price > 0 and market_age <= 3:
+        if market_price > 0 and 0 <= market_age <= 3:
             return market_price
 
         try:
-            market = self.market.token_market(mint)
+            market = self.market.token_market(
+                mint, timeout=min(2.0, float(getattr(self.s, "request_timeout_seconds", 2)))
+            )
             candidate = float((market or {}).get("price_usd") or 0)
             if candidate > 0:
                 self.market_price_cache[mint] = candidate
@@ -1064,6 +1135,8 @@ class PumpFunBot:
         # When a coin is not indexed by a market-data provider, this falls back to
         # the last observed trade or prior mark; the dashboard still exposes the mark
         # as an estimate rather than a guaranteed executable exit price.
+        if curve_price > 0:
+            return curve_price
         if feed_price > 0:
             return feed_price
         if market_price > 0:
@@ -1848,21 +1921,6 @@ class PumpFunBot:
             if manual_exit:
                 self.message = f"Manual exit for {mint[:8]} stopped: no tracked open position remains."
             return False
-        if self._native_build_retry_deferred(mint):
-            if manual_exit:
-                try:
-                    retry_at = float(self.store.get_state(f"native_build_retry_after:{mint}", "0") or 0)
-                except (TypeError, ValueError):
-                    retry_at = time.time()
-                remaining = max(0, int(retry_at - time.time()))
-                last_failure = str(self.store.get_state(f"native_build_failure:{mint}", "") or "")
-                detail = f" Last builder error: {last_failure[:180]}" if last_failure else ""
-                self.message = (
-                    f"Manual exit for {mint[:8]} remains pending; retry cooldown {remaining}s, "
-                    f"no transaction submitted.{detail}"
-                )
-            logger.debug("Sell builder for mint=%s is in pre-submission cooldown", mint[:8])
-            return False
         full_exit = (was_pending_exit or manual_exit or
                      reason in {"marked loss stop", "trailing stop"} or
                      reason.startswith("followed wallet ") or reason.startswith("experiment expiry") or
@@ -1886,22 +1944,56 @@ class PumpFunBot:
         if requested_raw <= 0:
             return False
         if full_exit:
-            # Preserve partial leader sells if the exit must wait for the grace period.
+            # Persist the desired amount before any cooldown or other retry guard so
+            # a leader sell cannot be consumed and forgotten before submission.
             self.store.set_state(pending_amount_key, str(requested_raw))
-        decimals = int(position["decimals"])
-        market = self.market.token_market(mint)
-        mark_price = float(market["price_usd"]) if market else float(position["last_price_usd"])
-        if mark_price <= 0 and manual_exit:
-            # A manual live exit does not need a live quote to submit a sell: the
-            # confirmed SOL proceeds determine realized P&L. Use the best stored
-            # price only for bookkeeping if the market-data quote is unavailable.
-            try:
-                mark_price = max(
-                    0.0,
-                    float(position.get("last_price_usd") or position.get("entry_price_usd") or 0.0),
+        if self._native_build_retry_deferred(mint):
+            if manual_exit:
+                try:
+                    retry_at = float(self.store.get_state(f"native_build_retry_after:{mint}", "0") or 0)
+                except (TypeError, ValueError):
+                    retry_at = time.time()
+                remaining = max(0, int(retry_at - time.time()))
+                last_failure = str(self.store.get_state(f"native_build_failure:{mint}", "") or "")
+                detail = f" Last builder error: {last_failure[:180]}" if last_failure else ""
+                self.message = (
+                    f"Manual exit for {mint[:8]} remains pending; retry cooldown {remaining}s, "
+                    f"no transaction submitted.{detail}"
                 )
-            except (TypeError, ValueError):
-                mark_price = 0.0
+            logger.debug("Sell builder for mint=%s is in pre-submission cooldown; pending exit retained", mint[:8])
+            return False
+        decimals = int(position["decimals"])
+        # A sell must not wait on a fresh DexScreener HTTP request. For live exits,
+        # confirmed SOL proceeds determine realized P&L; this mark is only a fallback
+        # for stop bookkeeping and the dashboard. Prefer a fresh trade tick, then a
+        # recent market cache, then the last persisted mark/entry price.
+        mark_now = time.time()
+        price_cache = getattr(self, "price_cache", {})
+        price_cache_at = getattr(self, "price_cache_at", {})
+        market_price_cache = getattr(self, "market_price_cache", {})
+        market_price_cache_at = getattr(self, "market_price_cache_at", {})
+        try:
+            feed_price = float(price_cache.get(mint, 0) or 0)
+            feed_age = mark_now - float(price_cache_at.get(mint, 0) or 0)
+            cached_market_price = float(market_price_cache.get(mint, 0) or 0)
+            cached_market_age = mark_now - float(market_price_cache_at.get(mint, 0) or 0)
+            stored_price = max(
+                0.0,
+                float(position.get("last_price_usd") or position.get("entry_price_usd") or 0.0),
+            )
+        except (TypeError, ValueError, OverflowError):
+            feed_price, feed_age, cached_market_price, cached_market_age = 0.0, float("inf"), 0.0, float("inf")
+            stored_price = 0.0
+        if feed_price > 0 and 0 <= feed_age <= 10:
+            mark_price = feed_price
+        elif cached_market_price > 0 and 0 <= cached_market_age <= 3:
+            mark_price = cached_market_price
+        else:
+            mark_price = stored_price
+        if mark_price <= 0 and manual_exit:
+            # Live execution does not require a market quote; a stored entry mark is
+            # only for bookkeeping. Never invent proceeds from this fallback.
+            mark_price = max(0.0, stored_price)
         if mark_price <= 0:
             if manual_exit:
                 self.message = (
@@ -2914,18 +3006,29 @@ class PumpFunBot:
         if not cursor_found and cursor != latest and len(sigs) >= 1000:
             logger.error("More than 1000 signatures may have arrived for %s between polls; oldest missed signals cannot be recovered by this pass", wallet)
 
-        # Bound RPC bursts. Process new signatures oldest-to-newest and advance the
-        # cursor only through successfully inspected rows, so a 429 never skips newer trades.
+        # Do not let old signatures consume the fresh-signal budget. Known-stale
+        # activity is intentionally ignored and advanced in the cursor; recent signals
+        # are inspected oldest-to-newest so a prolonged feed outage cannot starve current
+        # trades behind hundreds of obsolete signatures.
+        try:
+            max_signal_age = max(
+                5,
+                min(300, int(__import__("os").getenv("MAX_COPY_SIGNAL_AGE_SECONDS", "30"))),
+            )
+        except (TypeError, ValueError):
+            max_signal_age = 30
         try:
             max_per_poll = max(1, min(50, int(__import__("os").getenv("SOLANA_MAX_SIGNATURES_PER_WALLET_POLL", "8"))))
         except ValueError:
             max_per_poll = 8
+
         chronological = list(reversed(new_rows))
-        batch = chronological[:max_per_poll]
         cursor_candidate = cursor
         handled = 0
+        fresh_attempts = 0
         rate_limited = False
-        for row in batch:
+        stopped_before_end = False
+        for row in chronological:
             signature = row.get("signature")
             if not signature:
                 continue
@@ -2933,50 +3036,77 @@ class PumpFunBot:
             if self.store.signature_seen(dedupe_key):
                 cursor_candidate = signature
                 continue
-            # Never replay an old leader trade after an RPC outage. A stale
-            # signature is marked consumed and advances the cursor, but no buy/sell
-            # is generated from it. Unknown timestamps are skipped rather than guessed fresh.
-            try:
-                max_signal_age = max(
-                    5,
-                    min(300, int(__import__("os").getenv("MAX_COPY_SIGNAL_AGE_SECONDS", "30"))),
-                )
-            except (TypeError, ValueError):
-                max_signal_age = 30
+
             block_time = row.get("blockTime")
-            try:
-                signal_age = time.time() - float(block_time) if block_time is not None else float("inf")
-            except (TypeError, ValueError, OverflowError):
-                signal_age = float("inf")
-            if signal_age < 0 or signal_age > max_signal_age:
-                logger.info(
-                    "Skipping stale/undated watched-wallet signature %s (age=%s); "
-                    "marking consumed without copying",
-                    signature[:12],
-                    "unknown" if signal_age == float("inf") else f"{signal_age:.1f}s",
+            signal_age = None
+            if block_time is not None:
+                try:
+                    signal_age = time.time() - float(block_time)
+                except (TypeError, ValueError, OverflowError):
+                    signal_age = None
+
+            if signal_age is not None and (signal_age < 0 or signal_age > max_signal_age):
+                logger.debug(
+                    "Skipping stale watched-wallet signature %s (age=%.1fs); advancing stale cursor",
+                    signature[:12], signal_age,
                 )
                 self.store.mark_signature_seen(dedupe_key, wallet)
                 cursor_candidate = signature
                 handled += 1
                 continue
+
+            if fresh_attempts >= max_per_poll:
+                stopped_before_end = True
+                break
+
             try:
                 signals = self.detect_pump_signal(wallet, signature)
             except SolanaRPCRateLimited:
-                logger.warning("RPC fallback paused for %s; keeping cursor at the last inspected transaction.", wallet[:8])
+                logger.warning(
+                    "RPC fallback paused for %s; keeping cursor at the last inspected transaction.",
+                    wallet[:8],
+                )
                 rate_limited = True
                 break
             except SolanaTransactionNotReady:
-                logger.info("Transaction details not indexed for %s; keeping cursor for retry.", signature[:10])
+                logger.info(
+                    "Transaction details not indexed for %s; keeping cursor for retry.",
+                    signature[:10],
+                )
                 rate_limited = True
                 break
+
+            fresh_attempts += 1
             for signal in signals:
+                actual_block_time = signal.get("block_time")
+                actual_age = None
+                if actual_block_time is not None:
+                    try:
+                        actual_age = time.time() - float(actual_block_time)
+                    except (TypeError, ValueError, OverflowError):
+                        actual_age = None
+                # Signature listings can have a missing blockTime. Inspect the
+                # transaction, then require its own confirmed block time before copying.
+                if actual_age is None or actual_age < 0 or actual_age > max_signal_age:
+                    logger.info(
+                        "Skipping unverified/stale Pump signal %s (age=%s); not copying",
+                        signature[:12],
+                        "unknown" if actual_age is None else f"{actual_age:.1f}s",
+                    )
+                    continue
+                logger.info(
+                    "Fresh RPC fallback signal: side=%s wallet=%s mint=%s age=%.1fs",
+                    signal.get("side", "?"), wallet[:8], str(signal.get("mint") or "")[:8],
+                    actual_age,
+                )
                 self.process_signal(signal)
+
             self.store.mark_signature_seen(dedupe_key, wallet)
             cursor_candidate = signature
             handled += 1
 
-        if not rate_limited and len(batch) == len(chronological):
-            # All new signatures present in this response have now been inspected.
+        if not rate_limited and not stopped_before_end:
+            # Every returned row has either been inspected or proven stale.
             cursor_candidate = latest
         if cursor_candidate and cursor_candidate != cursor:
             self.store.set_cursor(wallet, cursor_candidate)
@@ -3049,6 +3179,7 @@ class PumpFunBot:
         self._refresh_risk_state(self.equity())
         next_rpc_poll = 0.0
         next_position_check = 0.0
+        next_equity_refresh = 0.0
 
         try:
             while True:
@@ -3056,6 +3187,13 @@ class PumpFunBot:
                     self._process_dashboard_commands()
                     self._consume_feed_events()
                     self._consume_solana_log_events()
+                    now = time.time()
+                    # Manage exits before discovery/scanner work can consume time.
+                    # Network-heavy tasks below must not get first priority over stops.
+                    if now >= next_position_check:
+                        self.manage_positions()
+                        next_position_check = time.time() + 1.5
+
                     self.token_discovery.tick()
                     self._process_discovery_live_entries()
                     self._process_trending_live_entries()
@@ -3073,7 +3211,10 @@ class PumpFunBot:
                             float(self.feed.connected_at or 0),
                             float(self.feed.last_account_trade_at or 0),
                         )
-                        fallback_interval = max(20, self.s.poll_seconds * 5)
+                        # The feed can be connected while account subscriptions are
+                        # rejected (for example, an unfunded PumpPortal linked wallet).
+                        # Keep RPC fallback responsive instead of waiting 20+ seconds.
+                        fallback_interval = max(10, self.s.poll_seconds * 2)
                         if now >= next_rpc_poll and now - last_activity >= fallback_interval:
                             logger.warning(
                                 "No PumpPortal account-trade events for %.0fs; running slower RPC fallback scan across %d wallets",
@@ -3099,8 +3240,7 @@ class PumpFunBot:
                             "experiment-expiry liquidation are disabled."
                         )
 
-                    if now >= next_position_check:
-                        self.manage_positions()
+                    if now >= next_equity_refresh:
                         equity = self.equity()
                         self.last_equity_usd = equity
                         self._refresh_risk_state(equity)
@@ -3109,7 +3249,7 @@ class PumpFunBot:
                         open_count = len(self.store.list_positions())
                         logger.info("Heartbeat equity=%.4f positions=%d auto_copy=%s active_wallets=%d",
                                     equity, open_count, self.auto_copy_enabled, len(self.active_wallets))
-                        next_position_check = now + 1.5
+                        next_equity_refresh = time.time() + 1.5
 
                     self._publish_dashboard_state(self.last_equity_usd)
                 except KeyboardInterrupt:

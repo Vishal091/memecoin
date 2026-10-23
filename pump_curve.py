@@ -95,12 +95,16 @@ def parse_bonding_curve_data(data: Any) -> PumpCurveSnapshot | None:
         return None
 
 
-def fetch_pump_curve(rpc, mint: str) -> PumpCurveSnapshot | None:
+def fetch_pump_curve(
+    rpc, mint: str, timeout: float | None = None
+) -> PumpCurveSnapshot | None:
     """Fetch and parse the mint's canonical Pump.fun bonding-curve account."""
     address = bonding_curve_address(mint)
-    response = rpc.call(
-        "getAccountInfo",
-        [address, {"encoding": "base64", "commitment": "confirmed"}],
+    params = [address, {"encoding": "base64", "commitment": "confirmed"}]
+    response = (
+        rpc.call("getAccountInfo", params)
+        if timeout is None
+        else rpc.call("getAccountInfo", params, timeout=timeout)
     ) or {}
     account = response.get("value")
     if not isinstance(account, dict):

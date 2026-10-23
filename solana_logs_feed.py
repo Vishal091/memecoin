@@ -36,6 +36,9 @@ class SolanaLogsFeed(threading.Thread):
         self.notifications_received = 0
         self.subscribed_wallet_count = 0
         self.subscription_errors = 0
+        self.subscription_requests_sent = 0
+        self.subscription_acks_received = 0
+        self.pending_wallet_count = 0
         self.last_error = ""
 
     @staticmethod
@@ -59,7 +62,10 @@ class SolanaLogsFeed(threading.Thread):
     def stop(self) -> None:
         self._stop_event.set()
 
-    def _subscribe(self, ws, wallet: str, request_id: int, pending: dict[int, str]) -> int:
+    def _subscribe(
+        self, ws, wallet: str, request_id: int,
+        pending: dict[int, tuple[str, float]],
+    ) -> int:
         ws.send(json.dumps({
             "jsonrpc": "2.0",
             "id": request_id,
@@ -69,7 +75,10 @@ class SolanaLogsFeed(threading.Thread):
                 {"commitment": "confirmed"},
             ],
         }))
-        pending[request_id] = wallet
+        pending[request_id] = (wallet, time.time())
+        self.subscription_requests_sent += 1
+        self.pending_wallet_count = len(pending)
+        logger.debug("Requested Solana logs subscription for wallet %s", wallet[:8])
         return request_id + 1
 
     def run(self) -> None:
@@ -89,11 +98,19 @@ class SolanaLogsFeed(threading.Thread):
                     self.connected.set()
                     self.last_error = ""
                     logger.info("Connected to Solana logs WebSocket")
-                    pending: dict[int, str] = {}
+                    pending: dict[int, tuple[str, float]] = {}
                     subscriptions: dict[str, int] = {}
+                    retry_after: dict[str, float] = {}
                     request_id = 1
+                    ack_timeout = max(5.0, min(10.0, float(self.timeout)))
 
                     while not self._stop_event.is_set():
+                        now = time.time()
+                        # A request with no ACK must not silently leave a wallet
+                        # in a permanently-pending state; reconnect and retry cleanly.
+                        if pending and now - next(iter(pending.values()))[1] > ack_timeout:
+                            raise TimeoutError("logsSubscribe acknowledgement timed out")
+
                         desired = set(self.get_subscriptions())
 
                         for wallet, subscription_id in list(subscriptions.items()):
@@ -106,10 +123,22 @@ class SolanaLogsFeed(threading.Thread):
                                 }))
                                 request_id += 1
                                 del subscriptions[wallet]
+                        for wallet in list(retry_after):
+                            if wallet not in desired:
+                                retry_after.pop(wallet, None)
 
-                        pending_wallets = set(pending.values())
-                        for wallet in sorted(desired - set(subscriptions) - pending_wallets):
-                            request_id = self._subscribe(ws, wallet, request_id, pending)
+                        # Establish one address subscription at a time and wait for
+                        # its ACK before sending the next. This avoids provider-side
+                        # drops/rate limits from a burst of subscription requests.
+                        pending_wallets = {wallet for wallet, _sent_at in pending.values()}
+                        self.pending_wallet_count = len(pending)
+                        if not pending:
+                            candidates = [
+                                wallet for wallet in sorted(desired - set(subscriptions))
+                                if retry_after.get(wallet, 0.0) <= now
+                            ]
+                            if candidates:
+                                request_id = self._subscribe(ws, candidates[0], request_id, pending)
                         self.subscribed_wallet_count = len(subscriptions)
 
                         try:
@@ -129,17 +158,40 @@ class SolanaLogsFeed(threading.Thread):
                             continue
 
                         if "id" in message and message.get("id") in pending:
-                            wallet = pending.pop(message["id"])
+                            wallet, _sent_at = pending.pop(message["id"])
+                            self.pending_wallet_count = len(pending)
                             if "error" in message:
                                 self.subscription_errors += 1
-                                self.last_error = "logsSubscribe request rejected"
-                                logger.warning("Solana logs subscription rejected for %s", wallet[:8])
+                                error = message.get("error")
+                                code = error.get("code") if isinstance(error, dict) else None
+                                self.last_error = (
+                                    f"logsSubscribe rejected (code {code})"
+                                    if code is not None else "logsSubscribe request rejected"
+                                )
+                                retry_after[wallet] = time.time() + 10.0
+                                logger.warning(
+                                    "Solana logs subscription rejected for %s (code=%s); retrying in 10s",
+                                    wallet[:8], code if code is not None else "unknown",
+                                )
                                 continue
                             subscription_id = message.get("result")
                             if isinstance(subscription_id, int):
                                 subscriptions[wallet] = subscription_id
+                                self.subscription_acks_received += 1
+                                retry_after.pop(wallet, None)
                                 self.subscribed_wallet_count = len(subscriptions)
-                                logger.info("Solana logs subscription active for wallet %s", wallet[:8])
+                                logger.info(
+                                    "Solana logs subscription active for wallet %s (%d/%d active)",
+                                    wallet[:8], len(subscriptions), len(desired),
+                                )
+                            else:
+                                self.subscription_errors += 1
+                                self.last_error = "logsSubscribe response had no subscription ID"
+                                retry_after[wallet] = time.time() + 10.0
+                                logger.warning(
+                                    "Solana logs subscription returned an invalid response for %s; retrying in 10s",
+                                    wallet[:8],
+                                )
                             continue
 
                         if message.get("method") != "logsNotification":
@@ -170,6 +222,7 @@ class SolanaLogsFeed(threading.Thread):
             except Exception as exc:
                 self.connected.clear()
                 self.subscribed_wallet_count = 0
+                self.pending_wallet_count = 0
                 # Avoid logging the full endpoint/exception because it could expose
                 # a provider URL containing an API key.
                 self.last_error = type(exc).__name__
@@ -180,3 +233,4 @@ class SolanaLogsFeed(threading.Thread):
                 self._stop_event.wait(3)
         self.connected.clear()
         self.subscribed_wallet_count = 0
+        self.pending_wallet_count = 0

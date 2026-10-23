@@ -42,7 +42,7 @@ class SolanaRPC:
     def backoff_remaining(self) -> float:
         return max(0.0, self._rate_limited_until - time.monotonic())
 
-    def call(self, method: str, params: list[Any]) -> Any:
+    def call(self, method: str, params: list[Any], timeout: float | None = None) -> Any:
         with self._lock:
             remaining = self.backoff_remaining
             if remaining > 0:
@@ -57,11 +57,12 @@ class SolanaRPC:
             request_id = self._request_id
             self._last_request_at = time.monotonic()
 
+        request_timeout = self.timeout if timeout is None else max(0.1, float(timeout))
         try:
             response = self.session.post(
                 self.url,
                 json={"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
-                timeout=self.timeout,
+                timeout=request_timeout,
             )
         except requests.RequestException:
             raise

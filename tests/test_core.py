@@ -21,8 +21,9 @@ from native_pump import (
     TransactionSimulationFailed,
 )
 from solana_rpc import SolanaRPC
+from solana_logs_feed import SolanaLogsFeed
 from storage import Store
-from token_discovery import TokenDiscoveryShadow
+from token_discovery import TokenDiscoveryShadow, _safe_exception_message
 
 
 
@@ -338,6 +339,91 @@ class DiscoveryQueueTests(unittest.TestCase):
 
 
 
+class PumpCurveMarkPriceTests(unittest.TestCase):
+    def _bot(self):
+        bot = object.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(request_timeout_seconds=12)
+        bot.price_cache = {}
+        bot.price_cache_at = {}
+        bot.market_price_cache = {}
+        bot.market_price_cache_at = {}
+        bot.curve_price_cache = {}
+        bot.curve_price_cache_at = {}
+        bot.curve_mark_checked_at = {}
+        bot.curve_completed_cache = set()
+        bot.curve_unpriced_cache = set()
+        bot.rpc = object()
+
+        class FakeStore:
+            def get_state(self, key, default=""):
+                return "pump" if key == "pool:test-mint" else default
+
+            def get_position(self, mint):
+                return {"mint": mint, "decimals": 6}
+
+        class FakeMarket:
+            def __init__(self):
+                self.dex_calls = 0
+                self.sol_timeouts = []
+
+            def sol_price_usd(self, timeout=None):
+                self.sol_timeouts.append(timeout)
+                return 150.0
+
+            def token_market(self, mint, timeout=None):
+                self.dex_calls += 1
+                return {"price_usd": 9.0}
+
+        bot.store = FakeStore()
+        bot.market = FakeMarket()
+        return bot
+
+    def test_unindexed_pump_position_uses_bounded_on_chain_curve_mark(self):
+        from unittest.mock import patch
+
+        bot = self._bot()
+
+        class FakeCurve:
+            complete = False
+            quote_mint = WSOL_MINT
+
+            def price_usd(self, sol_price_usd, decimals=6):
+                self.seen_sol_price = sol_price_usd
+                self.seen_decimals = decimals
+                return 0.000123
+
+        with patch("pumpfun_bot.fetch_pump_curve", return_value=FakeCurve()) as fetch:
+            mark = bot._mark_price("test-mint", 0.0002)
+
+        self.assertAlmostEqual(mark, 0.000123)
+        fetch.assert_called_once_with(bot.rpc, "test-mint", timeout=2.0)
+        self.assertEqual(bot.market.sol_timeouts, [2.0])
+        self.assertEqual(bot.market.dex_calls, 0)
+        self.assertEqual(bot.curve_price_cache["test-mint"], 0.000123)
+
+    def test_completed_curve_falls_back_to_indexed_market_quote(self):
+        from unittest.mock import patch
+
+        bot = self._bot()
+
+        class CompletedCurve:
+            complete = True
+            quote_mint = WSOL_MINT
+
+            def price_usd(self, sol_price_usd, decimals=6):
+                return None
+
+        with patch("pumpfun_bot.fetch_pump_curve", return_value=CompletedCurve()) as fetch:
+            mark = bot._mark_price("test-mint", 0.0002)
+            second_mark = bot._mark_price("test-mint", 0.0002)
+
+        self.assertAlmostEqual(mark, 9.0)
+        self.assertAlmostEqual(second_mark, 9.0)
+        self.assertEqual(bot.market.dex_calls, 1)
+        self.assertEqual(fetch.call_count, 1)
+        self.assertIn("test-mint", bot.curve_completed_cache)
+
+
 class LossExitGracePeriodTests(unittest.TestCase):
     def test_marked_loss_stop_bypasses_minimum_hold_immediately(self):
         now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
@@ -365,6 +451,20 @@ class LossExitGracePeriodTests(unittest.TestCase):
             0.0,
         )
 
+    def test_losing_leader_sell_bypasses_minimum_hold_immediately(self):
+        now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
+        position = {
+            "entry_price_usd": 1.0,
+            "opened_at": (now - timedelta(seconds=5)).isoformat(timespec="seconds"),
+        }
+        self.assertEqual(
+            loss_exit_hold_remaining_seconds(
+                position, 0.75, "followed wallet leader partial/full sell on pump",
+                120, now=now.timestamp(),
+            ),
+            0.0,
+        )
+
     def test_other_losing_exits_still_use_remaining_grace_period(self):
         now = datetime(2026, 10, 18, 12, 2, tzinfo=timezone.utc)
         position = {
@@ -373,7 +473,7 @@ class LossExitGracePeriodTests(unittest.TestCase):
         }
         self.assertEqual(
             loss_exit_hold_remaining_seconds(
-                position, 0.75, "followed wallet leader partial sell", 120,
+                position, 0.75, "strategy discretionary sell", 120,
                 now=now.timestamp()
             ),
             90.0,
@@ -467,7 +567,11 @@ class LossExitGracePeriodTests(unittest.TestCase):
             self.position = position
 
     class FakeMarket:
-        def token_market(self, mint):
+        def __init__(self):
+            self.token_market_calls = 0
+
+        def token_market(self, mint, timeout=None):
+            self.token_market_calls += 1
             return {"price_usd": 0.75}
 
     def _bot_with_fresh_position(self):
@@ -493,6 +597,10 @@ class LossExitGracePeriodTests(unittest.TestCase):
         )
         bot.store = self.FakeStore(position)
         bot.market = self.FakeMarket()
+        bot.price_cache = {}
+        bot.price_cache_at = {}
+        bot.market_price_cache = {}
+        bot.market_price_cache_at = {}
         # The sale behavior is under test; avoid exercising the unrelated feed-subscription loop.
         bot._refresh_feed_subscriptions = lambda: None
         return bot
@@ -507,25 +615,24 @@ class LossExitGracePeriodTests(unittest.TestCase):
         self.assertEqual(bot.store.get_state("exit_pending_amount_raw:test-mint", ""), "")
         self.assertEqual(len(bot.store.trades), 1)
         self.assertEqual(bot.store.trades[0]["action"], "SELL")
+        self.assertEqual(bot.market.token_market_calls, 0)
 
-    def test_losing_leader_sell_preserves_its_partial_amount_while_deferred(self):
+    def test_losing_leader_sell_exits_immediately_and_preserves_partial_quantity(self):
         bot = self._bot_with_fresh_position()
         reason = "followed wallet leader-wallet partial/full sell on pump"
-        self.assertFalse(
+        self.assertTrue(
             bot.sell(
                 "test-mint", 300, reason,
                 "leader-wallet", "leader-sell-signature",
             )
         )
-        self.assertEqual(bot.store.get_state("exit_pending:test-mint"), reason)
-        self.assertEqual(bot.store.get_state("exit_pending_amount_raw:test-mint"), "300")
-        self.assertEqual(
-            bot.store.get_state("exit_pending_source_wallet:test-mint"), "leader-wallet"
-        )
-        self.assertEqual(
-            bot.store.get_state("exit_pending_source_signature:test-mint"),
-            "leader-sell-signature",
-        )
+        position = bot.store.get_position("test-mint")
+        self.assertEqual(position["amount_raw"], "700")
+        self.assertAlmostEqual(position["invested_usd"], 0.7)
+        self.assertEqual(bot.store.trades[-1]["action"], "SELL")
+        self.assertEqual(bot.store.trades[-1]["amount_raw"], "300")
+        self.assertEqual(bot.store.get_state("exit_pending:test-mint", ""), "")
+        self.assertEqual(bot.market.token_market_calls, 0)
 
 
 class DashboardErrorRefreshTests(unittest.TestCase):
@@ -607,6 +714,36 @@ class NativeBuildFailureHandlingTests(unittest.TestCase):
         self.assertGreater(float(bot.store.get_state("native_build_retry_after:test-mint")), 0)
         self.assertIn("Associated token account not found", bot.store.get_state("native_build_failure:test-mint"))
         self.assertNotIn("manual_review_halt", bot.store.state)
+
+    def test_sell_builder_cooldown_preserves_new_leader_exit_for_retry(self):
+        position = {
+            "mint": "test-mint", "amount_raw": "1000", "decimals": 6,
+            "invested_usd": 1.0, "last_price_usd": 1.0,
+            "source_wallet": "leader-wallet", "source_signature": "leader-signature",
+        }
+        bot = object.__new__(PumpFunBot)
+        bot.s = SimpleNamespace(mode="live", slippage_bps=100)
+        bot.store = self.FakeStore(position)
+        bot.market = self.FakeMarket()
+        bot.executor = self.FakeExecutor()
+        bot.wallet_address = "test-wallet"
+        bot.keypair = object()
+        bot.store.set_state("native_build_retry_after:test-mint", str(__import__("time").time() + 120))
+
+        result = bot.sell(
+            "test-mint", 300,
+            "followed wallet leader-wallet partial/full sell on pump",
+            "leader-wallet", "leader-sell-signature",
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(
+            bot.store.get_state("exit_pending:test-mint"),
+            "followed wallet leader-wallet partial/full sell on pump",
+        )
+        self.assertEqual(bot.store.get_state("exit_pending_amount_raw:test-mint"), "300")
+        self.assertEqual(bot.store.get_state("exit_pending_source_wallet:test-mint"), "leader-wallet")
+        self.assertEqual(bot.store.get_state("exit_pending_source_signature:test-mint"), "leader-sell-signature")
 
     def test_pending_exit_reason_does_not_accumulate_wrappers_on_retry(self):
         position = {
@@ -1080,6 +1217,128 @@ class StaleWalletSignalTests(unittest.TestCase):
             bot.store.seen,
             [("leader-wallet|stale-new-signature", "leader-wallet")],
         )
+
+
+    def test_stale_backlog_does_not_hide_fresh_signature_behind_poll_limit(self):
+        import time
+        from unittest.mock import patch
+
+        now = int(time.time())
+        stale_rows = [
+            {"signature": f"stale-signature-{n}", "blockTime": now - 120 - n}
+            for n in range(12)
+        ]
+        # RPC returns newest-first; the cursor is older than every unseen row.
+        rows = [
+            {"signature": "fresh-signature", "blockTime": now},
+            *stale_rows,
+            {"signature": "stored-cursor", "blockTime": now - 300},
+        ]
+
+        class FakeStore:
+            def __init__(self):
+                self.cursor = "stored-cursor"
+                self.seen = []
+
+            def get_cursor(self, wallet):
+                return self.cursor
+
+            def set_cursor(self, wallet, signature):
+                self.cursor = signature
+
+            def signature_seen(self, key):
+                return any(item[0] == key for item in self.seen)
+
+            def mark_signature_seen(self, key, wallet):
+                self.seen.append((key, wallet))
+
+        bot = object.__new__(PumpFunBot)
+        bot.rpc = SimpleNamespace(signatures=lambda wallet, limit: rows)
+        bot.store = FakeStore()
+        detected = []
+        bot.detect_pump_signal = lambda wallet, signature: detected.append(signature) or []
+        bot.process_signal = lambda signal: None
+
+        with patch.dict("os.environ", {
+            "MAX_COPY_SIGNAL_AGE_SECONDS": "30",
+            "SOLANA_MAX_SIGNATURES_PER_WALLET_POLL": "1",
+        }):
+            handled = bot.poll_wallet("leader-wallet")
+
+        self.assertEqual(detected, ["fresh-signature"])
+        self.assertEqual(bot.store.cursor, "fresh-signature")
+        self.assertEqual(handled, 13)
+        self.assertEqual(len(bot.store.seen), 13)
+
+
+class ExceptionRedactionTests(unittest.TestCase):
+    def test_rpc_api_key_is_redacted_from_exception_url(self):
+        error = RuntimeError(
+            "502 Server Error for url: "
+            "https://mainnet.helius-rpc.com/?api-key=EXPOSED-TEST-KEY&cluster=mainnet"
+        )
+
+        safe = _safe_exception_message(error)
+
+        self.assertNotIn("EXPOSED-TEST-KEY", safe)
+        self.assertIn("api-key=<redacted>", safe)
+        self.assertIn("cluster=mainnet", safe)
+
+
+class SolanaLogsFeedSubscriptionTests(unittest.TestCase):
+    def test_watched_wallet_subscriptions_wait_for_each_ack(self):
+        import json
+        from contextlib import contextmanager
+        from unittest.mock import patch
+
+        class FakeWebSocket:
+            def __init__(self):
+                self.feed = None
+                self.sent = []
+                self.replies = queue.Queue()
+                self.in_flight = 0
+                self.max_in_flight = 0
+
+            def send(self, raw):
+                message = json.loads(raw)
+                self.sent.append(message)
+                if message.get("method") == "logsSubscribe":
+                    self.in_flight += 1
+                    self.max_in_flight = max(self.max_in_flight, self.in_flight)
+                    self.replies.put(json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "result": 1000 + message["id"],
+                    }))
+
+            def recv(self, timeout=1):
+                try:
+                    reply = self.replies.get_nowait()
+                    self.in_flight -= 1
+                    return reply
+                except queue.Empty:
+                    if self.feed and self.feed.subscribed_wallet_count == 10:
+                        self.feed.stop()
+                    raise TimeoutError()
+
+        feed = SolanaLogsFeed("https://rpc.example.invalid/?api-key=not-real", queue.Queue(), timeout=1)
+        feed.set_subscriptions([f"wallet-{n}" for n in range(10)])
+        ws = FakeWebSocket()
+        ws.feed = feed
+
+        @contextmanager
+        def fake_connect(*args, **kwargs):
+            yield ws
+
+        with patch("solana_logs_feed.connect", fake_connect):
+            feed.run()
+
+        requests = [message for message in ws.sent if message.get("method") == "logsSubscribe"]
+        self.assertEqual(len(requests), 10)
+        self.assertEqual(feed.subscription_acks_received, 10)
+        self.assertEqual(feed.subscription_requests_sent, 10)
+        self.assertEqual(feed.subscription_errors, 0)
+        self.assertEqual(ws.max_in_flight, 1)
 
 
 class ParserTests(unittest.TestCase):
