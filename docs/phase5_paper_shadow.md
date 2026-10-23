@@ -37,7 +37,7 @@ If you also want to observe copy-trading behavior, ensure your existing paper-mo
 1. Stop other bot instances using the same database, confirm the database path is the dedicated paper path above, and keep live-entry options disabled.
 2. Start the bot from the repository root with `python pumpfun_bot.py`.
 3. Confirm the dashboard reports paper mode, live-entry approval OFF, discovery scanners enabled for analysis, both live-buy switches OFF, and the global entry switch state.
-4. Leave the process collecting shadow marks. Token discovery records its observed candidate marks and 1/5/15-minute outcomes. Trending discovery records first-pass screened observations only when an exact pool match supplies a valid USD price with the candidate mint as the base token.
+4. Leave the process collecting shadow marks. Token discovery records its observed candidate marks and 1/5/15-minute outcomes. Trending discovery records first-pass screened observations. A candidate qualifies for return calculations only when an exact pool match supplies a valid USD price with the candidate mint as the base token; screened rows without a valid mark remain visible as missing-price data.
 5. After collection, run the read-only evaluator below. It does not alter the database and never signs or submits a transaction.
 
 Observation storage is coalesced by candidate, minute and status, stores a bounded subset of source fields, and retains at most the 500,000 newest observation rows. If a busy trial reaches that cap, older rows are pruned; the report's actual observed span must still meet the coverage target before review readiness can be reported. Persistence failures are surfaced in the dashboard rather than silently treated as successful collection.
