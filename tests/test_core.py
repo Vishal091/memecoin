@@ -1218,6 +1218,58 @@ class StaleWalletSignalTests(unittest.TestCase):
         )
 
 
+    def test_stale_backlog_does_not_hide_fresh_signature_behind_poll_limit(self):
+        import time
+        from unittest.mock import patch
+
+        now = int(time.time())
+        stale_rows = [
+            {"signature": f"stale-signature-{n}", "blockTime": now - 120 - n}
+            for n in range(12)
+        ]
+        # RPC returns newest-first; the cursor is older than every unseen row.
+        rows = [
+            {"signature": "fresh-signature", "blockTime": now},
+            *stale_rows,
+            {"signature": "stored-cursor", "blockTime": now - 300},
+        ]
+
+        class FakeStore:
+            def __init__(self):
+                self.cursor = "stored-cursor"
+                self.seen = []
+
+            def get_cursor(self, wallet):
+                return self.cursor
+
+            def set_cursor(self, wallet, signature):
+                self.cursor = signature
+
+            def signature_seen(self, key):
+                return any(item[0] == key for item in self.seen)
+
+            def mark_signature_seen(self, key, wallet):
+                self.seen.append((key, wallet))
+
+        bot = object.__new__(PumpFunBot)
+        bot.rpc = SimpleNamespace(signatures=lambda wallet, limit: rows)
+        bot.store = FakeStore()
+        detected = []
+        bot.detect_pump_signal = lambda wallet, signature: detected.append(signature) or []
+        bot.process_signal = lambda signal: None
+
+        with patch.dict("os.environ", {
+            "MAX_COPY_SIGNAL_AGE_SECONDS": "30",
+            "SOLANA_MAX_SIGNATURES_PER_WALLET_POLL": "1",
+        }):
+            handled = bot.poll_wallet("leader-wallet")
+
+        self.assertEqual(detected, ["fresh-signature"])
+        self.assertEqual(bot.store.cursor, "fresh-signature")
+        self.assertEqual(handled, 13)
+        self.assertEqual(len(bot.store.seen), 13)
+
+
 class ParserTests(unittest.TestCase):
     def setUp(self):
         self.rpc = SolanaRPC("https://example.invalid", timeout=1)
