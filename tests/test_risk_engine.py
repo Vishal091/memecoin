@@ -18,6 +18,7 @@ class RiskEngineTests(unittest.TestCase):
         self.store.reset_day_if_needed(10.0)
         self.settings = SimpleNamespace(
             mode="paper",
+            live_entries_approved=False,
             max_entry_usd=0.50,
             max_total_exposure_usd=1.00,
             max_open_positions=1,
@@ -69,6 +70,7 @@ class RiskEngineTests(unittest.TestCase):
         # Simulate the next process booting in live mode, where an interrupted
         # submission must remain uncertain instead of being automatically released.
         self.settings.mode = "live"
+        self.settings.live_entries_approved = True  # exercise restart recovery in an explicitly approved test profile
         self.risk.engage_on_startup()
         row = self.store.get_entry_reservation(reservation)
         self.assertEqual(row["status"], "uncertain")
@@ -76,6 +78,20 @@ class RiskEngineTests(unittest.TestCase):
         allowed, reason = self.risk.resume_entries()
         self.assertFalse(allowed)
         self.assertIn("reservation", reason.lower())
+
+    def test_live_entries_are_blocked_without_separate_approval(self):
+        self.settings.mode = "live"
+        self.settings.live_entries_approved = False
+        self.risk.engage_on_startup()
+
+        allowed, reason = self.risk.resume_entries()
+        self.assertFalse(allowed)
+        self.assertIn("LIVE_ENTRIES_APPROVED=false", reason)
+        self.assertIn("LIVE_ENTRIES_APPROVED=false", self.risk.gate_reason())
+        reservation, reason = self.risk.reserve_entry("MintLive", "leader_copy", 0.25)
+        self.assertIsNone(reservation)
+        self.assertIn("LIVE_ENTRIES_APPROVED=false", reason)
+        self.assertTrue(self.risk.kill_switch_active())
 
     def test_uncertain_transaction_requires_exact_signature_and_phrase(self):
         self.assertTrue(self.risk.resume_entries()[0])
