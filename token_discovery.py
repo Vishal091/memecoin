@@ -28,14 +28,14 @@ logger = logging.getLogger("token_discovery")
 
 
 _SECRET_QUERY_PARAMETER = re.compile(
-    r"(?i)([?&](?:api[-_]?key|access[-_]?token|token|auth|key|secret)=)[^&\\s]+"
+    r"(?i)([?&](?:api[-_]?key|access[-_]?token|token|auth|key|secret)=)[^&\s]+"
 )
 
 
 def _safe_exception_message(exc: Exception, limit: int = 240) -> str:
     """Flatten an exception for logs/UI while redacting query-string credentials."""
     message = " ".join(str(exc).split())
-    message = _SECRET_QUERY_PARAMETER.sub(r"\\1<redacted>", message)
+    message = _SECRET_QUERY_PARAMETER.sub(r"\1<redacted>", message)
     return message[:max(0, int(limit))]
 
 
