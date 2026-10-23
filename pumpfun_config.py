@@ -198,12 +198,6 @@ class PumpFunSettings:
             raise ValueError("SOLANA_RPC_URL must use HTTPS")
         if self.default_leaderboard_window not in {"overall", "day", "week", "month"}:
             raise ValueError("DEFAULT_LEADERBOARD_WINDOW must be overall, day, week or month")
-        if self.mode == "live" and not self.live_entries_approved and (
-            self.token_discovery_live_enabled or self.trending_discovery_live_enabled
-        ):
-            raise ValueError(
-                "Live discovery switches require LIVE_ENTRIES_APPROVED=true after separate rollout approval"
-            )
         if self.max_entry_usd <= 0 or self.max_total_exposure_usd <= 0:
             raise ValueError("Entry and exposure limits must be positive")
         if self.max_entry_usd > 0.50 or self.max_total_exposure_usd > 1.00:
@@ -243,5 +237,11 @@ class PumpFunSettings:
                 raise ValueError("PUMPFUN_AUTH_TOKEN is required for automatic top-trader discovery in live mode")
             if not self.pumpportal_api_key:
                 raise ValueError("PUMPPORTAL_API_KEY is required for the near-real-time account-trade feed in live mode")
+        if self.mode == "live" and not self.live_entries_approved and (
+            self.token_discovery_live_enabled or self.trending_discovery_live_enabled
+        ):
+            raise ValueError(
+                "Live discovery switches require LIVE_ENTRIES_APPROVED=true after separate rollout approval"
+            )
         if self.mode == "paper" and self.starting_paper_cash_usd <= 0:
             raise ValueError("STARTING_PAPER_CASH_USD must be positive")
