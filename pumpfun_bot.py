@@ -520,12 +520,17 @@ class PumpFunBot:
                 "last_notification_at": self.logs_feed.last_notification_at,
                 "last_signature": self.logs_feed.last_signature,
                 "subscription_errors": self.logs_feed.subscription_errors,
+                "subscription_requests_sent": self.logs_feed.subscription_requests_sent,
+                "subscription_acks_received": self.logs_feed.subscription_acks_received,
+                "pending_wallet_count": self.logs_feed.pending_wallet_count,
                 "error": self.logs_feed.last_error,
             } if self.logs_feed else {
                 "enabled": False, "connected": False, "subscribed_wallet_count": 0,
                 "messages_received": 0, "notifications_received": 0,
                 "last_message_at": 0, "last_notification_at": 0,
                 "last_signature": "", "subscription_errors": 0,
+                "subscription_requests_sent": 0, "subscription_acks_received": 0,
+                "pending_wallet_count": 0,
                 "error": "Disabled by SOLANA_LOGS_WS_ENABLED",
             }),
             "signal_stats": dict(self.signal_stats),
@@ -3001,18 +3006,29 @@ class PumpFunBot:
         if not cursor_found and cursor != latest and len(sigs) >= 1000:
             logger.error("More than 1000 signatures may have arrived for %s between polls; oldest missed signals cannot be recovered by this pass", wallet)
 
-        # Bound RPC bursts. Process new signatures oldest-to-newest and advance the
-        # cursor only through successfully inspected rows, so a 429 never skips newer trades.
+        # Do not let old signatures consume the fresh-signal budget. Known-stale
+        # activity is intentionally ignored and advanced in the cursor; recent signals
+        # are inspected oldest-to-newest so a prolonged feed outage cannot starve current
+        # trades behind hundreds of obsolete signatures.
+        try:
+            max_signal_age = max(
+                5,
+                min(300, int(__import__("os").getenv("MAX_COPY_SIGNAL_AGE_SECONDS", "30"))),
+            )
+        except (TypeError, ValueError):
+            max_signal_age = 30
         try:
             max_per_poll = max(1, min(50, int(__import__("os").getenv("SOLANA_MAX_SIGNATURES_PER_WALLET_POLL", "8"))))
         except ValueError:
             max_per_poll = 8
+
         chronological = list(reversed(new_rows))
-        batch = chronological[:max_per_poll]
         cursor_candidate = cursor
         handled = 0
+        fresh_attempts = 0
         rate_limited = False
-        for row in batch:
+        stopped_before_end = False
+        for row in chronological:
             signature = row.get("signature")
             if not signature:
                 continue
@@ -3020,50 +3036,77 @@ class PumpFunBot:
             if self.store.signature_seen(dedupe_key):
                 cursor_candidate = signature
                 continue
-            # Never replay an old leader trade after an RPC outage. A stale
-            # signature is marked consumed and advances the cursor, but no buy/sell
-            # is generated from it. Unknown timestamps are skipped rather than guessed fresh.
-            try:
-                max_signal_age = max(
-                    5,
-                    min(300, int(__import__("os").getenv("MAX_COPY_SIGNAL_AGE_SECONDS", "30"))),
-                )
-            except (TypeError, ValueError):
-                max_signal_age = 30
+
             block_time = row.get("blockTime")
-            try:
-                signal_age = time.time() - float(block_time) if block_time is not None else float("inf")
-            except (TypeError, ValueError, OverflowError):
-                signal_age = float("inf")
-            if signal_age < 0 or signal_age > max_signal_age:
-                logger.info(
-                    "Skipping stale/undated watched-wallet signature %s (age=%s); "
-                    "marking consumed without copying",
-                    signature[:12],
-                    "unknown" if signal_age == float("inf") else f"{signal_age:.1f}s",
+            signal_age = None
+            if block_time is not None:
+                try:
+                    signal_age = time.time() - float(block_time)
+                except (TypeError, ValueError, OverflowError):
+                    signal_age = None
+
+            if signal_age is not None and (signal_age < 0 or signal_age > max_signal_age):
+                logger.debug(
+                    "Skipping stale watched-wallet signature %s (age=%.1fs); advancing stale cursor",
+                    signature[:12], signal_age,
                 )
                 self.store.mark_signature_seen(dedupe_key, wallet)
                 cursor_candidate = signature
                 handled += 1
                 continue
+
+            if fresh_attempts >= max_per_poll:
+                stopped_before_end = True
+                break
+
             try:
                 signals = self.detect_pump_signal(wallet, signature)
             except SolanaRPCRateLimited:
-                logger.warning("RPC fallback paused for %s; keeping cursor at the last inspected transaction.", wallet[:8])
+                logger.warning(
+                    "RPC fallback paused for %s; keeping cursor at the last inspected transaction.",
+                    wallet[:8],
+                )
                 rate_limited = True
                 break
             except SolanaTransactionNotReady:
-                logger.info("Transaction details not indexed for %s; keeping cursor for retry.", signature[:10])
+                logger.info(
+                    "Transaction details not indexed for %s; keeping cursor for retry.",
+                    signature[:10],
+                )
                 rate_limited = True
                 break
+
+            fresh_attempts += 1
             for signal in signals:
+                actual_block_time = signal.get("block_time")
+                actual_age = None
+                if actual_block_time is not None:
+                    try:
+                        actual_age = time.time() - float(actual_block_time)
+                    except (TypeError, ValueError, OverflowError):
+                        actual_age = None
+                # Signature listings can have a missing blockTime. Inspect the
+                # transaction, then require its own confirmed block time before copying.
+                if actual_age is None or actual_age < 0 or actual_age > max_signal_age:
+                    logger.info(
+                        "Skipping unverified/stale Pump signal %s (age=%s); not copying",
+                        signature[:12],
+                        "unknown" if actual_age is None else f"{actual_age:.1f}s",
+                    )
+                    continue
+                logger.info(
+                    "Fresh RPC fallback signal: side=%s wallet=%s mint=%s age=%.1fs",
+                    signal.get("side", "?"), wallet[:8], str(signal.get("mint") or "")[:8],
+                    actual_age,
+                )
                 self.process_signal(signal)
+
             self.store.mark_signature_seen(dedupe_key, wallet)
             cursor_candidate = signature
             handled += 1
 
-        if not rate_limited and len(batch) == len(chronological):
-            # All new signatures present in this response have now been inspected.
+        if not rate_limited and not stopped_before_end:
+            # Every returned row has either been inspected or proven stale.
             cursor_candidate = latest
         if cursor_candidate and cursor_candidate != cursor:
             self.store.set_cursor(wallet, cursor_candidate)
@@ -3168,7 +3211,10 @@ class PumpFunBot:
                             float(self.feed.connected_at or 0),
                             float(self.feed.last_account_trade_at or 0),
                         )
-                        fallback_interval = max(20, self.s.poll_seconds * 5)
+                        # The feed can be connected while account subscriptions are
+                        # rejected (for example, an unfunded PumpPortal linked wallet).
+                        # Keep RPC fallback responsive instead of waiting 20+ seconds.
+                        fallback_interval = max(10, self.s.poll_seconds * 2)
                         if now >= next_rpc_poll and now - last_activity >= fallback_interval:
                             logger.warning(
                                 "No PumpPortal account-trade events for %.0fs; running slower RPC fallback scan across %d wallets",
