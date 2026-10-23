@@ -1989,25 +1989,30 @@ class PumpFunBot:
                     source_signature=source_signature,
                 )
                 return
-            tx_sig = result["signature"]
-            used_pool = result["pool"]
-            raw_out = int(result["total_output_amount"])
-            if raw_out <= 0:
+            tx_sig = ""
+            try:
+                if not isinstance(result, dict):
+                    raise ValueError("Executor returned a non-object result")
+                tx_sig = str(result.get("signature") or "")
+                used_pool = str(result.get("pool") or venue)
+                raw_out = int(result.get("total_output_amount") or 0)
+                if not tx_sig or raw_out <= 0:
+                    raise ValueError("Missing signature or non-positive token output")
+                # Wallet SOL delta includes swap input plus network/priority fees
+                # and account rent; retain its all-in amount in P&L basis.
+                effective_spend = max(0, -int(result.get("sol_delta_lamports") or 0)) / 1_000_000_000 * sol_price
+                cost_basis = effective_spend if effective_spend > 0 else spend
+                effective_price = spend / raw_to_units(raw_out, decimals)
+            except Exception as exc:
                 self._handle_uncertain_trade(
                     TransactionOutcomeUncertain(
-                        str(tx_sig), "buy", mint,
-                        "Executor returned a successful buy without positive token output.",
+                        tx_sig or "signature-unavailable", "buy", mint,
+                        f"Executor returned but fill details could not be safely reconciled ({type(exc).__name__}).",
                     ),
                     source_wallet=source_wallet,
                     source_signature=source_signature,
                 )
                 return
-            # Wallet SOL delta includes swap input plus network/priority fees and
-            # account rent. Keep that all-in amount in P&L basis, but never treat
-            # fixed overhead as token price movement for the stop thresholds.
-            effective_spend = max(0, -int(result["sol_delta_lamports"])) / 1_000_000_000 * sol_price
-            cost_basis = effective_spend if effective_spend > 0 else spend
-            effective_price = spend / raw_to_units(raw_out, decimals)
 
         # Start the hold timer only after the buy has succeeded and its fill is known.
         timestamp = datetime.now(timezone.utc).isoformat()
