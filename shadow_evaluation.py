@@ -144,7 +144,6 @@ def _price_for_observation(row: dict) -> float | None:
     # Prefer the persisted top-level normalized mark, then source payload fields.
     for value in (
         payload.get("price_usd"),
-        payload.get("shadow_entry_price_usd"),
         row.get("price_usd"),
     ):
         result = _positive(value)
