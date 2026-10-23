@@ -337,6 +337,7 @@ class TokenDiscoveryShadow:
             "live_failed_count": live_failed,
             "unfilled_peak_20_count": unfilled_peak_20,
             "shadow_entries": sum(1 for c in all_candidates if c.get("shadow_entry_price_usd")),
+            "shadow_observation_errors": self.stats.get("shadow_observation_errors", 0),
             "active_watch_count": sum(
                 1 for c in all_candidates
                 if c.get("subscribed") and float(c.get("subscription_expires_at", 0)) > now
