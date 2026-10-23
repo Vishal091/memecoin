@@ -34,7 +34,7 @@ class PumpFunSettings:
     mode: str
     live_confirmation: str
     live_entries_approved: bool
-    watch_wallets: tuple[str, ...>
+    watch_wallets: tuple[str, ...]
     pumpfun_auth_token: str
     pumpportal_api_key: str
     leaderboard_refresh_seconds: int
