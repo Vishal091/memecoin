@@ -455,6 +455,19 @@ class TrendingTokenScanner:
                     c["symbol"] = str(chosen["symbol"]).upper()
                 c["dexscreener_pair_address"] = str(pair.get("pairAddress") or "")
                 c["dexscreener_url"] = str(pair.get("url") or "")
+                # A USD mark is only valid when the candidate mint is the pair's base
+                # token and the exact GeckoTerminal pool matched the DEX pair. A quote-side
+                # price would describe a different token, so leave it unavailable.
+                base_address = str((pair.get("baseToken") or {}).get("address") or "")
+                pair_price_usd = _num(pair.get("priceUsd"))
+                if same_pool and base_address == str(c.get("mint") or "") and pair_price_usd > 0:
+                    c["price_usd"] = pair_price_usd
+                    c["market_price_source"] = "DEX Screener priceUsd; exact pool, candidate mint is base token"
+                else:
+                    c["price_usd"] = None
+                    c["market_price_source"] = (
+                        "Unavailable: exact pool price is not denominated for the candidate mint"
+                    )
                 dex_liq = _num((pair.get("liquidity") or {}).get("usd"))
                 volume, change = pair.get("volume") or {}, pair.get("priceChange") or {}
                 c["dexscreener_liquidity_usd"] = dex_liq
