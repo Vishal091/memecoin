@@ -23,7 +23,7 @@ from native_pump import (
 from solana_rpc import SolanaRPC
 from solana_logs_feed import SolanaLogsFeed
 from storage import Store
-from token_discovery import TokenDiscoveryShadow
+from token_discovery import TokenDiscoveryShadow, _safe_exception_message
 
 
 
@@ -1269,6 +1269,20 @@ class StaleWalletSignalTests(unittest.TestCase):
         self.assertEqual(bot.store.cursor, "fresh-signature")
         self.assertEqual(handled, 13)
         self.assertEqual(len(bot.store.seen), 13)
+
+
+class ExceptionRedactionTests(unittest.TestCase):
+    def test_rpc_api_key_is_redacted_from_exception_url(self):
+        error = RuntimeError(
+            "502 Server Error for url: "
+            "https://mainnet.helius-rpc.com/?api-key=EXPOSED-TEST-KEY&cluster=mainnet"
+        )
+
+        safe = _safe_exception_message(error)
+
+        self.assertNotIn("EXPOSED-TEST-KEY", safe)
+        self.assertIn("api-key=<redacted>", safe)
+        self.assertIn("cluster=mainnet", safe)
 
 
 class SolanaLogsFeedSubscriptionTests(unittest.TestCase):
