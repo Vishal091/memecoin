@@ -25,7 +25,7 @@ Reservation states:
 - `uncertain`: outcome or post-submission reconciliation is unknown.
 - `completed`, `failed`, `released`, `reconciled`: terminal/inactive statuses.
 
-On restart, pre-submit `reserved` intents are released. In live mode, a `submitting` intent is moved to `uncertain` and remains a blocker until an operator reviews recent transaction history and actual wallet balances. Paper-mode reservations are released on restart because they do not submit real transactions.
+On restart, pre-submit `reserved` intents are released. A still-active `reserved` row can also be released in the dashboard because the state machine does not permit the executor to be called until the row transitions to `submitting`. In live mode, a `submitting` intent is moved to `uncertain` and remains a blocker until an operator reviews recent transaction history and actual wallet balances. Paper-mode reservations are released on restart because they do not submit real transactions.
 
 ## Manual reconciliation
 
