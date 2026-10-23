@@ -327,6 +327,7 @@ class TrendingScannerIntegrationTests(unittest.TestCase):
             "url": "https://dexscreener.com/solana/VerifiedPair111111111111111111111111111",
             "baseToken": {"address": mint, "name": "Crosschecked Trend", "symbol": "CTREND"},
             "quoteToken": {"address": "So11111111111111111111111111111111111111112", "name": "Wrapped SOL", "symbol": "SOL"},
+            "priceUsd": "0.00001",
             "liquidity": {"usd": 5000},
             "volume": {"h1": 90000, "h24": 150000},
             "priceChange": {"h1": -50, "h24": -30},
@@ -352,6 +353,8 @@ class TrendingScannerIntegrationTests(unittest.TestCase):
         self.assertTrue(candidate["dexscreener_confirmed"])
         self.assertTrue(candidate["market_data_discrepancy"])
         self.assertTrue(candidate["same_pool_crosscheck"])
+        self.assertAlmostEqual(candidate["price_usd"], 0.00001)
+        self.assertIn("candidate mint is base token", candidate["market_price_source"])
         self.assertGreaterEqual(len(candidate["risk_flags"]), 3)
 
         different_pool = {
@@ -365,6 +368,7 @@ class TrendingScannerIntegrationTests(unittest.TestCase):
         scanner._dexscreener_enrich([different_pool])
         self.assertFalse(different_pool["dexscreener_confirmed"])
         self.assertFalse(different_pool["same_pool_crosscheck"])
+        self.assertIsNone(different_pool["price_usd"])
         self.assertIn(
             "not directly comparable",
             " ".join(different_pool["risk_flags"]),
