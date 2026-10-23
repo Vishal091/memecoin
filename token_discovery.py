@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import re
 import threading
 import time
 from collections import deque
@@ -24,6 +25,19 @@ from native_pump import TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID
 from pumpportal import PUMP_PROGRAM_ID
 
 logger = logging.getLogger("token_discovery")
+
+
+_SECRET_QUERY_PARAMETER = re.compile(
+    r"(?i)([?&](?:api[-_]?key|access[-_]?token|token|auth|key|secret)=)[^&\\s]+"
+)
+
+
+def _safe_exception_message(exc: Exception, limit: int = 240) -> str:
+    """Flatten an exception for logs/UI while redacting query-string credentials."""
+    message = " ".join(str(exc).split())
+    message = _SECRET_QUERY_PARAMETER.sub(r"\\1<redacted>", message)
+    return message[:max(0, int(limit))]
+
 
 STATE_PREFIX = "token_discovery_candidate:"
 TOKEN_METADATA_SAFE_EXTENSIONS = {
@@ -440,7 +454,7 @@ class TokenDiscoveryShadow:
         except Exception as exc:
             self._backfill_results.put({
                 "offset": offset, "rows": [],
-                "error": " ".join(str(exc).split())[:240],
+                "error": _safe_exception_message(exc, 240),
             })
 
     def _start_recent_launch_backfill(self, now: float) -> None:
@@ -610,8 +624,10 @@ class TokenDiscoveryShadow:
                 mint, event, "rejected",
                 f"On-chain safety check unavailable ({type(exc).__name__}); failed closed",
             )
-            logger.info("Shadow discovery rejected %s because on-chain checks failed: %s",
-                        mint[:8], " ".join(str(exc).split())[:200])
+            logger.info(
+                "Shadow discovery rejected %s because on-chain checks failed (%s): %s",
+                mint[:8], type(exc).__name__, _safe_exception_message(exc, 200),
+            )
             return
 
         if not inspected["safe"]:
