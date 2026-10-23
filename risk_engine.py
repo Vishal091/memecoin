@@ -43,8 +43,8 @@ class RiskEngine:
             "Entry kill switch is active; explicit operator resume is required.",
         )
 
-    def gate_reason(self) -> str:
-        """Return a rejection reason, or an empty string if entry admission is open."""
+    def gate_reason(self, *, ignore_reservation_id: str | None = None) -> str:
+        """Return a rejection reason; optionally allow a reservation through its own submit boundary."""
         try:
             if (
                 str(getattr(self.settings, "mode", "paper")).lower() == "live"
@@ -59,7 +59,10 @@ class RiskEngine:
             unresolved = self.store.list_state_prefix("unresolved_trade:", limit=1)
             if unresolved:
                 return "An unresolved submitted transaction exists; reconcile it before resuming entries."
-            active = self.store.active_entry_reservations()
+            active = [
+                row for row in self.store.active_entry_reservations()
+                if str(row.get("reservation_id") or "") != str(ignore_reservation_id or "")
+            ]
             if active:
                 first = active[0]
                 return (
@@ -147,7 +150,7 @@ class RiskEngine:
     def mark_submitting(self, reservation_id: str) -> tuple[bool, str]:
         """Last local admission check; fails closed on live-policy or kill-switch changes."""
         try:
-            policy_reason = self.gate_reason()
+            policy_reason = self.gate_reason(ignore_reservation_id=reservation_id)
             if policy_reason:
                 return False, policy_reason
             return self.store.mark_entry_reservation_submitting(reservation_id)
