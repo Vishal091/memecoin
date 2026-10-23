@@ -140,20 +140,27 @@ function render(d){
   reservations.forEach(function(x){
     reconHtml+="<div class='status'><strong>Reservation "+esc(x.status||"unknown")+"</strong> · mint <span class='addr'>"+esc(x.mint||"")+"</span> · exposure $"+num(x.amount_usd||0)+
       "<div>Reservation ID: <span class='addr'>"+esc(x.reservation_id||"")+"</span></div><div>"+esc(x.detail||"")+"</div>"+
-      (x.status==="uncertain"?"<button class='danger resolveReservation' data-id='"+esc(x.reservation_id||"")+"'>Acknowledge verified reservation reconciliation</button>":"")+"</div>";
+      (x.status==="reserved"?"<button class='primary resolveReservation' data-id='"+esc(x.reservation_id||"")+"' data-status='reserved'>Release unused pre-submit reservation</button>":((x.status==="submitting"||x.status==="uncertain")?"<button class='danger resolveReservation' data-id='"+esc(x.reservation_id||"")+"' data-status='"+esc(x.status)+"'>Acknowledge verified reservation reconciliation</button>":""))+"</div>";
   });
   el("unresolvedTransactions").innerHTML=reconHtml||"No unresolved transactions or active reservations.";
   document.querySelectorAll(".resolveTrade").forEach(function(b){b.onclick=function(){
     var mint=b.dataset.mint, sig=b.dataset.signature;
     if(!sig||sig==="missing"){el("message").textContent="Cannot acknowledge: no transaction signature is recorded.";return}
-    if(prompt("After independently checking the transaction, type the exact recorded signature:")!==sig)return;
+    if(sig==="signature-unavailable"){
+      if(!confirm("No transaction signature was recorded. Review recent on-chain history and actual wallet balances for this mint before continuing."))return;
+    }else if(prompt("After independently checking the transaction, type the exact recorded signature:")!==sig)return;
     var phrase="I_VERIFIED_THE_ONCHAIN_TRANSACTION_AND_WALLET_BALANCES";
     if(prompt("Type "+phrase+" to confirm you reviewed on-chain history and actual wallet balances.")!==phrase)return;
     action({action:"acknowledge_reconciled_trade",mint:mint,signature:sig,confirmation:phrase});
   }});
   document.querySelectorAll(".resolveReservation").forEach(function(b){b.onclick=function(){
-    if(!confirm("Only continue after independently reviewing recent wallet transactions and actual token/SOL balances for this interrupted reservation."))return;
     var phrase="I_VERIFIED_THE_ONCHAIN_TRANSACTION_AND_WALLET_BALANCES";
+    if(b.dataset.status==="reserved"){
+      if(!confirm("The saved reservation is still in the pre-submit state, so the executor was not allowed to submit an order from it. Release this unused reservation?"))return;
+      action({action:"acknowledge_risk_reservation",reservation_id:b.dataset.id,confirmation:""});
+      return;
+    }
+    if(!confirm("Only continue after independently reviewing recent wallet transactions and actual token/SOL balances for this interrupted reservation."))return;
     if(prompt("Type "+phrase+" to acknowledge the reconciliation review.")!==phrase)return;
     action({action:"acknowledge_risk_reservation",reservation_id:b.dataset.id,confirmation:phrase});
   }});
@@ -286,7 +293,9 @@ class DashboardServer:
                         if not all(isinstance(command.get(key), str) and command.get(key) for key in ("mint", "signature", "confirmation")):
                             raise ValueError("Mint, signature, and reconciliation confirmation are required")
                     if command.get("action") == "acknowledge_risk_reservation":
-                        if not all(isinstance(command.get(key), str) and command.get(key) for key in ("reservation_id", "confirmation")):
+                        if (not isinstance(command.get("reservation_id"), str)
+                                or not command.get("reservation_id")
+                                or not isinstance(command.get("confirmation"), str)):
                             raise ValueError("Reservation ID and reconciliation confirmation are required")
                     commands.put(command)
                     self.send_body(202, "application/json; charset=utf-8",
