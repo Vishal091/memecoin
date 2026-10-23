@@ -66,6 +66,9 @@ class RiskEngineTests(unittest.TestCase):
         self.assertIsNotNone(reservation, reason)
         self.assertTrue(self.risk.mark_submitting(reservation)[0])
 
+        # Simulate the next process booting in live mode, where an interrupted
+        # submission must remain uncertain instead of being automatically released.
+        self.settings.mode = "live"
         self.risk.engage_on_startup()
         row = self.store.get_entry_reservation(reservation)
         self.assertEqual(row["status"], "uncertain")
