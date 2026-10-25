@@ -184,9 +184,9 @@ class RiskEngineTests(unittest.TestCase):
         self.settings.max_entry_usd = 5.00
         self.settings.max_total_exposure_usd = 5.00
         self.settings.max_open_positions = 3
-        self.settings.max_entries_per_day = 4
+        self.settings.max_entries_per_day = 20
 
-        # The approval flag alone is not enough: the engine applies its own hard ceiling.
+        # The approval flag alone is not enough: the engine applies its own hard ceilings, including ten entries/day.
         self.assertTrue(self.risk.resume_entries()[0])
         reservation, reason = self.risk.reserve_entry("MintTooLarge", "leader_copy", 0.51)
         self.assertIsNone(reservation)
@@ -206,7 +206,7 @@ class RiskEngineTests(unittest.TestCase):
         self.assertEqual(snapshot["max_entry_usd"], 0.50)
         self.assertEqual(snapshot["max_total_exposure_usd"], 0.55)
         self.assertEqual(snapshot["max_open_positions"], 1)
-        self.assertEqual(snapshot["max_entries_per_day"], 1)
+        self.assertEqual(snapshot["max_entries_per_day"], 10)
 
     def test_live_canary_keeps_entry_approval_fail_closed_when_missing(self):
         self.settings.mode = "live"
