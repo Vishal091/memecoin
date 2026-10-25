@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import queue
 import sys
 import threading
@@ -41,6 +42,7 @@ from token_discovery import TokenDiscoveryShadow
 from trending_scanner import TrendingTokenScanner
 from jupiter_ultra import JupiterUltraExecutor
 from risk_engine import RiskEngine
+from execution_costs import assumptions_from_settings, estimate_round_trip_cost
 
 logger = logging.getLogger("pumpfun")
 
@@ -334,7 +336,6 @@ class PumpFunBot:
         if (
             self.auto_copy_enabled
             and self.store.get_state("copy_paused", "0") != "1"
-            and not self._copy_block_reason()
         ):
             base_wallets = set(self.s.watch_wallets) | held_leaders
             rows = self.leaderboards.get(self.selected_window, [])
@@ -479,15 +480,26 @@ class PumpFunBot:
             ),
             "live_position_limit": 1,
         })
+        try:
+            event_journal_state = self.store.event_summary()
+        except Exception:
+            event_journal_state = {
+                "total_events": 0, "last_event_at": None, "by_strategy": {},
+                "retention_rows": 500000,
+                "note": "Event journal summary unavailable; trading controls are unchanged.",
+            }
         state = {
             "mode": self.s.mode,
             "message": self.message,
             "leaderboard_error": self.last_leaderboard_error,
             "leaderboards": leaders,
             "selected_window": self.selected_window,
-            "auto_copy": bool(self.auto_copy_enabled and not paused and not self._copy_block_reason()),
+            # Auto-copy here means signal observation/subscription. The independent
+            # entry gate can be halted while we continue collecting leader data.
+            "auto_copy": bool(self.auto_copy_enabled and not paused),
             "copy_paused": paused,
             "copy_block_reason": self._copy_block_reason(),
+            "event_journal": event_journal_state,
             "active_wallets": sorted(self.active_wallets),
             "equity_usd": self.last_equity_usd,
             "positions": positions,
@@ -693,15 +705,6 @@ class PumpFunBot:
                 if window not in {"overall", "day", "week", "month"}:
                     self.message = "Invalid leaderboard window."
                     continue
-                block_reason = self._copy_block_reason()
-                if block_reason:
-                    self.auto_copy_enabled = False
-                    self.store.set_state("auto_copy_enabled", "0")
-                    self.store.set_state("copy_paused", "1")
-                    self._refresh_feed_subscriptions()
-                    self.message = "Auto-copy blocked: " + block_reason
-                    logger.warning("%s", self.message)
-                    continue
                 if not self.leaderboards:
                     self.refresh_leaderboards(force=True)
                 if not self.leaderboards.get(window):
@@ -713,7 +716,14 @@ class PumpFunBot:
                 self.store.set_state("auto_copy_enabled", "1")
                 self.store.set_state("copy_paused", "0")
                 self._refresh_feed_subscriptions()
-                self.message = f"Auto-copy enabled for the top {len(self.leaderboards[window])} traders in {window}."
+                block_reason = self._copy_block_reason()
+                if block_reason:
+                    self.message = (
+                        f"Leader monitoring enabled for the top {len(self.leaderboards[window])} traders "
+                        f"in {window}; new entries remain blocked: {block_reason}"
+                    )
+                else:
+                    self.message = f"Auto-copy enabled for the top {len(self.leaderboards[window])} traders in {window}."
                 logger.warning("%s", self.message)
             elif action == "stop_copy":
                 self.auto_copy_enabled = False
@@ -814,7 +824,7 @@ class PumpFunBot:
             ))
             import hashlib
             tx_sig = "ws-" + hashlib.sha256(seed.encode()).hexdigest()[:40]
-        observed_price = self._event_price_usd(event)
+        observed_price = event.get("_observed_price_usd") or self._event_price_usd(event)
         new_balance = event.get("newTokenBalance") or event.get("new_token_balance")
         post_raw = 0
         if new_balance is not None:
@@ -862,6 +872,73 @@ class PumpFunBot:
             "signal": signal,
         })
 
+    def _record_event_safe(self, **kwargs) -> None:
+        """Best-effort telemetry only: journal errors never enable orders or stop monitoring."""
+        try:
+            recorder = getattr(self.store, "record_event", None)
+            if callable(recorder):
+                recorder(**kwargs)
+        except Exception as exc:
+            logger.warning("Event journal write failed (%s); entry safety gates unchanged", type(exc).__name__)
+
+    @staticmethod
+    def _event_latency_ms(event: dict, now: float | None = None) -> float | None:
+        """Convert a provider timestamp to observed latency only when its unit is clear."""
+        try:
+            raw = float(event.get("timestamp"))
+            if not math.isfinite(raw) or raw <= 0:
+                return None
+            # Epoch milliseconds are ~1e12; epoch seconds are ~1e9.
+            event_time = raw / 1000.0 if raw > 100_000_000_000 else raw
+            latency = ((time.time() if now is None else now) - event_time) * 1000.0
+            if latency < 0 or latency > 7 * 86400 * 1000:
+                return None
+            return latency
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _journal_feed_event(self, event: dict, source: str, now: float) -> float | None:
+        mint = str(event.get("mint") or "")
+        wallet = str(event.get("wallet") or event.get("traderPublicKey") or event.get("userPublicKey") or "")
+        side = str(event.get("side") or event.get("txType") or "").lower()
+        signature = str(event.get("signature") or event.get("txSignature") or event.get("txid")
+                        or event.get("transactionSignature") or "")
+        price = self._event_price_usd(event) if side in {"buy", "sell"} else None
+        if price is not None and price > 0:
+            event["_observed_price_usd"] = price
+        latency = self._event_latency_ms(event, now)
+        kind_by_source = {
+            "account_trade": ("leader_trade", "leader_copy"),
+            "solana_logs": ("leader_notification", "leader_copy"),
+            "token_trade": ("trade_tick", "market_data"),
+            "token_discovery_new": ("token_launch", "token_discovery"),
+        }
+        event_type, strategy = kind_by_source.get(source, ("feed_event", "system"))
+        safe_payload = {
+            key: event.get(key) for key in (
+                "txType", "tokenAmount", "solAmount", "marketCapSol", "marketCapUsd",
+                "realSolReserves", "pool", "timestamp", "bondingCurveKey",
+                "name", "symbol", "uri", "decimals",
+            ) if key in event
+        }
+        self._record_event_safe(
+            event_type=event_type, strategy=strategy, observed_at=now, mint=mint,
+            wallet=wallet, side=side, signature=signature, source=source,
+            status="observed", decision="observed", price_usd=price,
+            latency_ms=latency, payload=safe_payload,
+        )
+        # The exact trade-derived USD price is a market mark for future counterfactual
+        # paths. No virtual-reserve field is ever converted into liquidity.
+        if price is not None and price > 0 and mint:
+            self._record_event_safe(
+                event_type="price_mark", strategy="market_data", observed_at=now,
+                mint=mint, wallet=wallet, side=side, signature=signature,
+                source=source + "_price", status="observed", decision="price_mark",
+                price_usd=price, latency_ms=latency,
+                payload={"mark_origin": event_type, "pool": event.get("pool")},
+            )
+        return price
+
     def _consume_feed_events(self) -> None:
         while True:
             try:
@@ -870,9 +947,20 @@ class PumpFunBot:
                 break
             self.signal_stats["queued_events"] += 1
             source = str(event.get("source") or "")
+            now = time.time()
+            if source in {"account_trade", "token_trade", "token_discovery_new"}:
+                self._journal_feed_event(event, source, now)
             if source == "trending_discovery_candidate":
                 signal = event.get("signal")
                 if isinstance(signal, dict):
+                    self._record_event_safe(
+                        event_type="candidate_decision", strategy="trending_discovery",
+                        observed_at=now, mint=str(signal.get("mint") or ""),
+                        source="trending_discovery_queue", status=str(signal.get("status") or "SCREENED"),
+                        decision="queued_for_main_loop", reason=str(signal.get("decision") or ""),
+                        price_usd=signal.get("price_usd"), liquidity_usd=signal.get("liquidity_usd"),
+                        payload=signal,
+                    )
                     self._buy_trending_discovery(signal)
                 continue
             if source == "token_discovery_new":
@@ -880,33 +968,83 @@ class PumpFunBot:
                 continue
             if source == "token_trade":
                 mint = str(event.get("mint") or "")
-                price = self._event_price_usd(event)
-                if mint and price and price > 0:
+                price = event.get("_observed_price_usd")
+                if price is None:
+                    price = self._event_price_usd(event)
+                try:
+                    price = float(price)
+                except (TypeError, ValueError, OverflowError):
+                    price = 0.0
+                if mint and math.isfinite(price) and price > 0:
                     self.price_cache[mint] = price
-                    self.price_cache_at[mint] = time.time()
+                    self.price_cache_at[mint] = now
                 self.token_discovery.on_token_trade_event(event)
                 continue
-            price = self._event_price_usd(event)
+            price = event.get("_observed_price_usd")
             mint = str(event.get("mint") or "")
-            if mint and price and price > 0:
+            if price is None:
+                price = self._event_price_usd(event)
+            try:
+                price = float(price or 0)
+            except (TypeError, ValueError, OverflowError):
+                price = 0.0
+            if mint and math.isfinite(price) and price > 0:
                 self.price_cache[mint] = price
-                self.price_cache_at[mint] = time.time()
+                self.price_cache_at[mint] = now
             signal = self._signal_from_feed(event)
             if not signal:
                 self.signal_stats["unparsed_events"] += 1
-                logger.warning("Ignoring PumpPortal trade event because required mint/wallet/side/amount fields could not be parsed; fields=%s",
+                reason = "required mint/wallet/side/amount fields could not be parsed"
+                self._record_event_safe(
+                    event_type="signal_decision", strategy="leader_copy", observed_at=now,
+                    mint=mint, wallet=str(event.get("wallet") or event.get("traderPublicKey") or ""),
+                    side=str(event.get("side") or event.get("txType") or "").lower(),
+                    signature=str(event.get("signature") or event.get("txSignature") or event.get("txid") or ""),
+                    source=source or "unknown", status="rejected", decision="rejected",
+                    reason=reason, price_usd=price if price > 0 else None,
+                    payload={"event_keys": sorted(str(k) for k in event.keys())[:50]},
+                )
+                logger.warning("Ignoring PumpPortal trade event because required fields could not be parsed; fields=%s",
                                ",".join(sorted(str(k) for k in event.keys())))
                 continue
             if signal["wallet"] not in self.active_wallets:
                 self.signal_stats["unwatched_events"] += 1
-                logger.warning("Ignoring PumpPortal %s event for a wallet not in active subscriptions (%s)",
+                self._record_event_safe(
+                    event_type="signal_decision", strategy="leader_copy", observed_at=now,
+                    mint=signal["mint"], wallet=signal["wallet"], side=signal["side"],
+                    signature=signal["signature"], source=signal.get("source") or source,
+                    status="rejected", decision="rejected",
+                    reason="wallet not in active leader subscriptions",
+                    price_usd=signal.get("observed_price_usd"),
+                    latency_ms=self._event_latency_ms(event, now), payload={"venue": signal.get("venue")},
+                )
+                logger.warning("Ignoring PumpPortal %s event for wallet outside active subscriptions (%s)",
                                signal["side"], signal["wallet"][:8])
                 continue
             dedupe_key = self._dedupe_key(signal["wallet"], signal["signature"])
             if self.store.signature_seen(dedupe_key):
                 self.signal_stats["duplicate_events"] += 1
+                self._record_event_safe(
+                    event_type="signal_decision", strategy="leader_copy", observed_at=now,
+                    mint=signal["mint"], wallet=signal["wallet"], side=signal["side"],
+                    signature=signal["signature"], source=signal.get("source") or source,
+                    status="rejected", decision="duplicate",
+                    reason="leader signature already processed by another feed",
+                    price_usd=signal.get("observed_price_usd"),
+                )
                 continue
             self.signal_stats["parsed_signals"] += 1
+            self._record_event_safe(
+                event_type="signal_decision", strategy="leader_copy", observed_at=now,
+                mint=signal["mint"], wallet=signal["wallet"], side=signal["side"],
+                signature=signal["signature"], source=signal.get("source") or source,
+                status="observed", decision="accepted_for_processing",
+                reason="parsed from leader trade event; risk/entry checks still apply",
+                price_usd=signal.get("observed_price_usd"),
+                latency_ms=self._event_latency_ms(event, now),
+                liquidity_usd=signal.get("curve_liquidity_usd"),
+                payload={"venue": signal.get("venue"), "amount_ui": signal.get("amount_ui")},
+            )
             logger.info("Copy signal parsed: side=%s wallet=%s mint=%s source=%s",
                         signal["side"], signal["wallet"][:8], signal["mint"][:8], signal.get("source"))
             self.process_signal(signal)
@@ -920,21 +1058,45 @@ class PumpFunBot:
             except queue.Empty:
                 break
             self.signal_stats["rpc_log_notifications"] += 1
+            now = time.time()
             wallet = str(event.get("wallet") or "")
             signature = str(event.get("signature") or "")
+            self._record_event_safe(
+                event_type="leader_notification", strategy="leader_copy", observed_at=now,
+                wallet=wallet, signature=signature, source="solana_logs", status="observed",
+                decision="transaction_notification", payload={"retry_count": event.get("_retry_count")},
+            )
             if not wallet or not signature:
+                self._record_event_safe(
+                    event_type="signal_decision", strategy="leader_copy", observed_at=now,
+                    wallet=wallet, signature=signature, source="solana_logs",
+                    status="rejected", decision="rejected",
+                    reason="wallet or transaction signature missing",
+                )
                 continue
             if wallet not in self.active_wallets:
                 self.signal_stats["unwatched_events"] += 1
+                self._record_event_safe(
+                    event_type="signal_decision", strategy="leader_copy", observed_at=now,
+                    wallet=wallet, signature=signature, source="solana_logs",
+                    status="rejected", decision="rejected",
+                    reason="wallet not in active leader subscriptions",
+                )
                 continue
             dedupe_key = self._dedupe_key(wallet, signature)
             if self.store.signature_seen(dedupe_key):
                 self.signal_stats["duplicate_events"] += 1
+                self._record_event_safe(
+                    event_type="signal_decision", strategy="leader_copy", observed_at=now,
+                    wallet=wallet, signature=signature, source="solana_logs",
+                    status="rejected", decision="duplicate",
+                    reason="leader signature already processed by another feed",
+                )
                 continue
             if self.rpc.backoff_remaining > 0:
                 self.solana_log_events.put(event)
                 break
-            event.setdefault("_first_seen_at", time.time())
+            event.setdefault("_first_seen_at", now)
             try:
                 signals = self.detect_pump_signal(wallet, signature)
             except SolanaRPCRateLimited:
@@ -959,11 +1121,58 @@ class PumpFunBot:
                 continue
             except Exception as exc:
                 logger.warning("Could not inspect Solana log notification (%s)", type(exc).__name__)
+                self._record_event_safe(
+                    event_type="signal_decision", strategy="leader_copy", observed_at=time.time(),
+                    wallet=wallet, signature=signature, source="solana_logs",
+                    status="unknown", decision="rejected",
+                    reason=f"transaction inspection failed ({type(exc).__name__})",
+                )
                 continue
+            if not signals:
+                self._record_event_safe(
+                    event_type="signal_decision", strategy="leader_copy", observed_at=time.time(),
+                    wallet=wallet, signature=signature, source="solana_logs",
+                    status="rejected", decision="rejected",
+                    reason="transaction did not pass signer, Pump/PumpSwap program and trade-delta checks",
+                )
             for signal in signals:
                 signal["source"] = "solana_logs"
+                leader_trade_at = time.time()
+                leader_price = _finite(signal.get("observed_price_usd"))
+                self._record_event_safe(
+                    event_type="leader_trade", strategy="leader_copy",
+                    observed_at=leader_trade_at, mint=str(signal.get("mint") or ""),
+                    wallet=wallet, side=str(signal.get("side") or ""),
+                    signature=str(signal.get("signature") or signature),
+                    source="solana_logs_tx_parsed", status="signer_verified",
+                    decision="trade_delta_verified",
+                    reason="transaction signer and Pump/PumpSwap trade-delta checks passed",
+                    price_usd=leader_price,
+                    liquidity_usd=signal.get("curve_liquidity_usd"),
+                    payload={"venue": signal.get("venue"), "amount_ui": signal.get("amount_ui")},
+                )
+                if leader_price is not None and leader_price > 0:
+                    self._record_event_safe(
+                        event_type="price_mark", strategy="market_data",
+                        observed_at=leader_trade_at, mint=str(signal.get("mint") or ""),
+                        wallet=wallet, side=str(signal.get("side") or ""),
+                        signature=str(signal.get("signature") or signature),
+                        source="solana_logs_verified_trade_price", status="observed",
+                        decision="price_mark", price_usd=leader_price,
+                        liquidity_usd=signal.get("curve_liquidity_usd"),
+                        payload={"venue": signal.get("venue"), "mark_origin": "verified_leader_trade"},
+                    )
                 self.signal_stats["parsed_signals"] += 1
                 self.signal_stats["rpc_log_signals"] += 1
+                self._record_event_safe(
+                    event_type="signal_decision", strategy="leader_copy", observed_at=time.time(),
+                    mint=signal["mint"], wallet=wallet, side=signal["side"],
+                    signature=signal["signature"], source="solana_logs",
+                    status="observed", decision="accepted_for_processing",
+                    reason="confirmed signer and Pump/PumpSwap trade-delta checks passed",
+                    price_usd=signal.get("observed_price_usd"),
+                    payload={"venue": signal.get("venue"), "amount_ui": signal.get("amount_ui")},
+                )
                 logger.info(
                     "Solana logs copy signal parsed: side=%s wallet=%s mint=%s",
                     signal["side"], wallet[:8], signal["mint"][:8],
@@ -1757,6 +1966,81 @@ class PumpFunBot:
         )
         logger.warning("Live transaction confirmed: https://solscan.io/tx/%s", tx_sig)
 
+    def _entry_cost_inputs(self, strategy: str, signal: dict) -> dict:
+        """Record an estimate plus every missing measured input; never call it realized cost."""
+        supplied = signal.get("cost_inputs")
+        if isinstance(supplied, dict) and supplied.get("complete_for_after_cost_verdict") is True:
+            # Only explicitly marked, measured order-level costs can close the evidence gate.
+            return dict(supplied)
+        try:
+            configured_cap = min(
+                0.50, float(getattr(self.s, "max_entry_usd", 0.50)),
+                float(signal.get("planned_entry_usd") or getattr(self.s, "max_entry_usd", 0.50)),
+            )
+            liquidity = (
+                signal.get("verified_real_liquidity_usd")
+                or signal.get("real_curve_liquidity_usd")
+                or signal.get("real_liquidity_usd")
+                or signal.get("curve_liquidity_usd")
+                or signal.get("liquidity_usd")
+            )
+            route = "jupiter_ultra" if strategy == "trending_discovery" else "native_pump_sdk"
+            venue = str(signal.get("venue") or signal.get("pool_name") or "unknown")
+            assumptions = assumptions_from_settings(
+                self.s,
+                stream_events_attributed_per_round_trip=(
+                    0.0 if strategy == "trending_discovery"
+                    else signal.get("pumpportal_stream_events_attributed_per_round_trip")
+                ),
+            )
+            estimate = estimate_round_trip_cost(
+                notional_usd=max(0.01, configured_cap),
+                route=route,
+                venue=venue,
+                liquidity_usd=liquidity,
+                sol_usd=signal.get("sol_usd"),
+                assumptions=assumptions,
+            )
+            estimate["measurement_basis"] = "estimate_only"
+            return estimate
+        except Exception as exc:
+            return {
+                "status": "ESTIMATE_UNAVAILABLE",
+                "complete_for_after_cost_verdict": False,
+                "missing_inputs": ["validated_cost_estimate"],
+                "error_type": type(exc).__name__,
+                "measurement_basis": "estimate_only",
+            }
+
+    def _record_entry_decision(
+        self, strategy: str, signal: dict, decision: str, reason: str,
+        *, status: str | None = None,
+    ) -> None:
+        """Journal entry gate outcomes without changing the entry gate or retry policy."""
+        self._record_event_safe(
+            event_type="entry_decision",
+            strategy=strategy,
+            observed_at=time.time(),
+            mint=str(signal.get("mint") or ""),
+            wallet=str(signal.get("wallet") or ""),
+            side="buy",
+            signature=str(signal.get("signature") or ""),
+            source=str(signal.get("source") or "entry_pipeline"),
+            status=status or decision,
+            decision=decision,
+            reason=reason,
+            price_usd=signal.get("observed_price_usd") or signal.get("price_usd"),
+            liquidity_usd=(signal.get("verified_real_liquidity_usd")
+                           or signal.get("curve_liquidity_usd") or signal.get("liquidity_usd")),
+            latency_ms=signal.get("signal_latency_ms"),
+            cost_inputs=self._entry_cost_inputs(strategy, signal),
+            payload={
+                "venue": signal.get("venue"),
+                "amount_ui": signal.get("amount_ui"),
+                "planned_entry_usd": signal.get("planned_entry_usd"),
+            },
+        )
+
     def buy(
         self, signal: dict, *, strategy: str = "leader_copy",
         entry_cap_usd: float | None = None,
@@ -1773,6 +2057,7 @@ class PumpFunBot:
                 or signal.get("fresh_security_verified") is not True
             ):
                 logger.warning("Reject discovery buy %s: live discovery opt-in or fresh security verification missing", mint[:8])
+                self._record_entry_decision(strategy, signal, "rejected", "live discovery opt-in or fresh security verification missing")
                 return
             discovery_positions = [
                 p for p in self.store.list_positions()
@@ -1780,6 +2065,7 @@ class PumpFunBot:
             ]
             if discovery_positions:
                 logger.info("Reject discovery buy %s: one live discovery position is already open", mint[:8])
+                self._record_entry_decision(strategy, signal, "rejected", "one live discovery position is already open")
                 return
             entry_cap_usd = min(
                 0.50, float(self.s.token_discovery_max_entry_usd),
@@ -1787,9 +2073,11 @@ class PumpFunBot:
             )
             if entry_cap_usd <= 0:
                 logger.warning("Reject discovery buy %s: discovery entry cap is zero", mint[:8])
+                self._record_entry_decision(strategy, signal, "rejected", "discovery entry cap is zero")
                 return
         elif strategy != "leader_copy":
             logger.warning("Reject buy %s: unsupported entry strategy %s", mint[:8], strategy)
+            self._record_entry_decision(str(strategy), signal, "rejected", "unsupported entry strategy")
             return
         source_wallet = str(signal.get("wallet") or "") or None
         source_signature = str(signal.get("signature") or "") or None
@@ -1798,11 +2086,14 @@ class PumpFunBot:
                 "Skipping buy for %s because an earlier transaction outcome remains unresolved",
                 mint[:8],
             )
+            self._record_entry_decision(strategy, signal, "rejected", "earlier transaction outcome remains unresolved")
             return
         if self.store.get_position(mint):
+            self._record_entry_decision(strategy, signal, "rejected", "position already exists for mint")
             return
         if self._native_build_retry_deferred(mint):
             logger.debug("Skipping repeated build for mint=%s during pre-submission cooldown", mint[:8])
+            self._record_entry_decision(strategy, signal, "rejected", "native transaction builder retry cooldown active")
             return
         sol_price = self.market.sol_price_usd()
         market = self.market.token_market(mint)
@@ -1811,11 +2102,15 @@ class PumpFunBot:
             observed_price = float(market.get("price_usd") or 0)
         if observed_price <= 0:
             logger.info("Reject Pump.fun buy %s: no reliable trade or market price yet", mint)
+            self._record_entry_decision(strategy, signal, "rejected", "no reliable trade or market price")
             return
 
         curve_liquidity = float(signal.get("curve_liquidity_usd") or 0)
         pair_liquidity = float(market.get("liquidity_usd") or 0) if market else 0.0
         actual_liquidity = max(curve_liquidity, pair_liquidity)
+        signal["sol_usd"] = sol_price
+        signal["verified_real_liquidity_usd"] = actual_liquidity
+        signal["observed_price_usd"] = observed_price
         discovery_liquidity_floor = max(
             5000.0, float(getattr(self.s, "token_discovery_min_liquidity_usd", 5000.0))
         )
@@ -1827,6 +2122,7 @@ class PumpFunBot:
                 "Reject discovery buy %s: fresh real curve liquidity %.0f USD below %.0f USD",
                 mint[:8], curve_liquidity, discovery_liquidity_floor,
             )
+            self._record_entry_decision(strategy, signal, "rejected", f"fresh real curve liquidity ${curve_liquidity:.2f} below ${discovery_liquidity_floor:.2f}")
             return
         curve_state_verified = bool(signal.get("curve_state_verified"))
         venue = str(signal.get("venue", "pump"))
@@ -1853,13 +2149,16 @@ class PumpFunBot:
                 "Reject buy %s: indexed market pair unavailable and fresh verified on-chain curve fallback criteria were not met",
                 mint[:8],
             )
+            self._record_entry_decision(strategy, signal, "rejected", "indexed market pair unavailable; verified on-chain curve fallback criteria not met")
             return
         if actual_liquidity < portfolio_liquidity_floor:
             logger.info("Reject Pump.fun buy %s: verified/observed liquidity %.0f USD below %.0f USD",
                         mint, actual_liquidity, portfolio_liquidity_floor)
+            self._record_entry_decision(strategy, signal, "rejected", f"verified/observed liquidity ${actual_liquidity:.2f} below ${portfolio_liquidity_floor:.2f}")
             return
         if market and int(market.get("pair_age_seconds") or 0) < self.s.min_pair_age_seconds and not unindexed_pump_entry:
             logger.info("Reject Pump.fun buy %s: pair age below filter", mint)
+            self._record_entry_decision(strategy, signal, "rejected", "market pair age below configured filter")
             return
         if unindexed_pump_entry:
             logger.warning(
@@ -1875,6 +2174,7 @@ class PumpFunBot:
         )
         if not allowed:
             logger.info("Reject buy %s: %s", mint, reason)
+            self._record_entry_decision(strategy, signal, "rejected", reason)
             return
         effective_entry_cap = self.s.max_entry_usd
         if strategy == "token_discovery":
@@ -1883,8 +2183,10 @@ class PumpFunBot:
                 float(entry_cap_usd if entry_cap_usd is not None else self.s.token_discovery_max_entry_usd),
             )
         spend = min(effective_entry_cap, self.s.max_total_exposure_usd - self._current_positions_value())
+        signal["planned_entry_usd"] = spend
         minimum_practical_spend = 0.10 if strategy == "token_discovery" else 0.50
         if spend < minimum_practical_spend:
+            self._record_entry_decision(strategy, signal, "rejected", f"practical entry size below minimum ${minimum_practical_spend:.2f}")
             return
 
         reservation_id, reserve_reason = self.risk_engine.reserve_entry(
@@ -1893,6 +2195,7 @@ class PumpFunBot:
         )
         if not reservation_id:
             logger.warning("Reject buy %s: risk reservation denied: %s", str(mint)[:8], reserve_reason)
+            self._record_entry_decision(strategy, signal, "rejected", f"risk reservation denied: {reserve_reason}")
             return
 
         decimals = int(signal.get("decimals") or 6)
@@ -1912,11 +2215,13 @@ class PumpFunBot:
                     reservation_id, status="failed", detail="Paper output amount rounded to zero."
                 )
                 logger.info("Reject %s: estimated output rounds to zero", mint)
+                self._record_entry_decision(strategy, signal, "rejected", "estimated output amount rounds to zero")
                 return
             admitted, admission_reason = self.risk_engine.mark_submitting(reservation_id)
             if not admitted:
                 self.risk_engine.release_entry(reservation_id, status="released", detail=admission_reason)
                 logger.warning("Reject %s: %s", str(mint)[:8], admission_reason)
+                self._record_entry_decision(strategy, signal, "rejected", admission_reason)
                 return
             cash = float(self.store.get_state("paper_cash", "0"))
             self.store.set_state("paper_cash", cash - spend - cost)
@@ -1931,6 +2236,7 @@ class PumpFunBot:
             if not admitted:
                 self.risk_engine.release_entry(reservation_id, status="released", detail=admission_reason)
                 logger.warning("Reject %s: %s", str(mint)[:8], admission_reason)
+                self._record_entry_decision(strategy, signal, "rejected", admission_reason)
                 return
             assert self.keypair is not None and self.wallet_address is not None
             try:
@@ -1949,6 +2255,7 @@ class PumpFunBot:
                     reservation_id, status="failed",
                     detail="Transaction was verified expired and not landed.",
                 )
+                self._record_entry_decision(strategy, signal, "rejected", "transaction expired and was verified not landed")
                 return
             except TransactionOutcomeUncertain as exc:
                 self._handle_uncertain_trade(
@@ -1956,6 +2263,7 @@ class PumpFunBot:
                     source_wallet=source_wallet,
                     source_signature=source_signature,
                 )
+                self._record_entry_decision(strategy, signal, "uncertain", f"transaction outcome uncertain: {type(exc).__name__}", status="uncertain")
                 return
             except TransactionBuildFailed as exc:
                 self.risk_engine.release_entry(
@@ -1971,6 +2279,7 @@ class PumpFunBot:
                         "delegating to fresh-entry recovery (retryable_slippage=%s)",
                         mint[:8], exc.retryable,
                     )
+                    self._record_entry_decision(strategy, signal, "rejected", f"pre-submission simulation failed ({type(exc).__name__}): {str(exc)[:200]}")
                     raise
                 delay = self._defer_native_build_retry(mint, str(exc))
                 logger.warning(
@@ -1978,6 +2287,7 @@ class PumpFunBot:
                     "retry for this mint is deferred %ds.",
                     mint[:8], " ".join(str(exc).split())[:220], delay,
                 )
+                self._record_entry_decision(strategy, signal, "rejected", f"pre-submission transaction build blocked ({type(exc).__name__}): {str(exc)[:200]}")
                 return
             except Exception as exc:
                 self._handle_uncertain_trade(
@@ -1988,6 +2298,7 @@ class PumpFunBot:
                     source_wallet=source_wallet,
                     source_signature=source_signature,
                 )
+                self._record_entry_decision(strategy, signal, "uncertain", f"executor exception after submission boundary ({type(exc).__name__}); reconciliation required", status="uncertain")
                 return
             tx_sig = ""
             try:
@@ -2012,6 +2323,7 @@ class PumpFunBot:
                     source_wallet=source_wallet,
                     source_signature=source_signature,
                 )
+                self._record_entry_decision(strategy, signal, "uncertain", f"executor fill details could not be reconciled ({type(exc).__name__})", status="uncertain")
                 return
 
         # Start the hold timer only after the buy has succeeded and its fill is known.
@@ -2054,6 +2366,7 @@ class PumpFunBot:
                 source_wallet=source_wallet,
                 source_signature=source_signature,
             )
+            self._record_entry_decision(strategy, signal, "uncertain", f"buy fill could not be persisted to local ledger ({type(exc).__name__})", status="uncertain")
             return
         self.risk_engine.release_entry(
             reservation_id, status="completed", detail="Buy fill and ledger record completed."
@@ -2066,6 +2379,13 @@ class PumpFunBot:
         logger.warning(
             "BUY %s raw=%s cost=%.4f USD strategy=%s source=%s pool=%s",
             mint, raw_out, cost_basis, strategy, source_wallet or "token-discovery", used_pool,
+        )
+        self._record_entry_decision(
+            strategy,
+            {**signal, "observed_price_usd": effective_price, "planned_entry_usd": spend},
+            "opened",
+            f"position and trade ledger persisted; {self.s.mode} fill recorded; cost basis USD {cost_basis:.4f}",
+            status="position_opened",
         )
         self._refresh_feed_subscriptions()
         if self.s.mode == "live":
@@ -2502,10 +2822,18 @@ class PumpFunBot:
         return True
 
     def _set_discovery_live_status(self, candidate: dict, status: str, reason: str) -> None:
+        normalized = " ".join(str(reason or "").split())[:500]
         candidate["live_entry_status"] = status
         candidate["live_entry_status_updated_at"] = time.time()
-        candidate["live_entry_reason"] = " ".join(str(reason or "").split())[:500]
+        candidate["live_entry_reason"] = normalized
         self.token_discovery._save(candidate)
+        state = str(status or "unknown").lower()
+        decision = "rejected" if state in {
+            "blocked", "failed", "rejected", "skipped_stale", "expired", "dropped"
+        } else state
+        self._record_entry_decision(
+            "token_discovery", candidate, decision, normalized, status=state
+        )
 
     def _schedule_discovery_live_preflight_retry(self, candidate: dict, reason: str) -> None:
         """Retry transient pre-submission failures only while the original entry is fresh."""
@@ -3134,6 +3462,27 @@ class PumpFunBot:
                         self.store.upsert_position(pos)
 
     def process_signal(self, signal: dict):
+        if signal.get("wallet") not in self.active_wallets:
+            self._record_event_safe(
+                event_type="signal_decision", strategy="leader_copy", observed_at=time.time(),
+                mint=str(signal.get("mint") or ""), wallet=str(signal.get("wallet") or ""),
+                side=str(signal.get("side") or ""), signature=str(signal.get("signature") or ""),
+                source=str(signal.get("source") or "signal_pipeline"), status="rejected",
+                decision="rejected", reason="wallet not in active leader subscriptions",
+                price_usd=signal.get("observed_price_usd"),
+            )
+            return
+        self._record_event_safe(
+            event_type="signal_decision", strategy="leader_copy", observed_at=time.time(),
+            mint=str(signal.get("mint") or ""), wallet=str(signal.get("wallet") or ""),
+            side=str(signal.get("side") or ""), signature=str(signal.get("signature") or ""),
+            source=str(signal.get("source") or "signal_pipeline"), status="observed",
+            decision="accepted_for_processing",
+            reason="signal passed parsing and active-wallet checks; entry gates still apply",
+            price_usd=signal.get("observed_price_usd"),
+            liquidity_usd=signal.get("curve_liquidity_usd"),
+            payload={"venue": signal.get("venue"), "amount_ui": signal.get("amount_ui")},
+        )
         if signal.get("wallet") not in self.active_wallets:
             return
         self.store.add_signal(signal["wallet"], signal["signature"], signal["mint"], signal["side"],

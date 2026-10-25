@@ -31,6 +31,12 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px 8px
 <body><main>
 <header><div><h1>Memecoin <span class="muted">/ Pump.fun</span></h1><div class="muted">Top traders · automatic copy · manual exits</div></div><div><span class="pill" id="mode">MODE</span> <button id="refresh">Refresh</button></div></header>
 <div id="message" class="status">Connecting to local bot...</div>
+<section class="panel" id="evidencePanel">
+  <div class="toolbar"><h2>Data-first evidence</h2><span class="pill">OBSERVATION ONLY</span></div>
+  <div id="evidenceMessage" class="muted">Waiting for journal counters…</div>
+  <div class="grid" id="modeEvidence"></div>
+  <div class="footer">Paper-ledger PnL and counterfactual price paths are separate. These counters are not evidence of positive after-cost expectancy or permission to trade live.</div>
+</section>
 <section class="panel"><div class="toolbar"><div><h2>Global entry safety gate <span class="pill" id="entryGateStatus">HALTED</span></h2><div class="muted">Blocks new buys across all strategies. Existing positions continue to be managed; the switch does not auto-liquidate holdings. Every process startup requires an explicit resume.</div></div><button id="entryGateToggle" class="primary">Resume new entries</button></div><div id="entryGateDetail" class="status">Risk-control state is loading…</div><div id="unresolvedTransactions" class="status">Checking unresolved transactions and reservations…</div><div class="footer">Only acknowledge after independently checking transaction history and actual wallet balances. Acknowledgement does not enable entries; use the separate resume control afterwards.</div></section>
 <div class="grid"><div class="metric"><small>Estimated equity</small><strong id="equity">—</strong></div>
 <div class="metric"><small>Open positions</small><strong id="posCount">0</strong></div><div class="metric"><small>Auto-copy</small><strong id="copyStatus">OFF</strong></div>
@@ -112,6 +118,27 @@ function render(d){
     : "SCANNER DISABLED · Set TOKEN_DISCOVERY_ENABLED=true to enable screening. Live execution additionally requires TOKEN_DISCOVERY_LIVE_ENABLED=true, BOT_MODE=live and explicit live confirmation.";
   el("opportunityFunnel").textContent = "Tracked launches: "+(td.tracked_candidates||0)+" · Queued: "+(td.queue_count||0)+" · On-chain safety passed: "+(td.safety_passed_count||0)+" · Entry gates passed: "+(td.qualified_count||0)+" · Live attempts: "+(td.live_attempted_count||0)+" · Confirmed live buys: "+(td.live_confirmed_count||0)+" · Failed/blocked/stale: "+(td.live_failed_count||0)+" · Unfilled shadow candidates later peaking +20% or more: "+(td.unfilled_peak_20_count||0)+" (hypothetical movement, not realized profit).";
   function esc(v){return String(v===undefined||v===null?"":v).replace(/[&<>"']/g,function(ch){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]})}
+  var ej=d.event_journal||{}, modeMap=ej.by_strategy||{};
+  el("evidenceMessage").textContent="Journal rows: "+(ej.total_events||0)+
+    " · Retention cap: "+(ej.retention_rows||500000)+
+    " · Last observation: "+(ej.last_event_at?new Date(Number(ej.last_event_at)*1000).toLocaleString():"none yet")+
+    " · "+(ej.note||"Counters only; no live-edge conclusion.");
+  var modeRows=[
+    ["leader_copy","A · Leader copy"],
+    ["trending_discovery","B · Trending tokens"],
+    ["token_discovery","C · New-token discovery"]
+  ];
+  el("modeEvidence").innerHTML=modeRows.map(function(pair){
+    var m=modeMap[pair[0]]||{};
+    return "<div class='metric'><small>"+pair[1]+"</small>"+
+      "<strong>"+Number(m.events||0)+" events</strong>"+
+      "<div class='muted'>Decisions/rejections: "+Number(m.rejections||0)+
+      " · Paper sell rows: "+Number(m.paper_sell_rows||0)+
+      " · Paper realized PnL: $"+num(m.paper_realized_pnl_usd||0)+
+      "</div><div class='muted'>Top rejection: "+
+      (m.top_rejections&&m.top_rejections.length?String(m.top_rejections[0].reason||"unspecified").slice(0,100):"none recorded")+
+      "</div></div>";
+  }).join("");
   var rc=d.risk_control||{};
   el("entryGateStatus").textContent=rc.kill_switch_active?"NEW ENTRIES HALTED":"ENTRY GATE OPEN";
   el("entryGateToggle").textContent=rc.kill_switch_active?"Resume new entries":"Engage kill switch";

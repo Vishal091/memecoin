@@ -8,6 +8,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from execution_costs import assumptions_from_settings, estimate_round_trip_cost
+
 import requests
 
 from native_pump import TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID
@@ -692,17 +694,44 @@ class TrendingTokenScanner:
         return row
 
     def set_live_status(self, mint: str, status: str, reason: str) -> None:
-        """Persist one-shot live-attempt state so restarts cannot replay a buy."""
+        """Persist one-shot attempt state and journal its reason without submitting trades."""
         normalized = " ".join(str(reason or "").split())[:500]
+        updated_at = time.time()
+        candidate_snapshot = {}
         if self.store is not None:
             self.store.set_state(f"trending_live_status:{mint}", str(status))
             self.store.set_state(f"trending_live_reason:{mint}", normalized)
-            self.store.set_state(f"trending_live_status_at:{mint}", str(time.time()))
+            self.store.set_state(f"trending_live_status_at:{mint}", str(updated_at))
         with self._lock:
             if mint in self._candidates:
                 self._candidates[mint]["live_entry_status"] = str(status)
                 self._candidates[mint]["live_entry_reason"] = normalized
-                self._candidates[mint]["live_entry_status_updated_at"] = time.time()
+                self._candidates[mint]["live_entry_status_updated_at"] = updated_at
+                candidate_snapshot = dict(self._candidates[mint])
+        record_event = getattr(self.store, "record_event", None) if self.store is not None else None
+        if callable(record_event):
+            state = str(status or "unknown").lower()
+            decision = "rejected" if state in {"blocked", "failed", "rejected", "skipped_stale", "stale_queue"} else state
+            try:
+                cost_inputs = candidate_snapshot.get("cost_inputs")
+                if not isinstance(cost_inputs, dict):
+                    cost_inputs = estimate_round_trip_cost(
+                        notional_usd=0.50, route="jupiter_ultra",
+                        venue=str(candidate_snapshot.get("venue") or candidate_snapshot.get("dex_id") or "unknown"),
+                        liquidity_usd=candidate_snapshot.get("liquidity_usd"), sol_usd=None,
+                        assumptions=assumptions_from_settings(self.settings, stream_events_attributed_per_round_trip=0.0),
+                    )
+                    cost_inputs["measurement_basis"] = "estimate_only"
+                record_event(
+                    event_type="entry_decision", strategy="trending_discovery",
+                    observed_at=updated_at, mint=mint, side="buy", source="trending_live_status",
+                    status=state, decision=decision, reason=normalized,
+                    price_usd=candidate_snapshot.get("price_usd"),
+                    liquidity_usd=candidate_snapshot.get("liquidity_usd"),
+                    cost_inputs=cost_inputs, payload={"status": state, "pool_name": candidate_snapshot.get("pool_name")},
+                )
+            except Exception as exc:
+                logger.warning("Could not persist trending entry status (%s)", type(exc).__name__)
 
     def _stored_live_status(self, mint: str) -> tuple[str, str, float]:
         if self.store is None:
@@ -796,6 +825,84 @@ class TrendingTokenScanner:
                     item["live_entry_reason"] = live_reason
                     item["live_entry_status_updated_at"] = live_updated_at
                 self._candidates[item["mint"]] = item
+                # Journal every first-pass outcome, including rejected/filtered rows.
+                # This makes rejection analysis possible even when the candidate never
+                # reaches the pre-trade queue. Positive price marks are also retained for
+                # subsequent counterfactual price-path evaluation.
+                record_event = getattr(self.store, "record_event", None)
+                if callable(record_event):
+                    item_status = str(item.get("status") or "UNKNOWN").upper()
+                    item_decision = str(item.get("decision") or "")
+                    eligible_mark = item.get("shadow_eligible") is True
+                    rejected = item_status in {"REJECTED", "FILTERED", "UNKNOWN"} or not eligible_mark
+                    try:
+                        observed_at = _num(item.get("updated_at")) or time.time()
+                        try:
+                            pool_venue = str(item.get("venue") or item.get("dex_id") or "unknown")
+                            candidate_costs = estimate_round_trip_cost(
+                                notional_usd=0.50,
+                                route="jupiter_ultra",
+                                venue=pool_venue,
+                                liquidity_usd=item.get("liquidity_usd"),
+                                sol_usd=None,
+                                assumptions=assumptions_from_settings(
+                                    self.settings,
+                                    stream_events_attributed_per_round_trip=0.0,
+                                ),
+                            )
+                            candidate_costs["measurement_basis"] = "estimate_only"
+                        except Exception as cost_exc:
+                            candidate_costs = {
+                                "status": "ESTIMATE_UNAVAILABLE",
+                                "complete_for_after_cost_verdict": False,
+                                "missing_inputs": ["validated_cost_estimate"],
+                                "error_type": type(cost_exc).__name__,
+                            }
+                        record_event(
+                            event_type="candidate_decision",
+                            strategy="trending_discovery",
+                            observed_at=observed_at,
+                            mint=str(item.get("mint") or ""),
+                            side="screen",
+                            source="geckoterminal_trending_scan",
+                            status=item_status,
+                            decision="rejected" if rejected else "shadow_eligible",
+                            reason=item_decision,
+                            price_usd=item.get("price_usd"),
+                            liquidity_usd=item.get("liquidity_usd"),
+                            cost_inputs=candidate_costs,
+                            payload=item,
+                        )
+                        mark = _num(item.get("price_usd"))
+                        if mark is not None and mark > 0:
+                            record_event(
+                                event_type="price_mark",
+                                strategy="market_data",
+                                observed_at=observed_at,
+                                mint=str(item.get("mint") or ""),
+                                source=str(item.get("market_price_source") or "gecko_dexscreener"),
+                                status=item_status,
+                                price_usd=mark,
+                                liquidity_usd=item.get("liquidity_usd"),
+                                payload={
+                                    "strategy_source": "trending_discovery",
+                                    "pool_address": item.get("pool_address"),
+                                    "pool_name": item.get("pool_name"),
+                                    "market_cap_usd": item.get("market_cap_usd"),
+                                    "market_price_source": item.get("market_price_source"),
+                                    "same_pool_crosscheck": item.get("same_pool_crosscheck"),
+                                    "shadow_eligible": eligible_mark,
+                                },
+                            )
+                    except Exception as exc:
+                        self._shadow_observation_errors += 1
+                        now = time.time()
+                        if now - self._last_shadow_observation_error_at >= 60:
+                            logger.warning(
+                                "Could not persist trending event journal row (%s)",
+                                type(exc).__name__,
+                            )
+                            self._last_shadow_observation_error_at = now
                 is_trade_candidate = (
                     item.get("status") == "SCREENED"
                     and int(item.get("momentum_score") or 0) >= int(getattr(self.settings, "trending_min_score", 75))

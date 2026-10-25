@@ -195,3 +195,8 @@ python shadow_evaluation.py --db memecoin-phase5-paper.db --json-out reports/pha
 ```
 
 The evaluator uses first qualifying entries chronologically, measures 1/5/15-minute returns, reports adverse excursion and cost-sensitivity scenarios, keeps screened missing-price candidates visible but excludes them from returns, and separates paper-ledger P&L from shadow marks. It reports insufficient data honestly; review readiness is not live-trading authorization. Initial review targets are at least 30 elapsed days and 100 evaluable 15-minute samples per strategy. No live orders are submitted by the evaluator.
+
+
+## Phase 6A — data-first observation
+
+The incremental data-first work is documented in [docs/phase6_data_first.md](docs/phase6_data_first.md). It adds a secret-safe, bounded SQLite event journal, observation-only dashboard counters, configurable cost assumptions, a read-only per-mode reference-price report, and tests. It does not prove profitability or enable live trading. The paper-forward trial must collect real observations before any mode can be evaluated for after-cost expectancy.

@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from event_journal import EventJournal
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -23,6 +25,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self._init(starting_cash)
+        self.journal = EventJournal(self.db, self.lock)
         existing_mode = self.get_state("database_mode", "")
         has_history = (
             self.db.execute("SELECT COUNT(*) FROM trades").fetchone()[0] > 0 or
@@ -315,6 +318,45 @@ class Store:
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (utc_now(), mode, action, mint, str(amount_raw), float(price_usd), float(value_usd),
                  float(pnl_usd), reason, source_wallet, source_signature, tx_signature, str(strategy or "leader_copy")))
+        # A ledger row also becomes an immutable event-journal fill record. This is
+        # observability only: the strategy executor and risk gate have already decided.
+        try:
+            self.record_event(
+                event_type="paper_trade" if str(mode).lower() == "paper" else "trade_fill",
+                strategy=str(strategy or "leader_copy"),
+                observed_at=__import__("time").time(),
+                mint=mint,
+                wallet=source_wallet or "",
+                side=str(action or "").lower(),
+                signature=str(tx_signature or source_signature or ""),
+                source="trade_ledger",
+                status="ledger_recorded",
+                decision="fill_recorded",
+                reason=str(reason or "")[:500],
+                price_usd=price_usd,
+                payload={
+                    "mode": str(mode),
+                    "action": str(action),
+                    "amount_raw": str(amount_raw),
+                    "value_usd": float(value_usd),
+                    "pnl_usd": float(pnl_usd),
+                    "source_wallet": source_wallet,
+                    "source_signature": source_signature,
+                    "tx_signature": tx_signature,
+                },
+            )
+        except Exception as exc:
+            # Instrumentation must not convert a successfully-written ledger row
+            # into a false transaction/position persistence failure.
+            __import__("logging").getLogger("storage").warning(
+                "Trade ledger row saved but event-journal write failed (%s)",
+                type(exc).__name__,
+            )
+            try:
+                errors = int(self.get_state("event_journal_write_errors", "0") or 0)
+                self.set_state("event_journal_write_errors", errors + 1)
+            except Exception:
+                pass
 
     def equity_snapshot(self) -> dict:
         return {
@@ -736,6 +778,18 @@ class Store:
             item["shadow_eligible"] = bool(item.get("shadow_eligible"))
             results.append(item)
         return results
+
+    def record_event(self, **kwargs) -> bool:
+        """Append a sanitized event to the strategy-research journal."""
+        return self.journal.record_event(**kwargs)
+
+    def list_events(self, **kwargs) -> list[dict]:
+        """Read a bounded, chronological event-journal slice."""
+        return self.journal.list_events(**kwargs)
+
+    def event_summary(self) -> dict:
+        """Return per-mode observation and paper-ledger counters for the UI."""
+        return self.journal.summary()
 
     def claim_once(self, key: str) -> bool:
         """Atomically add a one-time action key; returns False if it was already claimed."""

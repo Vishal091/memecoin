@@ -1204,6 +1204,15 @@ class CopySafetyGateTests(unittest.TestCase):
         self.assertEqual(bot.active_wallets, {"held-leader", "leader-wallet"})
 
 
+    def test_global_entry_kill_switch_does_not_disable_leader_observation_subscriptions(self):
+        bot = self._bot({"entry_kill_switch_active": "1", "copy_paused": "0"})
+        # A buy gate may be closed while the feed still needs leader observations.
+        bot._copy_block_reason = lambda: "Global entry kill switch is active"
+        bot._refresh_feed_subscriptions()
+        self.assertEqual(bot.active_wallets, {"leader-wallet"})
+        self.assertIn("Global entry kill switch", bot._copy_block_reason())
+
+
 class StaleWalletSignalTests(unittest.TestCase):
     def test_old_watched_wallet_signature_advances_cursor_without_copying(self):
         import time
