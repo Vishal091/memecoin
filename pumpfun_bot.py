@@ -340,7 +340,6 @@ class PumpFunBot:
         if (
             self.auto_copy_enabled
             and self.store.get_state("copy_paused", "0") != "1"
-            and not self._copy_block_reason()
         ):
             base_wallets = set(self.s.watch_wallets) | held_leaders
             rows = self.leaderboards.get(self.selected_window, [])
@@ -503,6 +502,8 @@ class PumpFunBot:
             "risk_control": self.risk_engine.snapshot(),
             "research_journal": self.research.snapshot(),
             "strategy_accounts": self.store.strategy_accounts_snapshot(mode=self.s.mode),
+            "mode_policy_auto_disable_enabled": bool(self.s.research_auto_disable_enabled),
+            "strategy_accounts": self.store.strategy_accounts_snapshot(mode=self.s.mode),
             "feed_connected": bool(self.feed and self.feed.connected.is_set()),
             "feed_error": self.feed.last_error if self.feed else "",
             "feed_stats": ({
@@ -604,6 +605,19 @@ class PumpFunBot:
             except queue.Empty:
                 break
             action = command.get("action")
+            if action == "set_mode_kill_switch":
+                strategy = str(command.get("strategy") or "")
+                requested = command.get("enabled")
+                if not isinstance(requested, bool):
+                    self.message = "Invalid mode kill-switch toggle; expected true or false."
+                    continue
+                ok, detail = self.risk_engine.set_mode_kill_switch(
+                    strategy, requested,
+                    "Operator paused the mode from the local dashboard.",
+                )
+                self.message = detail
+                logger.warning("Mode kill switch action: %s", detail)
+                continue
             if action == "set_entry_kill_switch":
                 requested = command.get("enabled")
                 if not isinstance(requested, bool):
@@ -701,15 +715,8 @@ class PumpFunBot:
                 if window not in {"overall", "day", "week", "month"}:
                     self.message = "Invalid leaderboard window."
                     continue
-                block_reason = self._copy_block_reason()
-                if block_reason:
-                    self.auto_copy_enabled = False
-                    self.store.set_state("auto_copy_enabled", "0")
-                    self.store.set_state("copy_paused", "1")
-                    self._refresh_feed_subscriptions()
-                    self.message = "Auto-copy blocked: " + block_reason
-                    logger.warning("%s", self.message)
-                    continue
+                # Subscribing to leader activity is observation, not order authorization.
+                # Resulting buys still pass global and per-strategy risk gates.
                 if not self.leaderboards:
                     self.refresh_leaderboards(force=True)
                 if not self.leaderboards.get(window):
