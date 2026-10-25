@@ -437,7 +437,7 @@ class ResearchJournal:
             }
 
 
-// Reuse one writer per Store to keep table setup/pruning out of hot paths.
+# Reuse one writer per Store to keep table setup/pruning out of hot paths.
 def get_research_journal(store, *, path_window_seconds: int = DEFAULT_PATH_WINDOW_SECONDS) -> ResearchJournal:
     journal = getattr(store, "_research_journal", None)
     if journal is None:
