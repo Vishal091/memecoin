@@ -360,6 +360,33 @@ class Store:
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (utc_now(), mode, action, mint, str(amount_raw), float(price_usd), float(value_usd),
                  float(pnl_usd), reason, source_wallet, source_signature, tx_signature, str(strategy or "leader_copy")))
+            if str(mode).lower() == "paper":
+                strategy_value = str(strategy or "leader_copy")
+                account = self.db.execute(
+                    "SELECT cash_usd,realized_pnl_usd FROM strategy_accounts WHERE lower(mode)='paper' AND strategy=?",
+                    (strategy_value,),
+                ).fetchone()
+                if account is None:
+                    raise RuntimeError("Strategy-specific paper account is missing; refusing unbudgeted ledger update.")
+                action_value = str(action or "").upper()
+                if action_value.startswith("BUY"):
+                    cash_delta = -float(value_usd)
+                    pnl_delta = 0.0
+                elif action_value.startswith("SELL"):
+                    cash_delta = float(value_usd)
+                    pnl_delta = float(pnl_usd)
+                else:
+                    cash_delta = 0.0
+                    pnl_delta = 0.0
+                next_cash = float(account["cash_usd"] or 0.0) + cash_delta
+                if next_cash < -1e-6:
+                    raise ValueError("Strategy-specific paper cash budget would be exceeded.")
+                self.db.execute(
+                    "UPDATE strategy_accounts SET cash_usd=?,realized_pnl_usd=?,updated_at=? "
+                    "WHERE lower(mode)='paper' AND strategy=?",
+                    (max(0.0, next_cash), float(account["realized_pnl_usd"] or 0.0) + pnl_delta,
+                     utc_now(), strategy_value),
+                )
         # The trading ledger remains authoritative. Research telemetry is secondary:
         # never let an observability failure erase a persisted fill/exit record.
         try:
@@ -805,6 +832,32 @@ class Store:
             item["shadow_eligible"] = bool(item.get("shadow_eligible"))
             results.append(item)
         return results
+
+    def get_strategy_account(self, mode: str, strategy: str) -> dict | None:
+        """Return a virtual capital account for one strategy and runtime mode."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM strategy_accounts WHERE lower(mode)=lower(?) AND strategy=?",
+                (str(mode), str(strategy)),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def strategy_accounts_snapshot(self, *, mode: str = "paper") -> dict:
+        """Compact per-strategy starting cash, remaining paper cash and realized PnL."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT * FROM strategy_accounts WHERE lower(mode)=lower(?) ORDER BY strategy",
+                (str(mode),),
+            ).fetchall()
+        return {
+            str(row["strategy"]): {
+                "starting_cash_usd": round(float(row["starting_cash_usd"] or 0), 6),
+                "cash_usd": round(float(row["cash_usd"] or 0), 6),
+                "realized_pnl_usd": round(float(row["realized_pnl_usd"] or 0), 6),
+                "updated_at": str(row["updated_at"] or ""),
+            }
+            for row in rows
+        }
 
     def claim_once(self, key: str) -> bool:
         """Atomically add a one-time action key; returns False if it was already claimed."""
