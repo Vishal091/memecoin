@@ -799,7 +799,7 @@ class TrendingTokenScanner:
                 self._candidates[item["mint"]] = item
                 # Record screened and rejected candidate decisions, not just the
                 # shortlisted rows, so filters can be scored against future outcomes.
-                if self.store is not None:
+                if self.store is not None and hasattr(self.store, "db"):
                     try:
                         get_research_journal(self.store).record_candidate(
                             mode=str(getattr(self.settings, "mode", "paper")),
