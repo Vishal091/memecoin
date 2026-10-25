@@ -148,6 +148,7 @@ class RiskEngine:
                 max_total_exposure_usd=float(getattr(self.settings, "max_total_exposure_usd", 1.00)),
                 max_open_positions=int(getattr(self.settings, "max_open_positions", 1)),
                 max_entries_per_day=int(getattr(self.settings, "max_entries_per_day", 4)),
+                max_strategy_exposure_usd=float(getattr(self.settings, "max_strategy_exposure_usd", 0.75)),
             )
             if denied:
                 return None, denied
@@ -295,6 +296,7 @@ class RiskEngine:
             "unresolved_trades": unresolved_rows,
             "max_entry_usd": float(getattr(self.settings, "max_entry_usd", 0.50)),
             "max_total_exposure_usd": float(getattr(self.settings, "max_total_exposure_usd", 1.00)),
+            "max_strategy_exposure_usd": float(getattr(self.settings, "max_strategy_exposure_usd", 0.75)),
             "max_open_positions": int(getattr(self.settings, "max_open_positions", 1)),
             "max_entries_per_day": int(getattr(self.settings, "max_entries_per_day", 4)),
             "max_portfolio_drawdown_pct": float(getattr(self.settings, "max_portfolio_drawdown_pct", 0.15)),
