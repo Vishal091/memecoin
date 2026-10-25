@@ -150,8 +150,8 @@ class Settings:
                 raise ValueError("Live canary requires MAX_TOTAL_EXPOSURE_USD <= 0.55, including the built-in fee allowance.")
             if self.max_open_positions != 1:
                 raise ValueError("Live canary requires MAX_OPEN_POSITIONS=1.")
-            if self.max_entries_per_day != 1:
-                raise ValueError("Live canary requires MAX_ENTRIES_PER_DAY=1.")
+            if not (1 <= self.max_entries_per_day <= 10):
+                raise ValueError("Live canary requires MAX_ENTRIES_PER_DAY between 1 and 10.")
             if not (0 < self.daily_loss_limit_usd <= 0.50):
                 raise ValueError("Live canary requires DAILY_LOSS_LIMIT_USD in (0, 0.50].")
             if not (0 < self.total_loss_limit_usd <= 0.50):
