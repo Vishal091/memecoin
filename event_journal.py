@@ -21,23 +21,22 @@ _SECRET_NAME = re.compile(
     re.IGNORECASE,
 )
 _SECRET_QUERY_VALUE = re.compile(
-    r"(?i)([?&](?:api[-_]?key|access[-_]?token|auth(?:orization)?|token|key|secret|password|cookie)=)[^&#\\s\\\"'<>]+"
+    r"(?i)([?&](?:api[-_]?key|access[-_]?token|auth(?:orization)?|token|key|secret|password|cookie)=)[^&#\s\"'<>]+"
 )
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\\b(api[-_]?key|access[-_]?token|auth(?:orization)?|private[-_]?key|"
-    r"secret|seed[-_]?phrase|mnemonic|password|cookie)\\b(\\s*[:=]\\s*)[^,;\\s\\\"']+"
+    r"(?i)\b(api[-_]?key|access[-_]?token|auth(?:orization)?|private[-_]?key|"
+    r"secret|seed[-_]?phrase|mnemonic|password|cookie)\b(\s*[:=]\s*)[^,;\s\"']+"
 )
-_SECRET_HEADER = re.compile(r"(?im)\\b(Cookie|Set-Cookie|Authorization)\\s*:\\s*[^\\r\\n]+")
+_SECRET_HEADER = re.compile(r"(?im)\b(Cookie|Set-Cookie|Authorization)\s*:\s*[^\r\n]+")
 
 
 def _redact_text(value: str, limit: int) -> str:
     """Redact secret-like values even when they occur inside innocent string fields."""
-    result = _SECRET_HEADER.sub(r"\\1: [REDACTED]", value)
-    result = re.sub(r"(?i)(\\bBearer\\s+)[A-Za-z0-9._~+/-]+={0,2}", r"\\1[REDACTED]", result)
-    result = _SECRET_QUERY_VALUE.sub(r"\\1[REDACTED]", result)
-    result = _SECRET_ASSIGNMENT.sub(r"\\1\\2[REDACTED]", result)
+    result = _SECRET_HEADER.sub(r"\1: [REDACTED]", value)
+    result = re.sub(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/-]+={0,2}", r"\1[REDACTED]", result)
+    result = _SECRET_QUERY_VALUE.sub(r"\1[REDACTED]", result)
+    result = _SECRET_ASSIGNMENT.sub(r"\1\2[REDACTED]", result)
     return result[:max(0, int(limit))]
-
 
 _ALLOWED_STRATEGIES = {"leader_copy", "trending_discovery", "token_discovery", "market_data", "system"}
 _DECISION_RE = re.compile(r"(?:reject|block|skip|filter|fail|stale|unparsed|duplicate|unknown)", re.IGNORECASE)
