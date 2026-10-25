@@ -37,6 +37,44 @@ class StrategyAccountTests(unittest.TestCase):
         self.assertAlmostEqual(accounts["leader_copy"]["cash_usd"], 4.0)
         self.assertAlmostEqual(accounts["token_discovery"]["cash_usd"], 4.0)
 
+    def test_mode_mismatch_is_rejected_before_database_migration(self):
+        import sqlite3
+
+        bad_path = Path(self.tmp.name) / "live-locked.db"
+        connection = sqlite3.connect(str(bad_path))
+        connection.executescript("""
+            CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO state(key,value) VALUES('database_mode','live');
+            CREATE TABLE trades (id INTEGER PRIMARY KEY, action TEXT NOT NULL);
+            INSERT INTO trades(action) VALUES('BUY');
+            CREATE TABLE positions (mint TEXT PRIMARY KEY);
+        """)
+        connection.commit()
+        before_tables = {
+            row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        connection.close()
+
+        with self.assertRaisesRegex(RuntimeError, "locked to 'live' mode"):
+            Store(bad_path, 10.0, mode="paper")
+
+        check = sqlite3.connect(str(bad_path))
+        after_tables = {
+            row[0] for row in check.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        self.assertEqual(after_tables, before_tables)
+        self.assertNotIn("strategy_accounts", after_tables)
+        self.assertEqual(
+            check.execute("SELECT value FROM state WHERE key='database_mode'").fetchone()[0],
+            "live",
+        )
+        self.assertEqual(check.execute("SELECT COUNT(*) FROM trades").fetchone()[0], 1)
+        check.close()
+
     def test_strategy_ledger_refuses_negative_virtual_cash(self):
         with self.assertRaises(ValueError):
             self.store.add_trade(
