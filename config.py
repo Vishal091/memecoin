@@ -138,8 +138,8 @@ class Settings:
                 )
             if self.live_confirmation != "I_ACCEPT_THE_RISK_AND_UNDERSTAND_LIVE_TRADING":
                 raise ValueError("Live mode not armed. Set LIVE_CONFIRMATION locally only after reviewing the risks.")
-            if not self.jupiter_api_key:
-                raise ValueError("JUPITER_API_KEY is required for live mode")
+            if _bool("TRENDING_DISCOVERY_LIVE_ENABLED", False) and not self.jupiter_api_key:
+                raise ValueError("JUPITER_API_KEY is required when trending discovery live buys are enabled")
             if not self.keypair_path.is_file():
                 raise ValueError(f"Local keypair file not found: {self.keypair_path}")
 
