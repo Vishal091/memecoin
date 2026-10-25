@@ -1,8 +1,8 @@
-# Phase 6E — bounded live canary (draft; default off)
+# Phase 6E — bounded supervised live trial (draft; default off)
 
 ## Purpose and status
 
-This change wires the existing `LIVE_ENTRIES_APPROVED` guard into configuration and adds a deliberately small first live-canary profile. It is for a single, supervised live software test, not a profitability claim or a general approval to run an unattended strategy.
+This change wires the existing `LIVE_ENTRIES_APPROVED` guard into configuration and adds a deliberately small first live-canary profile. It is for a supervised, tightly capped live software trial, not a profitability claim or approval to run an unattended strategy. The configured daily entry ceiling can be up to ten buys; it may halt earlier due to position, exposure, loss, or reconciliation safeguards.
 
 This branch is stacked on the open Phase 6D draft and is not merged into `main`. Do not use it for real funds until GitHub Actions passes, the full tests pass on the target Windows machine, the code changes are reviewed, and the operator completes the preflight below.
 
@@ -14,13 +14,13 @@ When `BOT_MODE=live`, configuration validation fails closed unless all of these 
 - `MAX_ENTRY_USD <= 0.50`.
 - `MAX_TOTAL_EXPOSURE_USD <= 0.55`. The reservation includes the code's built-in $0.05 allowance for fees; actual fees/rent may be higher.
 - `MAX_OPEN_POSITIONS=1`.
-- `MAX_ENTRIES_PER_DAY=1`.
+- `1 <= MAX_ENTRIES_PER_DAY <= 10` (the requested local profile uses `10`).
 - `DAILY_LOSS_LIMIT_USD` and `TOTAL_LOSS_LIMIT_USD` are each greater than zero and no greater than $0.50.
 - `MIN_SOL_RESERVE >= 0.025` SOL.
 - `MAX_MARKED_LOSS_PCT <= 0.18`, `TRAILING_STOP_PCT <= 0.12`, and `MAX_QUOTE_SHORTFALL_PCT <= 0.04`.
 - `TOKEN_DISCOVERY_LIVE_ENABLED=false` and `TRENDING_DISCOVERY_LIVE_ENABLED=false`. The initial canary is leader-copy only.
 
-The risk engine separately clamps live input to $0.50, total reserved exposure to $0.55, open positions to one and entries per day to one, even when a settings object is looser. These are ceilings, not guarantees about total wallet debit: network and route fees, token-account rent, slippage, and failed/unsellable tokens can cause additional costs or losses. The loss thresholds stop new entries; they are not a guarantee that an existing position will be liquidated at that loss.
+The risk engine separately clamps live input to $0.50, total reserved exposure to $0.55, open positions to one and entries per day to ten, even when a settings object is looser. At ten $0.50 buy inputs, daily swap notional could reach $5.00, before exit swaps, network fees, route fees and account rent; these limits do not cap total wallet debit or guarantee a maximum loss. The $0.50 daily and total loss circuit breakers remain in force and can halt entries earlier. These are ceilings, not guarantees about total wallet debit: network and route fees, token-account rent, slippage, and failed/unsellable tokens can cause additional costs or losses. The loss thresholds stop new entries; they are not a guarantee that an existing position will be liquidated at that loss.
 
 ## Preflight — do not skip
 
@@ -35,7 +35,7 @@ The risk engine separately clamps live input to $0.50, total reserved exposure t
         MAX_ENTRY_USD=0.50
         MAX_TOTAL_EXPOSURE_USD=0.55
         MAX_OPEN_POSITIONS=1
-        MAX_ENTRIES_PER_DAY=1
+        MAX_ENTRIES_PER_DAY=10
         DAILY_LOSS_LIMIT_USD=0.50
         TOTAL_LOSS_LIMIT_USD=0.50
         MIN_SOL_RESERVE=0.025
@@ -53,12 +53,12 @@ The risk engine separately clamps live input to $0.50, total reserved exposure t
 
    The check command validates configuration/endpoints; it is not proof of a successful live fill. Do not continue if any command fails or the dashboard/console reports unresolved transactions, a missing wallet, an RPC issue, or an unexpected mode.
 
-6. Start exactly one bot process. On every startup the independent global entry kill switch should engage by design. Before resuming it from the loopback dashboard, verify the wallet address, mode, live approval, the input/exposure caps, one-position/one-entry limits, loss ceilings, SOL reserve, fresh live database path, no unresolved transactions/reservations, and both discovery live switches off. Verify values from the local configuration as well as the dashboard; do not resume if anything is unclear.
+6. Start exactly one bot process. On every startup the independent global entry kill switch should engage by design. Before resuming it from the loopback dashboard, verify the wallet address, mode, live approval, the input/exposure caps, one-position/ten-entries-per-day limits, loss ceilings, SOL reserve, fresh live database path, no unresolved transactions/reservations, and both discovery live switches off. Verify values from the local configuration as well as the dashboard; do not resume if anything is unclear.
 
-7. For the canary, supervise the bot continuously and wait for at most one fresh leader-copy entry. The entry cap is the swap input, not a cap on total wallet debit. After the first confirmed entry, re-engage the global entry kill switch and leave the process running so its position manager can manage the exit. Do not resume entries again during this canary. The one-entry-per-day and one-open-position limits are additional safeguards, not substitutes for this manual stop. Do not start a second bot against the same database.
+7. For this supervised trial, supervise the bot continuously and allow no more than ten confirmed fresh leader-copy entries in a UTC day. Keep at most one position open; do not allow a new buy until the prior position is confirmed closed and balances/ledger agree. After each fill and exit, verify the signature, actual SOL/token balances, fees, and recorded position before considering another entry. Stop earlier at any manual-review halt, unresolved transaction, stale/missed feed, inconsistent balance, unexpected exit, or loss circuit breaker. The $0.50 input cap is not a cap on total wallet debit. The daily and total loss limits remain $0.50 and may prevent the bot from reaching ten entries; do not disable or raise them to force the full count. Do not start a second bot against the same database.
 
 8. If a transaction outcome is uncertain, a buy/sell fails unexpectedly, balances disagree, or the bot engages a manual-review/entry halt, do not clear the halt or retry the trade blindly. Keep new entries halted, inspect the exact signature and wallet/token balances on-chain, and reconcile according to the project procedure. Never infer that a timeout means a transaction did not land.
 
 ## Evidence limits
 
-Passing unit tests only validates covered software behavior. Until there is collected paper-forward data and measured transaction costs, this canary does not establish positive expectancy. A $0.50 input can be uneconomic once entry/exit fees and rent are counted. Stop after a single observed live cycle and review actual debit, fill, exit, fees, and reconciliation before considering any increase to limits.
+Passing unit tests only validates covered software behavior. Until there is collected paper-forward data and measured transaction costs, this canary does not establish positive expectancy. A $0.50 input can be uneconomic once entry/exit fees and rent are counted. Review actual debit, fills, exits, fees, and reconciliation after each cycle; stop the trial if actual costs or behavior differ from expectations. Ten $0.50 inputs are a ceiling, not a target or evidence of positive expectancy.
