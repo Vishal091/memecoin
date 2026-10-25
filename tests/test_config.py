@@ -32,6 +32,9 @@ class LiveCanaryConfigTests(unittest.TestCase):
             "DAILY_LOSS_LIMIT_USD": "0.50",
             "TOTAL_LOSS_LIMIT_USD": "0.50",
             "MIN_SOL_RESERVE": "0.025",
+            "MAX_MARKED_LOSS_PCT": "0.18",
+            "TRAILING_STOP_PCT": "0.12",
+            "MAX_QUOTE_SHORTFALL_PCT": "0.04",
             "TOKEN_DISCOVERY_LIVE_ENABLED": "false",
             "TRENDING_DISCOVERY_LIVE_ENABLED": "false",
         }
