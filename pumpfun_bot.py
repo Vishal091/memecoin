@@ -2008,6 +2008,40 @@ class PumpFunBot:
                 mint,
             )
 
+        # Counterfactual strategy signal: market/token filters have passed, so
+        # record what the mode would have selected even if an operator/global risk
+        # switch, position budget, or paper-only safety gate prevents an entry.
+        # This is telemetry only; it never reserves capacity or reaches an executor.
+        intended_cap = self.s.max_entry_usd if entry_cap_usd is None else min(
+            self.s.max_entry_usd, float(entry_cap_usd)
+        )
+        if strategy == "token_discovery":
+            intended_cap = min(
+                0.50, intended_cap, float(self.s.token_discovery_max_entry_usd)
+            )
+        elif strategy == "trending_discovery":
+            intended_cap = min(
+                0.50, intended_cap, float(self.s.trending_discovery_max_entry_usd)
+            )
+        self._journal_entry_decision(
+            signal, strategy=strategy, decision="would_copy",
+            price_usd=observed_price, liquidity_usd=actual_liquidity,
+        )
+        try:
+            self.research.record_event(
+                mode=self.s.mode, strategy=strategy, event_type="counterfactual_entry_signal",
+                event={**signal, "price_usd": observed_price, "liquidity_usd": actual_liquidity,
+                       "decision": "would_copy", "intended_notional_usd": intended_cap},
+                observed_at=time.time(),
+            )
+            if intended_cap > 0 and strategy in {"leader_copy", "token_discovery"}:
+                self.research.record_cost_estimate(
+                    strategy=strategy, mint=mint, notional_usd=intended_cap,
+                    source="counterfactual intended size; PumpPortal 0.5% fee assumption; other costs unknown",
+                )
+        except Exception as exc:
+            logger.warning("Research counterfactual/cost journal write failed (%s)", type(exc).__name__)
+
         equity = self.equity()
         self._refresh_risk_state(equity)
         allowed, reason = self._can_enter(
@@ -2043,24 +2077,21 @@ class PumpFunBot:
             logger.warning("Reject buy %s: risk reservation denied: %s", str(mint)[:8], reserve_reason)
             return
 
-        # Entry is now strategy-qualified: after all local filters and atomic risk
-        # reservation. Separate actual fills and transaction failures in the ledger.
-        self._journal_entry_decision(signal, strategy=strategy, decision="would_copy",
-            price_usd=observed_price, liquidity_usd=actual_liquidity)
+        # Separate actual risk admission from the previously journaled signal decision.
         try:
             self.research.record_event(
-                mode=self.s.mode, strategy=strategy, event_type="qualified_entry",
+                mode=self.s.mode, strategy=strategy, event_type="entry_admitted",
                 event={**signal, "price_usd": observed_price, "liquidity_usd": actual_liquidity,
-                       "decision": "would_copy"},
+                       "decision": "execution_admitted", "reserved_notional_usd": spend},
                 observed_at=time.time(),
             )
             if strategy in {"leader_copy", "token_discovery"}:
                 self.research.record_cost_estimate(
                     strategy=strategy, mint=mint, notional_usd=spend,
-                    source="PumpPortal 0.5% provider-fee assumption; other cost components left unknown",
+                    source="risk-reserved notional; PumpPortal 0.5% fee assumption; other cost components unknown",
                 )
         except Exception as exc:
-            logger.warning("Research qualified-entry/cost journal write failed (%s)", type(exc).__name__)
+            logger.warning("Research admitted-entry/cost journal write failed (%s)", type(exc).__name__)
 
         decimals = int(signal.get("decimals") or 6)
         total_supply_tokens = float(signal.get("total_supply_tokens") or 0)
