@@ -26,8 +26,8 @@ class LiveCanaryConfigTests(unittest.TestCase):
             "JUPITER_API_KEY": "test-placeholder-not-a-real-key",
             "KEYPAIR_PATH": str(self.keypair),
             "MAX_ENTRY_USD": "0.50",
-            "MAX_TOTAL_EXPOSURE_USD": "0.55",
-            "MAX_OPEN_POSITIONS": "1",
+            "MAX_TOTAL_EXPOSURE_USD": "5.50",
+            "MAX_OPEN_POSITIONS": "10",
             "MAX_ENTRIES_PER_DAY": "10",
             "DAILY_LOSS_LIMIT_USD": "0.50",
             "TOTAL_LOSS_LIMIT_USD": "0.50",
@@ -61,16 +61,17 @@ class LiveCanaryConfigTests(unittest.TestCase):
         self.assertEqual(settings.mode, "live")
         self.assertTrue(settings.live_entries_approved)
         self.assertEqual(settings.max_entry_usd, 0.50)
-        self.assertEqual(settings.max_total_exposure_usd, 0.55)
-        self.assertEqual(settings.max_open_positions, 1)
+        self.assertEqual(settings.max_total_exposure_usd, 5.50)
+        self.assertEqual(settings.max_open_positions, 10)
         self.assertEqual(settings.max_entries_per_day, 10)
         self.assertGreaterEqual(settings.min_sol_reserve, 0.025)
 
     def test_live_canary_rejects_limits_above_the_hard_caps(self):
         invalid_values = (
             ("MAX_ENTRY_USD", "0.51", "MAX_ENTRY_USD"),
-            ("MAX_TOTAL_EXPOSURE_USD", "0.56", "MAX_TOTAL_EXPOSURE_USD"),
-            ("MAX_OPEN_POSITIONS", "2", "MAX_OPEN_POSITIONS"),
+            ("MAX_TOTAL_EXPOSURE_USD", "5.51", "MAX_TOTAL_EXPOSURE_USD"),
+            ("MAX_OPEN_POSITIONS", "11", "MAX_OPEN_POSITIONS"),
+            ("MAX_OPEN_POSITIONS", "0", "MAX_OPEN_POSITIONS"),
             ("MAX_ENTRIES_PER_DAY", "11", "MAX_ENTRIES_PER_DAY"),
             ("MAX_ENTRIES_PER_DAY", "0", "MAX_ENTRIES_PER_DAY"),
             ("DAILY_LOSS_LIMIT_USD", "0.51", "DAILY_LOSS_LIMIT_USD"),
