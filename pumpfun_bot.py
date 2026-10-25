@@ -325,7 +325,7 @@ class PumpFunBot:
 
     def _copy_block_reason(self) -> str:
         """Report the global entry gate and persisted circuit breakers."""
-        gate_reason = self.risk_engine.gate_reason(strategy=strategy)
+        gate_reason = self.risk_engine.gate_reason(strategy="leader_copy")
         if gate_reason:
             return gate_reason
         if self.store.get_state("daily_paused", "0") == "1":
@@ -502,6 +502,7 @@ class PumpFunBot:
             "trending_discovery": self.trending_scanner.dashboard_snapshot(),
             "risk_control": self.risk_engine.snapshot(),
             "research_journal": self.research.snapshot(),
+            "strategy_accounts": self.store.strategy_accounts_snapshot(mode=self.s.mode),
             "feed_connected": bool(self.feed and self.feed.connected.is_set()),
             "feed_error": self.feed.last_error if self.feed else "",
             "feed_stats": ({
@@ -959,12 +960,22 @@ class PumpFunBot:
             self.signal_stats["parsed_signals"] += 1
             logger.info("Copy signal parsed: side=%s wallet=%s mint=%s source=%s",
                         signal["side"], signal["wallet"][:8], signal["mint"][:8], signal.get("source"))
-            self.process_signal(signal)
-            # An account-feed event is only an observation until the separate Solana
-            # RPC path confirms that the watched wallet signed a Pump/PumpSwap trade.
-            # Do not suppress that later verified notification in live mode.
-            if self.s.mode == "live" and signal.get("signer_verified") is not True:
+            # Never action an account-feed event until Solana RPC independently
+            # confirms the wallet signature and Pump/PumpSwap program invocation.
+            # Leave it unconsumed so the separate RPC notification can validate it.
+            if signal.get("source") != "solana_logs" or signal.get("signer_verified") is not True or signal.get("program_verified") is not True:
+                try:
+                    self.research.record_signal(
+                        mode=self.s.mode, strategy="leader_copy", mint=signal.get("mint", ""),
+                        signal_type="leader_trade", decision="observed_unverified",
+                        rejection_reason="Awaiting independent Solana signer/program verification.",
+                        source_wallet=signal.get("wallet", ""), source_signature=signal.get("signature", ""),
+                        payload=signal,
+                    )
+                except Exception as exc:
+                    logger.warning("Research unverified-signal journal write failed (%s)", type(exc).__name__)
                 continue
+            self.process_signal(signal)
             self.store.mark_signature_seen(dedupe_key, signal["wallet"])
 
     def _consume_solana_log_events(self) -> None:
@@ -1311,7 +1322,7 @@ class PumpFunBot:
         self, equity: float, *, strategy: str = "leader_copy",
         entry_cap_usd: float | None = None,
     ) -> tuple[bool, str]:
-        gate_reason = self.risk_engine.gate_reason()
+        gate_reason = self.risk_engine.gate_reason(strategy=strategy)
         if gate_reason:
             return False, gate_reason
         if strategy not in {"token_discovery", "trending_discovery"} and self.store.get_state("copy_paused", "0") == "1":
@@ -1361,9 +1372,12 @@ class PumpFunBot:
         if spend < minimum_practical_spend:
             return False, "Too little exposure headroom for a practical trade"
         if self.s.mode == "paper":
-            cash = float(self.store.get_state("paper_cash", "0"))
+            account = self.store.get_strategy_account(self.s.mode, strategy)
+            if not account:
+                return False, "Strategy-specific paper account is missing; refusing unbudgeted entry"
+            cash = float(account.get("cash_usd") or 0.0)
             if cash < spend + self.s.paper_swap_cost_usd:
-                return False, "Insufficient paper cash after simulated costs"
+                return False, "Insufficient strategy-specific paper cash after simulated costs"
         else:
             assert self.wallet_address
             sol_price = self.market.sol_price_usd()
@@ -3473,7 +3487,7 @@ class PumpFunBot:
                     self._process_trending_live_entries()
                     now = time.time()
 
-                    if now >= self._next_mode_policy_check_at:
+                    if self.s.research_auto_disable_enabled and now >= self._next_mode_policy_check_at:
                         self._next_mode_policy_check_at = now + 60.0
                         try:
                             policy_result = auto_disable_unprofitable_modes(
