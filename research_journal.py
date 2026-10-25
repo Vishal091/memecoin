@@ -13,7 +13,7 @@ import time
 from typing import Any
 
 STRATEGIES = ("leader_copy", "trending_discovery", "token_discovery")
-DEFAULT_PATH_WINDOW_SECONDS = 900
+DEFAULT_PATH_WINDOW_SECONDS = 1200
 
 # Public data only. Keep this list deliberately narrow; do not add generic headers,
 # credentials, request URLs, environment values, private keys or arbitrary raw payloads.
