@@ -30,10 +30,18 @@ def _int(name: str, default: int) -> int:
     return value
 
 
+def _bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "true" if default else "false").strip().lower()
+    if raw not in {"true", "false"}:
+        raise ValueError(f"{name} must be 'true' or 'false'")
+    return raw == "true"
+
+
 @dataclass(frozen=True)
 class Settings:
     mode: str
     live_confirmation: str
+    live_entries_approved: bool
     watch_wallets: tuple[str, ...]
     rpc_url: str
     jupiter_api_key: str
@@ -74,6 +82,7 @@ class Settings:
         settings = cls(
             mode=mode,
             live_confirmation=os.getenv("LIVE_CONFIRMATION", "").strip(),
+            live_entries_approved=_bool("LIVE_ENTRIES_APPROVED", False),
             watch_wallets=wallets,
             rpc_url=os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip(),
             jupiter_api_key=os.getenv("JUPITER_API_KEY", "").strip(),
@@ -122,11 +131,42 @@ class Settings:
         if not (0 < self.trailing_stop_pct < 1):
             raise ValueError("TRAILING_STOP_PCT must be between 0 and 1")
         if self.mode == "live":
+            if not self.live_entries_approved:
+                raise ValueError(
+                    "Live mode is disabled by default. Set LIVE_ENTRIES_APPROVED=true only "
+                    "after reviewing and accepting the bounded live-canary limits."
+                )
             if self.live_confirmation != "I_ACCEPT_THE_RISK_AND_UNDERSTAND_LIVE_TRADING":
                 raise ValueError("Live mode not armed. Set LIVE_CONFIRMATION locally only after reviewing the risks.")
-            if not self.jupiter_api_key:
-                raise ValueError("JUPITER_API_KEY is required for live mode")
+            if _bool("TRENDING_DISCOVERY_LIVE_ENABLED", False) and not self.jupiter_api_key:
+                raise ValueError("JUPITER_API_KEY is required when trending discovery live buys are enabled")
             if not self.keypair_path.is_file():
                 raise ValueError(f"Local keypair file not found: {self.keypair_path}")
+
+            # Bounded first canary: keep the initial real-money exposure deliberately tiny.
+            if self.max_entry_usd > 0.50:
+                raise ValueError("Live canary requires MAX_ENTRY_USD <= 0.50.")
+            if self.max_total_exposure_usd > 5.50:
+                raise ValueError("Live trial requires MAX_TOTAL_EXPOSURE_USD <= 5.50 for up to ten reserved positions; actual fees/rent can be higher.")
+            if not (1 <= self.max_open_positions <= 10):
+                raise ValueError("Live trial requires MAX_OPEN_POSITIONS between 1 and 10.")
+            if not (1 <= self.max_entries_per_day <= 10):
+                raise ValueError("Live canary requires MAX_ENTRIES_PER_DAY between 1 and 10.")
+            if not (0 < self.daily_loss_limit_usd <= 0.50):
+                raise ValueError("Live canary requires DAILY_LOSS_LIMIT_USD in (0, 0.50].")
+            if not (0 < self.total_loss_limit_usd <= 0.50):
+                raise ValueError("Live canary requires TOTAL_LOSS_LIMIT_USD in (0, 0.50].")
+            if self.min_sol_reserve < 0.025:
+                raise ValueError("Live canary requires MIN_SOL_RESERVE >= 0.025 SOL.")
+            if self.max_marked_loss_pct > 0.18:
+                raise ValueError("Live canary requires MAX_MARKED_LOSS_PCT <= 0.18.")
+            if self.trailing_stop_pct > 0.12:
+                raise ValueError("Live canary requires TRAILING_STOP_PCT <= 0.12.")
+            if self.max_quote_shortfall_pct > 0.04:
+                raise ValueError("Live canary requires MAX_QUOTE_SHORTFALL_PCT <= 0.04.")
+            if _bool("TOKEN_DISCOVERY_LIVE_ENABLED", False):
+                raise ValueError("Initial live canary is leader-copy only; TOKEN_DISCOVERY_LIVE_ENABLED must be false.")
+            if _bool("TRENDING_DISCOVERY_LIVE_ENABLED", False):
+                raise ValueError("Initial live canary is leader-copy only; TRENDING_DISCOVERY_LIVE_ENABLED must be false.")
         if self.mode == "paper" and self.starting_paper_cash_usd <= 0:
             raise ValueError("STARTING_PAPER_CASH_USD must be greater than zero")

@@ -151,9 +151,9 @@ class PumpFunSettings:
             keypair_path=Path(os.getenv("KEYPAIR_PATH", "./wallet.json")).expanduser(),
             # Enforced trial ceilings: local settings can only make this profile stricter.
             max_entry_usd=min(0.50, _float("MAX_ENTRY_USD", 0.50)),
-            max_total_exposure_usd=min(1.00, _float("MAX_TOTAL_EXPOSURE_USD", 1.00)),
-            max_open_positions=1,
-            max_entries_per_day=max(1, min(4, _int("MAX_ENTRIES_PER_DAY", 4))),
+            max_total_exposure_usd=min(5.50, _float("MAX_TOTAL_EXPOSURE_USD", 5.50)),
+            max_open_positions=max(1, min(10, _int("MAX_OPEN_POSITIONS", 10))),
+            max_entries_per_day=max(1, min(10, _int("MAX_ENTRIES_PER_DAY", 10))),
             # Pause new entries after three losing exits in a row; allow only a narrow safe override range.
             max_consecutive_losses=max(2, min(10, _int("MAX_CONSECUTIVE_LOSSES", 3))),
             daily_loss_limit_usd=min(0.50, _float("DAILY_LOSS_LIMIT_USD", 0.50)),
@@ -238,10 +238,10 @@ class PumpFunSettings:
             raise ValueError("DEFAULT_LEADERBOARD_WINDOW must be overall, day, week or month")
         if self.max_entry_usd <= 0 or self.max_total_exposure_usd <= 0:
             raise ValueError("Entry and exposure limits must be positive")
-        if self.max_entry_usd > 0.50 or self.max_total_exposure_usd > 1.00:
-            raise ValueError("This trial profile caps entries at $0.50 and total exposure at $1.00")
-        if self.max_open_positions != 1:
-            raise ValueError("This trial profile permits one open position at a time")
+        if self.max_entry_usd > 0.50 or self.max_total_exposure_usd > 5.50:
+            raise ValueError("This trial profile caps each swap input at $0.50 and reserved exposure at $5.50")
+        if not (1 <= self.max_open_positions <= 10):
+            raise ValueError("MAX_OPEN_POSITIONS must be between 1 and 10 for this trial profile")
         if not (0 < self.max_portfolio_drawdown_pct <= 0.15):
             raise ValueError("MAX_PORTFOLIO_DRAWDOWN_PCT must be greater than 0 and no more than 0.15")
         fee_values = (

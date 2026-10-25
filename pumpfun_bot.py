@@ -47,6 +47,15 @@ from execution_costs import assumptions_from_settings, estimate_round_trip_cost
 logger = logging.getLogger("pumpfun")
 
 
+def _finite(value):
+    """Return a finite float for an optional numeric value, otherwise None."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def raw_to_units(amount_raw: int | str, decimals: int) -> float:
     return int(amount_raw) / (10 ** decimals)
 

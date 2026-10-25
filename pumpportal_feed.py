@@ -18,6 +18,22 @@ from websockets.sync.client import connect
 
 logger = logging.getLogger(__name__)
 
+INITIAL_RECONNECT_DELAY_SECONDS = 3.0
+MAX_RECONNECT_DELAY_SECONDS = 300.0
+RECONNECT_RESET_AFTER_SECONDS = 60.0
+
+
+def _reconnect_backoff(current_delay: float, connection_duration: float | None) -> tuple[float, float]:
+    """Return (delay to wait, next delay), resetting only after a stable connection."""
+    if connection_duration is not None and connection_duration >= RECONNECT_RESET_AFTER_SECONDS:
+        delay = INITIAL_RECONNECT_DELAY_SECONDS
+    else:
+        delay = max(
+            INITIAL_RECONNECT_DELAY_SECONDS,
+            min(float(current_delay), MAX_RECONNECT_DELAY_SECONDS),
+        )
+    return delay, min(delay * 2.0, MAX_RECONNECT_DELAY_SECONDS)
+
 
 class PumpPortalAccountFeed(threading.Thread):
     def __init__(self, api_key: str, output_queue: queue.Queue, timeout: int = 12):
@@ -82,9 +98,12 @@ class PumpPortalAccountFeed(threading.Thread):
             self.last_error = "PumpPortal API key is not configured"
             return
         uri = "wss://pumpportal.fun/api/data?api-key=" + quote(self.api_key, safe="")
+        reconnect_delay = INITIAL_RECONNECT_DELAY_SECONDS
         while not self._stop_event.is_set():
+            connection_opened_at = None
             try:
                 with connect(uri, open_timeout=self.timeout, close_timeout=3, ping_interval=20, max_size=2**20) as ws:
+                    connection_opened_at = time.monotonic()
                     subscribed_wallets: set[str] = set()
                     subscribed_tokens: set[str] = set()
                     self.connected_at = time.time()
@@ -189,6 +208,16 @@ class PumpPortalAccountFeed(threading.Thread):
             except Exception as exc:
                 self.connected.clear()
                 self.last_error = f"{type(exc).__name__}: {exc}"
-                logger.warning("PumpPortal feed disconnected: %s; reconnecting in 3 seconds", self.last_error)
-                self._stop_event.wait(3)
+                connection_duration = (
+                    None if connection_opened_at is None
+                    else time.monotonic() - connection_opened_at
+                )
+                wait_seconds, reconnect_delay = _reconnect_backoff(
+                    reconnect_delay, connection_duration
+                )
+                logger.warning(
+                    "PumpPortal feed disconnected: %s; reconnecting in %.0f seconds",
+                    self.last_error, wait_seconds,
+                )
+                self._stop_event.wait(wait_seconds)
         self.connected.clear()
