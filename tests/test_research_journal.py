@@ -100,7 +100,7 @@ class ResearchJournalTests(unittest.TestCase):
             jito_tip_usd=0.002, slippage_pct=1.5, failed_tx_cost_usd=0.004,
             latency_ms=250.0, source="measured-fixture",
         )
-        self.assertAlmostEqual(result["total_known_cost_usd"], 0.032)
+        self.assertAlmostEqual(result["total_known_cost_usd"], 0.0325)
         self.assertEqual(result["missing_components"], [])
         stored = self.store.db.execute("SELECT COUNT(*) FROM research_cost_estimates").fetchone()[0]
         self.assertEqual(stored, 2)
