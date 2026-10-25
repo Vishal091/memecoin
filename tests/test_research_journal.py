@@ -12,7 +12,7 @@ class ResearchJournalTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.store = Store(Path(self.tmp.name) / "journal.db", 12.0, mode="paper")
-        self.addCleanup(self.store.close)
+        self.addCleanup(self.store.db.close)
         self.journal = get_research_journal(self.store, path_window_seconds=900)
 
     def test_event_payload_is_allowlisted_and_credentials_are_not_persisted(self):
