@@ -1863,6 +1863,9 @@ class PumpFunBot:
         price_usd: float | None = None, liquidity_usd: float | None = None,
     ) -> None:
         """Persist a strategy entry decision and its reason without raw secrets."""
+        journal = getattr(self, "research", None)
+        if journal is None:
+            return  # Lightweight unit-test doubles do not open a database.
         try:
             mint = str(signal.get("mint") or "")
             signature = str(signal.get("signature") or signal.get("source_signature") or "")
