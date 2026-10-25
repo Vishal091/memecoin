@@ -163,7 +163,10 @@ class Store:
                 self.db.execute("ALTER TABLE trades ADD COLUMN strategy TEXT NOT NULL DEFAULT 'leader_copy'")
             # Equal starting paper allocations are tracked independently by strategy.
             # On a legacy DB, current cash is reconstructed from its tagged buy/sell rows.
-            if self.mode == "paper":
+            saved_mode_for_accounts = str(self.get_state("database_mode", "") or "").lower()
+            # Never create paper-account rows before the constructor rejects a database
+            # already locked to live mode. Mode mismatch must be a non-mutating failure.
+            if self.mode == "paper" and saved_mode_for_accounts in {"", "paper"}:
                 account_count = int(self.db.execute(
                     "SELECT COUNT(*) FROM strategy_accounts WHERE lower(mode)='paper'"
                 ).fetchone()[0])
