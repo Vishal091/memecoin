@@ -31,7 +31,7 @@ class _FakeRiskEngine:
     def __init__(self):
         self.last_reason = ""
 
-    def gate_reason(self):
+    def gate_reason(self, *, strategy=None, ignore_reservation_id=None):
         return ""
 
     def activate_kill_switch(self, reason):
