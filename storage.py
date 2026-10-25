@@ -16,6 +16,7 @@ def utc_now() -> str:
 class Store:
     def __init__(self, path: Path, starting_cash: float, mode: str = "paper"):
         self.path = path
+        self.mode = str(mode).lower()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.db = sqlite3.connect(str(path), check_same_thread=False)
@@ -93,6 +94,17 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS idx_risk_reservations_status
                 ON risk_reservations(status, created_at);
+            CREATE TABLE IF NOT EXISTS strategy_accounts (
+                mode TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                starting_cash_usd REAL NOT NULL,
+                cash_usd REAL NOT NULL,
+                realized_pnl_usd REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(mode,strategy)
+            );
+            CREATE INDEX IF NOT EXISTS idx_strategy_accounts_mode ON strategy_accounts(mode,strategy);
             CREATE TABLE IF NOT EXISTS shadow_observations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 observed_at REAL NOT NULL,
@@ -149,6 +161,39 @@ class Store:
             trade_columns = {row[1] for row in self.db.execute("PRAGMA table_info(trades)").fetchall()}
             if "strategy" not in trade_columns:
                 self.db.execute("ALTER TABLE trades ADD COLUMN strategy TEXT NOT NULL DEFAULT 'leader_copy'")
+            # Equal starting paper allocations are tracked independently by strategy.
+            # On a legacy DB, current cash is reconstructed from its tagged buy/sell rows.
+            if self.mode == "paper":
+                account_count = int(self.db.execute(
+                    "SELECT COUNT(*) FROM strategy_accounts WHERE lower(mode)='paper'"
+                ).fetchone()[0])
+                if account_count == 0:
+                    try:
+                        total_start = float(self.get_state("initial_equity", str(starting_cash)))
+                    except (TypeError, ValueError):
+                        total_start = float(starting_cash)
+                    allocation = max(0.0, total_start / 3.0)
+                    for strategy in ("leader_copy", "trending_discovery", "token_discovery"):
+                        trades = self.db.execute(
+                            "SELECT action,value_usd,pnl_usd FROM trades WHERE lower(mode)='paper' AND strategy=? ORDER BY id ASC",
+                            (strategy,),
+                        ).fetchall()
+                        cash = allocation
+                        realized = 0.0
+                        for trade in trades:
+                            action = str(trade["action"] or "").upper()
+                            value = float(trade["value_usd"] or 0.0)
+                            if action.startswith("BUY"):
+                                cash -= value
+                            elif action.startswith("SELL"):
+                                cash += value
+                                realized += float(trade["pnl_usd"] or 0.0)
+                        self.db.execute(
+                            "INSERT OR IGNORE INTO strategy_accounts "
+                            "(mode,strategy,starting_cash_usd,cash_usd,realized_pnl_usd,created_at,updated_at) "
+                            "VALUES('paper',?,?,?,?,?,?)",
+                            (strategy, allocation, cash, realized, utc_now(), utc_now()),
+                        )
 
     def close(self) -> None:
         self.db.close()
