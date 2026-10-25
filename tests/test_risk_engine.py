@@ -151,6 +151,23 @@ class RiskEngineTests(unittest.TestCase):
         self.assertIn("Drawdown ceiling reached", self.risk.kill_switch_reason())
         self.assertIn("process restarted", self.risk.kill_switch_reason())
 
+    def test_mode_kill_switch_only_blocks_its_own_strategy(self):
+        self.assertTrue(self.risk.resume_entries()[0])
+        self.assertTrue(self.risk.set_mode_kill_switch("trending_discovery", True, "test pause")[0])
+        self.assertIn("kill switch", self.risk.gate_reason(strategy="trending_discovery").lower())
+        self.assertEqual(self.risk.gate_reason(strategy="leader_copy"), "")
+        self.assertEqual(self.risk.gate_reason(strategy="token_discovery"), "")
+        self.assertFalse(self.risk.set_mode_kill_switch("not_a_strategy", True)[0])
+
+    def test_evidence_auto_disable_cannot_be_manually_overridden(self):
+        self.assertTrue(self.risk.resume_entries()[0])
+        self.store.set_state("mode_policy_disabled:paper:trending_discovery", "1")
+        self.store.set_state("mode_policy_reason:paper:trending_discovery", "Non-positive lower bound")
+        ok, detail = self.risk.set_mode_kill_switch("trending_discovery", False)
+        self.assertFalse(ok)
+        self.assertIn("cannot override", detail.lower())
+        self.assertIn("auto-disabled", self.risk.gate_reason(strategy="trending_discovery").lower())
+
     def test_store_reservation_transaction_enforces_exposure_atomically(self):
         self.assertTrue(self.risk.resume_entries()[0])
         first = self.store.try_reserve_entry_atomic(
