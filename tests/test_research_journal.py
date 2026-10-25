@@ -105,6 +105,24 @@ class ResearchJournalTests(unittest.TestCase):
         stored = self.store.db.execute("SELECT COUNT(*) FROM research_cost_estimates").fetchone()[0]
         self.assertEqual(stored, 1)
 
+    def test_screened_but_ineligible_trending_candidate_keeps_rejection_reason(self):
+        self.journal.record_candidate(
+            mode="paper", strategy="trending_discovery",
+            candidate={
+                "mint": "MintScreenedButRejected", "status": "SCREENED",
+                "price_usd": 0.001, "momentum_score": 30,
+                "shadow_eligible": False,
+                "decision": "score below configured threshold",
+                "liquidity_usd": 20000,
+            }, observed_at=1_800_000_000.0,
+        )
+        row = self.store.db.execute(
+            "SELECT decision,rejection_reason FROM research_signals WHERE mint=?",
+            ("MintScreenedButRejected",),
+        ).fetchone()
+        self.assertEqual(row["decision"], "rejected")
+        self.assertIn("score below", row["rejection_reason"].lower())
+
     def test_dashboard_snapshot_exposes_counts_not_raw_payloads(self):
         self.journal.record_candidate(
             mode="paper", strategy="trending_discovery",
