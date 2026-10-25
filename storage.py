@@ -21,18 +21,43 @@ class Store:
         self.lock = threading.RLock()
         self.db = sqlite3.connect(str(path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA foreign_keys=ON")
-        self._init(starting_cash)
-        existing_mode = self.get_state("database_mode", "")
-        has_history = (
-            self.db.execute("SELECT COUNT(*) FROM trades").fetchone()[0] > 0 or
-            self.db.execute("SELECT COUNT(*) FROM positions").fetchone()[0] > 0
-        )
-        if existing_mode and existing_mode != mode:
+
+        # Check database mode before changing pragmas or running schema migrations.
+        # A wrong-mode invocation must be a non-mutating failure.
+        tables = {
+            str(row["name"])
+            for row in self.db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        existing_mode = ""
+        if "state" in tables:
+            try:
+                mode_row = self.db.execute(
+                    "SELECT value FROM state WHERE key='database_mode' LIMIT 1"
+                ).fetchone()
+                existing_mode = str(mode_row["value"] or "").strip().lower() if mode_row else ""
+            except sqlite3.Error:
+                self.db.close()
+                raise RuntimeError(
+                    "Could not validate this database's mode marker. Use a new, separate DATABASE_PATH."
+                )
+        has_history = False
+        for table in ("trades", "positions"):
+            if table in tables:
+                try:
+                    if int(self.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) > 0:
+                        has_history = True
+                        break
+                except sqlite3.Error:
+                    self.db.close()
+                    raise RuntimeError(
+                        "Could not validate existing trading history. Use a new, separate DATABASE_PATH."
+                    )
+        if existing_mode and existing_mode != self.mode:
             self.db.close()
             raise RuntimeError(
-                f"This database is locked to {existing_mode!r} mode, not {mode!r}. "
+                f"This database is locked to {existing_mode!r} mode, not {self.mode!r}. "
                 "Use a different DATABASE_PATH for paper and live trading."
             )
         if not existing_mode and has_history:
@@ -41,8 +66,12 @@ class Store:
                 "This database contains old trading history but has no mode marker. "
                 "Use a new, separate DATABASE_PATH for this mode."
             )
+
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA foreign_keys=ON")
+        self._init(starting_cash)
         with self.db:
-            self.db.execute("INSERT OR IGNORE INTO state(key,value) VALUES('database_mode',?)", (mode,))
+            self.db.execute("INSERT OR IGNORE INTO state(key,value) VALUES('database_mode',?)", (self.mode,))
 
     def _init(self, starting_cash: float) -> None:
         with self.db:
