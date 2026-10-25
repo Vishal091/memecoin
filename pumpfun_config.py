@@ -196,7 +196,7 @@ class PumpFunSettings:
             database_path=Path(os.getenv("DATABASE_PATH", "memecoin-pumpfun.db")),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             research_round_trip_cost_pct=_float("RESEARCH_ROUND_TRIP_COST_PCT", 5.0),
-            research_path_window_seconds=max(60, min(3600, _int("RESEARCH_PATH_WINDOW_SECONDS", 900))),
+            research_path_window_seconds=max(60, min(3600, _int("RESEARCH_PATH_WINDOW_SECONDS", 1200))),
             research_auto_disable_enabled=os.getenv("RESEARCH_AUTO_DISABLE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
         )
         obj.validate()
