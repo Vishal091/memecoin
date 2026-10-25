@@ -504,6 +504,7 @@ class Store:
         max_total_exposure_usd: float,
         max_open_positions: int,
         max_entries_per_day: int,
+        max_strategy_exposure_usd: float | None = None,
     ) -> str:
         """Atomically account for tracked positions, pending intents, duplicate mints and daily capacity."""
         from math import isfinite
@@ -572,6 +573,20 @@ class Store:
                 if exposure + amount > float(max_total_exposure_usd) + 1e-9:
                     self.db.rollback()
                     return "Total exposure reservation would exceed configured maximum."
+                if max_strategy_exposure_usd is not None:
+                    strategy_position_exposure = self.db.execute(
+                        "SELECT COALESCE(SUM(invested_usd),0) FROM positions WHERE strategy=?",
+                        (str(strategy),),
+                    ).fetchone()[0]
+                    strategy_reserved_exposure = self.db.execute(
+                        "SELECT COALESCE(SUM(amount_usd),0) FROM risk_reservations "
+                        "WHERE strategy=? AND status IN (" + placeholders + ")",
+                        (str(strategy), *active_statuses),
+                    ).fetchone()[0]
+                    strategy_exposure = float(strategy_position_exposure or 0) + float(strategy_reserved_exposure or 0)
+                    if strategy_exposure + amount > float(max_strategy_exposure_usd) + 1e-9:
+                        self.db.rollback()
+                        return "Strategy-specific exposure budget would be exceeded."
 
                 timestamp = utc_now()
                 self.db.execute(
