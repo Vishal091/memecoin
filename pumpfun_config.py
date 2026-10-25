@@ -29,6 +29,19 @@ def _int(name: str, default: int) -> int:
     return value
 
 
+def _optional_float(name: str) -> float | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be numeric when supplied") from exc
+    if not __import__("math").isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return value
+
+
 @dataclass(frozen=True)
 class PumpFunSettings:
     mode: str
@@ -73,6 +86,17 @@ class PumpFunSettings:
     request_timeout_seconds: int
     paper_swap_cost_usd: float
     pumpportal_priority_fee_sol: float
+    pumpportal_fee_pct_per_side: float
+    pump_protocol_fee_pct_per_side: float | None
+    pump_creator_fee_pct_per_side: float | None
+    pumpswap_protocol_fee_pct_per_side: float | None
+    pumpswap_creator_fee_pct_per_side: float | None
+    base_network_fee_sol_per_side: float
+    jito_tip_sol_per_side: float
+    failed_tx_probability: float | None
+    failed_tx_cost_sol: float
+    latency_slippage_pct_per_side: float | None
+    cost_assumptions_version: str
     token_discovery_enabled: bool
     token_discovery_live_enabled: bool
     token_discovery_max_entry_usd: float
@@ -155,6 +179,20 @@ class PumpFunSettings:
             request_timeout_seconds=max(3, _int("REQUEST_TIMEOUT_SECONDS", 12)),
             paper_swap_cost_usd=_float("PAPER_SWAP_COST_USD", 0.02),
             pumpportal_priority_fee_sol=_float("PUMPPORTAL_PRIORITY_FEE_SOL", 0.00001),
+            # Cost-model values are assumptions unless measured against actual fills.
+            pumpportal_fee_pct_per_side=_float("PUMPPORTAL_FEE_PCT_PER_SIDE", 0.5),
+            # Intentionally unset by default: use verified/configured venue fee schedules,
+            # never a fabricated creator/protocol fee to make expectancy look complete.
+            pump_protocol_fee_pct_per_side=_optional_float("PUMP_PROTOCOL_FEE_PCT_PER_SIDE"),
+            pump_creator_fee_pct_per_side=_optional_float("PUMP_CREATOR_FEE_PCT_PER_SIDE"),
+            pumpswap_protocol_fee_pct_per_side=_optional_float("PUMPSWAP_PROTOCOL_FEE_PCT_PER_SIDE"),
+            pumpswap_creator_fee_pct_per_side=_optional_float("PUMPSWAP_CREATOR_FEE_PCT_PER_SIDE"),
+            base_network_fee_sol_per_side=_float("BASE_NETWORK_FEE_SOL_PER_SIDE", 0.000005),
+            jito_tip_sol_per_side=_float("JITO_TIP_SOL_PER_SIDE", 0.0),
+            failed_tx_probability=_optional_float("FAILED_TX_PROBABILITY"),
+            failed_tx_cost_sol=_float("FAILED_TX_COST_SOL", 0.000015),
+            latency_slippage_pct_per_side=_optional_float("LATENCY_SLIPPAGE_PCT_PER_SIDE"),
+            cost_assumptions_version=os.getenv("COST_ASSUMPTIONS_VERSION", "2026-10-25-v1").strip() or "2026-10-25-v1",
             # Discovery scanning and live execution have independent opt-ins.
             token_discovery_enabled=os.getenv("TOKEN_DISCOVERY_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
             token_discovery_live_enabled=os.getenv("TOKEN_DISCOVERY_LIVE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
@@ -206,6 +244,21 @@ class PumpFunSettings:
             raise ValueError("This trial profile permits one open position at a time")
         if not (0 < self.max_portfolio_drawdown_pct <= 0.15):
             raise ValueError("MAX_PORTFOLIO_DRAWDOWN_PCT must be greater than 0 and no more than 0.15")
+        fee_values = (
+            self.pumpportal_fee_pct_per_side,
+            self.pump_protocol_fee_pct_per_side,
+            self.pump_creator_fee_pct_per_side,
+            self.pumpswap_protocol_fee_pct_per_side,
+            self.pumpswap_creator_fee_pct_per_side,
+        )
+        if any(value is not None and (value < 0 or value > 100) for value in fee_values):
+            raise ValueError("Fee percentages must be in [0,100]")
+        if self.failed_tx_probability is not None and not 0 <= self.failed_tx_probability <= 1:
+            raise ValueError("FAILED_TX_PROBABILITY must be in [0,1] when supplied")
+        if self.latency_slippage_pct_per_side is not None and self.latency_slippage_pct_per_side > 100:
+            raise ValueError("LATENCY_SLIPPAGE_PCT_PER_SIDE cannot exceed 100")
+        if not self.cost_assumptions_version:
+            raise ValueError("COST_ASSUMPTIONS_VERSION cannot be empty")
         if not (0 <= self.slippage_bps <= 500):
             raise ValueError("SLIPPAGE_BPS must be between 0 and 500 (5%)")
         if not (0 < self.trailing_stop_pct < 1):

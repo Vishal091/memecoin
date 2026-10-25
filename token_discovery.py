@@ -23,6 +23,7 @@ from solders.pubkey import Pubkey
 from pump_curve import bonding_curve_address, parse_bonding_curve_data
 from native_pump import TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID
 from pumpportal import PUMP_PROGRAM_ID
+from execution_costs import assumptions_from_settings, estimate_round_trip_cost
 
 logger = logging.getLogger("token_discovery")
 
@@ -208,6 +209,86 @@ class TokenDiscoveryShadow:
                         type(exc).__name__,
                     )
                     self._last_shadow_observation_error_at = now
+
+        # Unified data-first journal: state changes and rejections are recorded
+        # separately from strategy execution. Journal failures never authorize or
+        # block a trade; they are surfaced as observability errors.
+        record_event = getattr(self.store, "record_event", None)
+        if callable(record_event):
+            status = str(candidate.get("status") or "unknown")
+            status_key = status.lower()
+            try:
+                has_shadow_entry = float(candidate.get("shadow_entry_at") or 0) > 0
+            except (TypeError, ValueError, OverflowError):
+                has_shadow_entry = False
+            if status_key in {"rejected", "filtered", "expired", "dropped", "blocked", "skipped"}:
+                decision = "rejected"
+            elif bool(candidate.get("would_buy")) or has_shadow_entry:
+                decision = "shadow_eligible"
+            else:
+                decision = "observed"
+            try:
+                try:
+                    candidate_costs = estimate_round_trip_cost(
+                        notional_usd=min(0.50, max(0.10, float(getattr(self.settings, "token_discovery_max_entry_usd", 0.50)))),
+                        route="native_pump_sdk",
+                        venue="pump",
+                        liquidity_usd=candidate.get("real_curve_liquidity_usd"),
+                        sol_usd=None,
+                        assumptions=assumptions_from_settings(self.settings),
+                    )
+                    candidate_costs["measurement_basis"] = "estimate_only"
+                except Exception as cost_exc:
+                    candidate_costs = {
+                        "status": "ESTIMATE_UNAVAILABLE",
+                        "complete_for_after_cost_verdict": False,
+                        "missing_inputs": ["validated_cost_estimate"],
+                        "error_type": type(cost_exc).__name__,
+                    }
+                record_event(
+                    event_type="candidate_decision",
+                    strategy="token_discovery",
+                    observed_at=float(candidate["last_updated_at"]),
+                    mint=str(candidate.get("mint") or ""),
+                    wallet=str(candidate.get("creator") or ""),
+                    side="create",
+                    source="pump_fun_token_discovery",
+                    status=status,
+                    decision=decision,
+                    reason=str(candidate.get("reason") or ""),
+                    price_usd=candidate.get("price_usd"),
+                    liquidity_usd=candidate.get("real_curve_liquidity_usd"),
+                    cost_inputs=candidate_costs,
+                    payload=candidate,
+                )
+                mark = candidate.get("price_usd")
+                if mark is not None and float(mark) > 0:
+                    record_event(
+                        event_type="price_mark",
+                        strategy="market_data",
+                        observed_at=float(candidate["last_updated_at"]),
+                        mint=str(candidate.get("mint") or ""),
+                        signature=str(candidate.get("last_trade_signature") or ""),
+                        source=str(candidate.get("shadow_mark_source") or "pump_curve_mark"),
+                        status=status,
+                        price_usd=mark,
+                        liquidity_usd=candidate.get("real_curve_liquidity_usd"),
+                        payload={
+                            "strategy_source": "token_discovery",
+                            "market_cap_usd": candidate.get("market_cap_usd"),
+                            "market_cap_source": candidate.get("market_cap_source"),
+                            "real_curve_liquidity_usd": candidate.get("real_curve_liquidity_usd"),
+                        },
+                    )
+            except Exception as exc:
+                stats = getattr(self, "stats", None)
+                if isinstance(stats, dict):
+                    stats["event_journal_errors"] = int(stats.get("event_journal_errors", 0)) + 1
+                now = float(candidate["last_updated_at"])
+                last_logged = float(getattr(self, "_last_event_journal_error_at", 0.0) or 0.0)
+                if now - last_logged >= 60:
+                    logger.warning("Could not persist token-discovery event journal row (%s)", type(exc).__name__)
+                    self._last_event_journal_error_at = now
 
     def _market_cap_from_event(self, event: dict) -> tuple[float, str]:
         """Read explicitly named USD market-cap fields or convert PumpPortal SOL market cap."""
