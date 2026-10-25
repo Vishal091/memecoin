@@ -43,8 +43,8 @@ class RiskEngine:
             "Entry kill switch is active; explicit operator resume is required.",
         )
 
-    def gate_reason(self, *, ignore_reservation_id: str | None = None) -> str:
-        """Return a rejection reason; optionally allow a reservation through its own submit boundary."""
+    def gate_reason(self, *, strategy: str | None = None, ignore_reservation_id: str | None = None) -> str:
+        """Return a rejection reason; enforce global and strategy-specific gates."""
         try:
             if (
                 str(getattr(self.settings, "mode", "paper")).lower() == "live"
@@ -54,6 +54,15 @@ class RiskEngine:
                     "Live entries are disabled in this Phase 4 build: LIVE_ENTRIES_APPROVED=false. "
                     "Use paper mode until a separate rollout is approved."
                 )
+            mode = str(getattr(self.settings, "mode", "paper")).lower()
+            if strategy:
+                disabled_key = f"mode_policy_disabled:{mode}:{strategy}"
+                if self.store.get_state(disabled_key, "0") == "1":
+                    detail = self.store.get_state(
+                        f"mode_policy_reason:{mode}:{strategy}",
+                        "Mature after-cost expectancy evidence did not clear the positive lower-confidence-bound gate.",
+                    )
+                    return f"Strategy {strategy} is auto-disabled by mode evidence policy: {detail}"
             if self.kill_switch_active():
                 return "Global entry kill switch is active: " + self.kill_switch_reason()
             unresolved = self.store.list_state_prefix("unresolved_trade:", limit=1)
@@ -113,7 +122,7 @@ class RiskEngine:
         exposure_usd: float | None = None,
     ) -> tuple[str | None, str]:
         """Atomically reserve position/exposure capacity before building or submitting."""
-        reason = self.gate_reason()
+        reason = self.gate_reason(strategy=strategy)
         if reason:
             return None, reason
         try:
@@ -150,7 +159,9 @@ class RiskEngine:
     def mark_submitting(self, reservation_id: str) -> tuple[bool, str]:
         """Last local admission check; fails closed on live-policy or kill-switch changes."""
         try:
-            policy_reason = self.gate_reason(ignore_reservation_id=reservation_id)
+            row = self.store.get_entry_reservation(reservation_id) or {}
+            strategy = str(row.get("strategy") or "") or None
+            policy_reason = self.gate_reason(strategy=strategy, ignore_reservation_id=reservation_id)
             if policy_reason:
                 return False, policy_reason
             return self.store.mark_entry_reservation_submitting(reservation_id)
@@ -264,8 +275,17 @@ class RiskEngine:
             active = self.store.active_entry_reservations()
         except Exception:
             active = []
+        mode = str(getattr(self.settings, "mode", "paper")).lower()
+        mode_policy = {}
+        for strategy in ("leader_copy", "trending_discovery", "token_discovery"):
+            disabled = self.store.get_state(f"mode_policy_disabled:{mode}:{strategy}", "0") == "1"
+            mode_policy[strategy] = {
+                "disabled": disabled,
+                "reason": self.store.get_state(f"mode_policy_reason:{mode}:{strategy}", ""),
+            }
         return {
-            "mode": str(getattr(self.settings, "mode", "paper")),
+            "mode": mode,
+            "mode_policy": mode_policy,
             "live_entries_approved": bool(getattr(self.settings, "live_entries_approved", False)),
             "kill_switch_active": self.kill_switch_active(),
             "kill_switch_reason": self.kill_switch_reason(),
