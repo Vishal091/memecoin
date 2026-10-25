@@ -193,18 +193,18 @@ class RiskEngineTests(unittest.TestCase):
         self.assertIn("0.50", reason)
 
         reservation, reason = self.risk.reserve_entry(
-            "MintExcessExposure", "leader_copy", 0.50, exposure_usd=0.51
+            "MintExcessExposure", "leader_copy", 0.50, exposure_usd=0.56
         )
         self.assertIsNone(reservation)
         self.assertIn("exposure", reason.lower())
 
         reservation, reason = self.risk.reserve_entry(
-            "MintCanary", "leader_copy", 0.50, exposure_usd=0.50
+            "MintCanary", "leader_copy", 0.50, exposure_usd=0.55
         )
         self.assertIsNotNone(reservation, reason)
         snapshot = self.risk.snapshot()
         self.assertEqual(snapshot["max_entry_usd"], 0.50)
-        self.assertEqual(snapshot["max_total_exposure_usd"], 0.50)
+        self.assertEqual(snapshot["max_total_exposure_usd"], 0.55)
         self.assertEqual(snapshot["max_open_positions"], 1)
         self.assertEqual(snapshot["max_entries_per_day"], 1)
 
