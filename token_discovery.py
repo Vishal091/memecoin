@@ -23,6 +23,7 @@ from solders.pubkey import Pubkey
 from pump_curve import bonding_curve_address, parse_bonding_curve_data
 from native_pump import TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID
 from pumpportal import PUMP_PROGRAM_ID
+from research_journal import get_research_journal
 
 logger = logging.getLogger("token_discovery")
 
@@ -174,6 +175,21 @@ class TokenDiscoveryShadow:
             self._key(str(candidate["mint"])),
             json.dumps(candidate, sort_keys=True, separators=(",", ":")),
         )
+        # Journal every candidate state (including safety/liquidity rejections) for
+        # later counterfactual price-path evaluation; the writer allowlists public fields.
+        try:
+            get_research_journal(self.store).record_candidate(
+                mode=str(getattr(self.settings, "mode", "paper")),
+                strategy="token_discovery",
+                candidate=candidate,
+                observed_at=float(candidate["last_updated_at"]),
+            )
+        except Exception as exc:
+            now = float(candidate["last_updated_at"])
+            last_logged = float(getattr(self, "_last_research_journal_error_at", 0.0) or 0.0)
+            if now - last_logged >= 60:
+                logger.warning("Could not persist token discovery research event (%s)", type(exc).__name__)
+                self._last_research_journal_error_at = now
         # The shadow ledger is append/upsert-only and never calls an executor.
         # Coalescing happens in SQLite by minute/status to keep observation growth bounded.
         record_observation = getattr(self.store, "record_shadow_observation", None)
