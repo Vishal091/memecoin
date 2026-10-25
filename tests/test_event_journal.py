@@ -109,6 +109,7 @@ class EventJournalTests(unittest.TestCase):
             decision="screened",
             payload={
                 "metadata_uri": "https://example.invalid/item.json?access_token=QUERY_SECRET&safe=1",
+                "signed_url": "https://example.invalid/blob?X-Amz-Credential=CREDENTIAL_SECRET&X-Amz-Signature=SIG_SECRET",
                 "diagnostic": "Authorization: Bearer BEARER_SECRET",
                 "debug": "api_key=INLINE_SECRET",
                 "cookie_note": "Cookie: session=COOKIE_SECRET",
@@ -117,7 +118,7 @@ class EventJournalTests(unittest.TestCase):
         )
         row = self.store.list_events(event_types=["candidate_decision"])[0]
         serialized = str(row["payload"])
-        for secret in ("QUERY_SECRET", "BEARER_SECRET", "INLINE_SECRET", "COOKIE_SECRET"):
+        for secret in ("QUERY_SECRET", "CREDENTIAL_SECRET", "SIG_SECRET", "BEARER_SECRET", "INLINE_SECRET", "COOKIE_SECRET"):
             self.assertNotIn(secret, serialized)
         self.assertIn("[REDACTED]", serialized)
         self.assertEqual(row["payload"]["safe_metric"], "ordinary diagnostic text")
