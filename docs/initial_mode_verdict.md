@@ -39,7 +39,7 @@ The scanner processed many launches and rejected many for missing/unsupported qu
 
 - A secret-safe SQLite research journal for normalized observed events, signal/entry decisions, rejection reasons, price-path marks, ledger fills and cost-estimate fields.
 - Candidate-state recording for token discovery and trending, including rejects.
-- Leader-copy eligibility is recorded only after the local filters and atomic entry reservation pass. Account-stream events are recorded as observations and are not actioned until independent signer/program verification arrives from the Solana logs path.
+- Leader-copy counterfactual signals are recorded after the market/strategy filters pass, even when the global entry gate later blocks an order. Separate entry-admission/rejection events capture the portfolio/risk decision. Account-stream events are observations and are not actioned until independent signer/program verification arrives from the Solana logs path.
 - Three separate virtual paper cash ledgers, individual mode entry kill switches, a global kill switch and a per-mode evidence-policy lock.
 - A read-only per-mode evaluator with deterministic bootstrap expectancy intervals, after-cost sensitivity, separate ledger metrics and a maturity gate. Mature modes whose lower 95% expectancy bound is not positive are auto-disabled; a positive bound is review-only and never auto-enables a mode.
 - A runbook for paper observation, report generation and verifying the difference between an observed signal, a qualified shadow entry and an actual paper-ledger position.
