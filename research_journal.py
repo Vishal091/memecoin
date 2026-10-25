@@ -321,6 +321,9 @@ class ResearchJournal:
         elif status == "screened" and (price is None or price <= 0):
             decision = "rejected"
             reason = reason or "Missing valid same-pool USD price; excluded from return evaluation."
+        elif status == "screened":
+            decision = "rejected"
+            reason = reason or "Candidate did not meet the configured shadow-eligibility or momentum threshold."
         else:
             decision = "observed"
         stamp = _finite(observed_at) or _finite(item.get("last_updated_at")) or _finite(item.get("updated_at")) or time.time()
