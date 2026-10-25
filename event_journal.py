@@ -20,6 +20,24 @@ _SECRET_NAME = re.compile(
     r"mnemonic|password|cookie|keypair.?path|wallet.?file)",
     re.IGNORECASE,
 )
+_SECRET_QUERY_VALUE = re.compile(
+    r"(?i)([?&](?:api[-_]?key|access[-_]?token|auth(?:orization)?(?:[-_]?token)?|refresh[-_]?token|client[-_]?secret|token|key|secret|password|cookie|jwt|session(?:[-_]?token)?|x-amz-(?:signature|security-token|credential)|x-goog-(?:signature|security-token|credential)|awsaccesskeyid|googleaccessid|signature|sig)=)[^&#\s\"'<>]+"
+)
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(api[-_]?key|access[-_]?token|auth(?:orization)?(?:[-_]?token)?|refresh[-_]?token|client[-_]?secret|private[-_]?key|"
+    r"secret|seed[-_]?phrase|mnemonic|password|cookie)\b(\s*[:=]\s*)[^,;\s\"']+"
+)
+_SECRET_HEADER = re.compile(r"(?im)\b(Cookie|Set-Cookie|Authorization)\s*:\s*[^\r\n]+")
+
+
+def _redact_text(value: str, limit: int) -> str:
+    """Redact secret-like values even when they occur inside innocent string fields."""
+    result = _SECRET_HEADER.sub(r"\1: [REDACTED]", value)
+    result = re.sub(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/-]+={0,2}", r"\1[REDACTED]", result)
+    result = _SECRET_QUERY_VALUE.sub(r"\1[REDACTED]", result)
+    result = _SECRET_ASSIGNMENT.sub(r"\1\2[REDACTED]", result)
+    return result[:max(0, int(limit))]
+
 _ALLOWED_STRATEGIES = {"leader_copy", "trending_discovery", "token_discovery", "market_data", "system"}
 _DECISION_RE = re.compile(r"(?:reject|block|skip|filter|fail|stale|unparsed|duplicate|unknown)", re.IGNORECASE)
 
@@ -45,7 +63,7 @@ def _safe_json(value: Any, *, key: str = "", depth: int = 0) -> Any:
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, str):
-        return value[:500]
+        return _redact_text(value, 500)
     if isinstance(value, dict):
         result = {}
         for name, item in list(value.items())[:80]:
@@ -56,7 +74,7 @@ def _safe_json(value: Any, *, key: str = "", depth: int = 0) -> Any:
         return result
     if isinstance(value, (list, tuple, set)):
         return [_safe_json(item, depth=depth + 1) for item in list(value)[:50]]
-    return str(value)[:300]
+    return _redact_text(str(value), 300)
 
 
 def _hash_key(value: str) -> str:

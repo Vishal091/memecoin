@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from contextlib import closing
 import json
 import math
 import sqlite3
@@ -89,7 +90,7 @@ def load_database(path: str | Path) -> tuple[list[dict], dict]:
         "pnl_observations": 0,
         "note": "Paper ledger metrics reflect the application's simulator accounting, not live executions.",
     }
-    with sqlite3.connect(uri, uri=True) as connection:
+    with closing(sqlite3.connect(uri, uri=True)) as connection:
         connection.row_factory = sqlite3.Row
         tables = {
             str(row["name"])

@@ -99,6 +99,30 @@ class EventJournalTests(unittest.TestCase):
         self.assertNotIn("DO_NOT_STORE_THIS_EITHER", serialized)
         self.assertEqual(row["payload"]["nested"]["safe_metric"], 12)
 
+    def test_embedded_credential_values_are_redacted_inside_safe_string_fields(self):
+        self.store.record_event(
+            event_type="candidate_decision",
+            strategy="token_discovery",
+            observed_at=1_800_000_000,
+            mint="mint-alpha",
+            status="observed",
+            decision="screened",
+            payload={
+                "metadata_uri": "https://example.invalid/item.json?access_token=QUERY_SECRET&safe=1",
+                "signed_url": "https://example.invalid/blob?X-Amz-Credential=CREDENTIAL_SECRET&X-Amz-Signature=SIG_SECRET",
+                "diagnostic": "Authorization: Bearer BEARER_SECRET",
+                "debug": "api_key=INLINE_SECRET",
+                "cookie_note": "Cookie: session=COOKIE_SECRET",
+                "safe_metric": "ordinary diagnostic text",
+            },
+        )
+        row = self.store.list_events(event_types=["candidate_decision"])[0]
+        serialized = str(row["payload"])
+        for secret in ("QUERY_SECRET", "CREDENTIAL_SECRET", "SIG_SECRET", "BEARER_SECRET", "INLINE_SECRET", "COOKIE_SECRET"):
+            self.assertNotIn(secret, serialized)
+        self.assertIn("[REDACTED]", serialized)
+        self.assertEqual(row["payload"]["safe_metric"], "ordinary diagnostic text")
+
     def test_retention_limit_is_enforced_on_every_insert_not_only_hourly(self):
         self.store.journal.RETENTION_ROWS = 3
         for index in range(5):
