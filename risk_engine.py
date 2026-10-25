@@ -56,6 +56,8 @@ class RiskEngine:
                 )
             mode = str(getattr(self.settings, "mode", "paper")).lower()
             if strategy:
+                if strategy not in {"leader_copy", "trending_discovery", "token_discovery"}:
+                    return "Unknown strategy; refusing entry."
                 disabled_key = f"mode_policy_disabled:{mode}:{strategy}"
                 if self.store.get_state(disabled_key, "0") == "1":
                     detail = self.store.get_state(
@@ -63,6 +65,12 @@ class RiskEngine:
                         "Mature after-cost expectancy evidence did not clear the positive lower-confidence-bound gate.",
                     )
                     return f"Strategy {strategy} is auto-disabled by mode evidence policy: {detail}"
+                if self.store.get_state(f"mode_kill_switch:{mode}:{strategy}", "0") == "1":
+                    detail = self.store.get_state(
+                        f"mode_kill_switch_reason:{mode}:{strategy}",
+                        "Independent strategy kill switch is active.",
+                    )
+                    return f"Strategy {strategy} kill switch is active: {detail}"
             if self.kill_switch_active():
                 return "Global entry kill switch is active: " + self.kill_switch_reason()
             unresolved = self.store.list_state_prefix("unresolved_trade:", limit=1)
@@ -81,6 +89,24 @@ class RiskEngine:
         except Exception:
             return "Risk-control state could not be read; refusing new entries."
         return ""
+
+    def set_mode_kill_switch(self, strategy: str, enabled: bool, reason: str = "") -> tuple[bool, str]:
+        """Set a persistent, independent entry kill switch for exactly one strategy."""
+        if strategy not in {"leader_copy", "trending_discovery", "token_discovery"}:
+            return False, "Unknown strategy."
+        mode = str(getattr(self.settings, "mode", "paper")).lower()
+        disabled_key = f"mode_policy_disabled:{mode}:{strategy}"
+        if not enabled and self.store.get_state(disabled_key, "0") == "1":
+            return False, "Evidence policy auto-disabled this strategy; manual toggles cannot override it."
+        state_key = f"mode_kill_switch:{mode}:{strategy}"
+        reason_key = f"mode_kill_switch_reason:{mode}:{strategy}"
+        self.store.set_state(state_key, "1" if enabled else "0")
+        if enabled:
+            clean = " ".join(str(reason or "Operator paused this strategy").split())[:500]
+            self.store.set_state(reason_key, clean)
+            return True, f"{strategy} entry kill switch engaged; existing positions remain managed."
+        self.store.set_state(reason_key, "")
+        return True, f"{strategy} entry kill switch cleared. Global and evidence gates still apply."
 
     def activate_kill_switch(self, reason: str) -> None:
         clean = " ".join(str(reason or "Operator or safety gate activated").split())[:1000]
@@ -283,6 +309,8 @@ class RiskEngine:
             mode_policy[strategy] = {
                 "disabled": disabled,
                 "reason": self.store.get_state(f"mode_policy_reason:{mode}:{strategy}", ""),
+                "kill_switch_active": self.store.get_state(f"mode_kill_switch:{mode}:{strategy}", "0") == "1",
+                "kill_switch_reason": self.store.get_state(f"mode_kill_switch_reason:{mode}:{strategy}", ""),
             }
         return {
             "mode": mode,
