@@ -146,10 +146,10 @@ class Settings:
             # Bounded first canary: keep the initial real-money exposure deliberately tiny.
             if self.max_entry_usd > 0.50:
                 raise ValueError("Live canary requires MAX_ENTRY_USD <= 0.50.")
-            if self.max_total_exposure_usd > 0.55:
-                raise ValueError("Live canary requires MAX_TOTAL_EXPOSURE_USD <= 0.55, including the built-in fee allowance.")
-            if self.max_open_positions != 1:
-                raise ValueError("Live canary requires MAX_OPEN_POSITIONS=1.")
+            if self.max_total_exposure_usd > 5.50:
+                raise ValueError("Live trial requires MAX_TOTAL_EXPOSURE_USD <= 5.50 for up to ten reserved positions; actual fees/rent can be higher.")
+            if not (1 <= self.max_open_positions <= 10):
+                raise ValueError("Live trial requires MAX_OPEN_POSITIONS between 1 and 10.")
             if not (1 <= self.max_entries_per_day <= 10):
                 raise ValueError("Live canary requires MAX_ENTRIES_PER_DAY between 1 and 10.")
             if not (0 < self.daily_loss_limit_usd <= 0.50):
