@@ -140,7 +140,7 @@ class RiskEngine:
             if live_mode:
                 max_total_exposure = min(max_total_exposure, 0.55)
                 max_open_positions = min(max_open_positions, 1)
-                max_entries_per_day = min(max_entries_per_day, 1)
+                max_entries_per_day = min(max_entries_per_day, 10)
             denied = self.store.try_reserve_entry_atomic(
                 reservation_id=reservation_id,
                 mint=mint,
@@ -283,7 +283,7 @@ class RiskEngine:
             max_entry_usd = min(max_entry_usd, 0.50)
             max_total_exposure_usd = min(max_total_exposure_usd, 0.55)
             max_open_positions = min(max_open_positions, 1)
-            max_entries_per_day = min(max_entries_per_day, 1)
+            max_entries_per_day = min(max_entries_per_day, 10)
         return {
             "mode": str(getattr(self.settings, "mode", "paper")),
             "live_entries_approved": bool(getattr(self.settings, "live_entries_approved", False)),
