@@ -37,7 +37,8 @@ SAFE_FIELDS = {
     "return_15m_pct", "current_return_pct", "max_return_pct", "min_return_pct",
     "shadow_entry_at", "shadow_entry_price_usd", "shadow_exit_at",
     "shadow_exit_price_usd", "entry_market_cap_usd", "entry_market_cap_source",
-    "latency_ms", "elapsed_ms", "price_impact_pct", "slippage_pct",
+    "latency_ms", "elapsed_ms", "price_impact_pct", "slippage_pct", "signer_verified", "program_verified",
+    "action", "value_usd", "pnl_usd", "observed_received_at", "block_time",
     "priority_fee_lamports", "failed_transaction", "fill_price_usd",
 }
 
@@ -208,6 +209,7 @@ class ResearchJournal:
         self, *, mode: str, strategy: str, event_type: str, event: dict | None = None,
         observed_at: float | None = None, rejection_reason: str = "",
         latency_ms: float | None = None, amount_usd: float | None = None,
+        dedupe_key: str = "",
     ) -> str:
         item = event if isinstance(event, dict) else {}
         stamp = _finite(observed_at) or _finite(item.get("timestamp")) or time.time()
@@ -224,7 +226,7 @@ class ResearchJournal:
         safe = safe_payload(item)
         # Prefer real public transaction signatures for deduplication; otherwise retain
         # events within distinct timestamps, not a single mutable "latest event" record.
-        event_key = self._key(mode, strategy, event_type, signature or source, mint, wallet, side, round(stamp, 2), safe)
+        event_key = dedupe_key or self._key(mode, strategy, event_type, signature or source, mint, wallet, side, round(stamp, 2), safe)
         with self.lock, self.db:
             self.db.execute(
                 """INSERT OR IGNORE INTO research_events
@@ -260,10 +262,13 @@ class ResearchJournal:
         clean_reason = " ".join(str(rejection_reason or "").split())[:500]
         safe = safe_payload(payload)
         if not signal_id:
-            signal_id = self._key(
-                mode, strategy_value, mint_value, signal_type, clean_decision,
-                source_signature, round(stamp, 2), clean_reason,
-            )
+            if source_signature:
+                signal_id = self._key(mode, strategy_value, mint_value, signal_type, source_signature, clean_decision)
+            else:
+                signal_id = self._key(
+                    mode, strategy_value, mint_value, signal_type, clean_decision,
+                    round(stamp, 2), clean_reason,
+                )
         with self.lock, self.db:
             self.db.execute(
                 """INSERT OR IGNORE INTO research_signals
@@ -422,3 +427,12 @@ class ResearchJournal:
                     "research_cost_estimates", "WHERE total_known_cost_usd IS NULL"
                 ),
             }
+
+
+// Reuse one writer per Store to keep table setup/pruning out of hot paths.
+def get_research_journal(store, *, path_window_seconds: int = DEFAULT_PATH_WINDOW_SECONDS) -> ResearchJournal:
+    journal = getattr(store, "_research_journal", None)
+    if journal is None:
+        journal = ResearchJournal(store, path_window_seconds=path_window_seconds)
+        setattr(store, "_research_journal", journal)
+    return journal
