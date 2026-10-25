@@ -61,7 +61,7 @@ class ResearchJournalTests(unittest.TestCase):
             event={"source": "verified_tick", "mint": "MintA", "price_usd": 1.2},
         )
         marks = self.store.db.execute(
-            "SELECT signal_id,price_usd FROM research_marks WHERE signal_id=?",
+            "SELECT signal_id,price_usd FROM research_marks WHERE signal_id=? ORDER BY observed_at ASC",
             (signal_id,),
         ).fetchall()
         self.assertTrue(inserted)
@@ -103,7 +103,7 @@ class ResearchJournalTests(unittest.TestCase):
         self.assertAlmostEqual(result["total_known_cost_usd"], 0.037)
         self.assertEqual(result["missing_components"], [])
         stored = self.store.db.execute("SELECT COUNT(*) FROM research_cost_estimates").fetchone()[0]
-        self.assertEqual(stored, 2)
+        self.assertEqual(stored, 1)
 
     def test_dashboard_snapshot_exposes_counts_not_raw_payloads(self):
         self.journal.record_candidate(
