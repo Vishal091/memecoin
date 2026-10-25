@@ -200,6 +200,17 @@ def _build_signal_cohort(events: list[dict], mode: str) -> list[dict]:
     return sorted(chosen.values(), key=lambda x: float(x["observed_at"]))
 
 
+def _pool_address(event: dict) -> str:
+    """Extract an explicit market/pool identity; never confuse venue labels with pool IDs."""
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    for source in (event, payload):
+        for key in ("pool_address", "pair_address", "pairAddress", "dexscreener_pair_address"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:128]
+    return ""
+
+
 def _build_marks(events: list[dict]) -> dict[str, list[dict]]:
     marks: dict[str, list[dict]] = defaultdict(list)
     eligible_types = {"price_mark", "trade_tick", "leader_trade", "candidate_decision",
@@ -215,6 +226,7 @@ def _build_marks(events: list[dict]) -> dict[str, list[dict]]:
             "observed_at": timestamp, "price_usd": price,
             "liquidity_usd": _finite(event.get("liquidity_usd")),
             "event_type": str(event.get("event_type") or ""),
+            "pool_address": _pool_address(event),
             "signature": str(event.get("signature") or ""),
             "source": str(event.get("source") or ""),
         })
@@ -252,6 +264,7 @@ def evaluate_mode_events(
             "entry_price_usd": price,
             "liquidity_usd": _finite(event.get("liquidity_usd")),
             "latency_ms": _finite(event.get("latency_ms")),
+            "pool_address": _pool_address(event),
             "cost_inputs": costs,
             "payload": payload,
             "rejected": _is_rejected(event),
@@ -265,6 +278,10 @@ def evaluate_mode_events(
         "rejected_decisions": sum(1 for e in _decision_events(events, mode) if _is_rejected(e)),
         "signals_with_reference_price": len(valid_signals),
         "signals_missing_reference_price": missing_reference,
+        "signals_missing_market_identity": (
+            sum(1 for signal in valid_signals if not signal["pool_address"])
+            if mode == "trending_discovery" else 0
+        ),
         "rejection_reasons": {},
         "horizons": {},
         "observed_span_days": (
@@ -281,16 +298,32 @@ def evaluate_mode_events(
     result["rejection_reasons"] = dict(rejection_reasons.most_common(30))
 
     for horizon in HORIZONS:
-        gross, outcomes, missing = [], [], 0
+        gross, outcomes, missing, missing_market_match = [], [], 0, 0
         for signal in valid_signals:
             target = signal["observed_at"] + horizon
-            future = next((
-                mark for mark in marks.get(signal["mint"], [])
-                if mark["observed_at"] >= target
-                and mark["observed_at"] <= target + max(0.0, max_delay_seconds)
-            ), None)
+            future = None
+            has_market_mismatch = False
+            for mark in marks.get(signal["mint"], []):
+                if mark["observed_at"] < target or mark["observed_at"] > target + max(0.0, max_delay_seconds):
+                    continue
+                signal_pool = signal["pool_address"]
+                mark_pool = mark["pool_address"]
+                # Trending return estimates are only valid against the exact screened pool.
+                # If the signal or future mark lacks identity, fail closed instead of
+                # silently joining prices from a different pool of the same token.
+                if mode == "trending_discovery":
+                    if not signal_pool or not mark_pool or mark_pool != signal_pool:
+                        has_market_mismatch = True
+                        continue
+                elif signal_pool and mark_pool != signal_pool:
+                    has_market_mismatch = True
+                    continue
+                future = mark
+                break
             if future is None:
                 missing += 1
+                if has_market_mismatch or (mode == "trending_discovery" and not signal["pool_address"]):
+                    missing_market_match += 1
                 continue
             value = (future["price_usd"] / signal["entry_price_usd"] - 1.0) * 100.0
             if not math.isfinite(value):
@@ -304,6 +337,8 @@ def evaluate_mode_events(
                 "rejected": signal["rejected"], "rejection_reason": signal["reason"],
                 "horizon_seconds": horizon, "mark_at": future["observed_at"],
                 "mark_price_usd": future["price_usd"], "gross_return_pct": value,
+                "signal_pool_address": signal["pool_address"],
+                "mark_pool_address": future["pool_address"],
                 "mark_latency_after_horizon_seconds": future["observed_at"] - target,
                 "signal_to_decision_latency_ms": signal["latency_ms"],
                 "provider_event_age_ms": (
@@ -316,6 +351,7 @@ def evaluate_mode_events(
         summary = {
             "horizon_seconds": horizon, "signals": len(valid_signals),
             "evaluable_samples": len(gross), "missing_or_stale_future_mark": missing,
+            "missing_valid_market_match": missing_market_match,
             "gross": summarize_returns(gross, seed=20261025 + horizon),
             "cost_scenarios": {}, "outcomes": outcomes,
         }
