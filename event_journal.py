@@ -21,7 +21,7 @@ _SECRET_NAME = re.compile(
     re.IGNORECASE,
 )
 _SECRET_QUERY_VALUE = re.compile(
-    r"(?i)([?&](?:api[-_]?key|access[-_]?token|auth(?:orization)?(?:[-_]?token)?|refresh[-_]?token|client[-_]?secret|token|key|secret|password|cookie|x-amz-signature|x-goog-signature|signature|sig)=)[^&#\s\"'<>]+"
+    r"(?i)([?&](?:api[-_]?key|access[-_]?token|auth(?:orization)?(?:[-_]?token)?|refresh[-_]?token|client[-_]?secret|token|key|secret|password|cookie|jwt|session(?:[-_]?token)?|x-amz-(?:signature|security-token|credential)|x-goog-(?:signature|security-token|credential)|awsaccesskeyid|googleaccessid|signature|sig)=)[^&#\s\"'<>]+"
 )
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(api[-_]?key|access[-_]?token|auth(?:orization)?(?:[-_]?token)?|refresh[-_]?token|client[-_]?secret|private[-_]?key|"
