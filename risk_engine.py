@@ -51,8 +51,8 @@ class RiskEngine:
                 and not bool(getattr(self.settings, "live_entries_approved", False))
             ):
                 return (
-                    "Live entries are disabled in this Phase 4 build: LIVE_ENTRIES_APPROVED=false. "
-                    "Use paper mode until a separate rollout is approved."
+                    "Live entries are disabled: LIVE_ENTRIES_APPROVED=false. "
+                    "Enable only the bounded canary after explicit approval and compliant limits."
                 )
             if self.kill_switch_active():
                 return "Global entry kill switch is active: " + self.kill_switch_reason()
@@ -86,7 +86,7 @@ class RiskEngine:
             ):
                 return False, (
                     "Live entry gate cannot be resumed: LIVE_ENTRIES_APPROVED=false. "
-                    "Use paper mode until a separate rollout is approved."
+                    "Enable only the bounded canary after explicit approval and compliant limits."
                 )
             unresolved = self.store.list_state_prefix("unresolved_trade:", limit=1000)
             if unresolved:
@@ -123,7 +123,10 @@ class RiskEngine:
                 return None, "Entry amount or reserved exposure is invalid."
             if not mint or strategy not in {"leader_copy", "token_discovery", "trending_discovery"}:
                 return None, "Unsupported strategy or missing mint."
+            live_mode = str(getattr(self.settings, "mode", "paper")).lower() == "live"
             configured_cap = float(getattr(self.settings, "max_entry_usd", 0.50))
+            if live_mode:
+                configured_cap = min(configured_cap, 0.50)
             if strategy == "token_discovery":
                 configured_cap = min(configured_cap, 0.50, float(getattr(self.settings, "token_discovery_max_entry_usd", 0.50)))
             elif strategy == "trending_discovery":
@@ -131,14 +134,21 @@ class RiskEngine:
             if amount > configured_cap + 1e-9:
                 return None, f"Requested input USD {amount:.2f} exceeds the USD {configured_cap:.2f} strategy cap."
             reservation_id = uuid4().hex
+            max_total_exposure = float(getattr(self.settings, "max_total_exposure_usd", 1.00))
+            max_open_positions = int(getattr(self.settings, "max_open_positions", 1))
+            max_entries_per_day = int(getattr(self.settings, "max_entries_per_day", 4))
+            if live_mode:
+                max_total_exposure = min(max_total_exposure, 0.50)
+                max_open_positions = min(max_open_positions, 1)
+                max_entries_per_day = min(max_entries_per_day, 1)
             denied = self.store.try_reserve_entry_atomic(
                 reservation_id=reservation_id,
                 mint=mint,
                 strategy=strategy,
                 amount_usd=exposure,
-                max_total_exposure_usd=float(getattr(self.settings, "max_total_exposure_usd", 1.00)),
-                max_open_positions=int(getattr(self.settings, "max_open_positions", 1)),
-                max_entries_per_day=int(getattr(self.settings, "max_entries_per_day", 4)),
+                max_total_exposure_usd=max_total_exposure,
+                max_open_positions=max_open_positions,
+                max_entries_per_day=max_entries_per_day,
             )
             if denied:
                 return None, denied
@@ -264,6 +274,16 @@ class RiskEngine:
             active = self.store.active_entry_reservations()
         except Exception:
             active = []
+        live_mode = str(getattr(self.settings, "mode", "paper")).lower() == "live"
+        max_entry_usd = float(getattr(self.settings, "max_entry_usd", 0.50))
+        max_total_exposure_usd = float(getattr(self.settings, "max_total_exposure_usd", 1.00))
+        max_open_positions = int(getattr(self.settings, "max_open_positions", 1))
+        max_entries_per_day = int(getattr(self.settings, "max_entries_per_day", 4))
+        if live_mode:
+            max_entry_usd = min(max_entry_usd, 0.50)
+            max_total_exposure_usd = min(max_total_exposure_usd, 0.50)
+            max_open_positions = min(max_open_positions, 1)
+            max_entries_per_day = min(max_entries_per_day, 1)
         return {
             "mode": str(getattr(self.settings, "mode", "paper")),
             "live_entries_approved": bool(getattr(self.settings, "live_entries_approved", False)),
@@ -273,9 +293,9 @@ class RiskEngine:
             "active_reservations": active,
             "unresolved_trade_count": len(unresolved_rows),
             "unresolved_trades": unresolved_rows,
-            "max_entry_usd": float(getattr(self.settings, "max_entry_usd", 0.50)),
-            "max_total_exposure_usd": float(getattr(self.settings, "max_total_exposure_usd", 1.00)),
-            "max_open_positions": int(getattr(self.settings, "max_open_positions", 1)),
-            "max_entries_per_day": int(getattr(self.settings, "max_entries_per_day", 4)),
+            "max_entry_usd": max_entry_usd,
+            "max_total_exposure_usd": max_total_exposure_usd,
+            "max_open_positions": max_open_positions,
+            "max_entries_per_day": max_entries_per_day,
             "max_portfolio_drawdown_pct": float(getattr(self.settings, "max_portfolio_drawdown_pct", 0.15)),
         }
