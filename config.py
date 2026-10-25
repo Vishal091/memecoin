@@ -158,6 +158,12 @@ class Settings:
                 raise ValueError("Live canary requires TOTAL_LOSS_LIMIT_USD in (0, 0.50].")
             if self.min_sol_reserve < 0.025:
                 raise ValueError("Live canary requires MIN_SOL_RESERVE >= 0.025 SOL.")
+            if self.max_marked_loss_pct > 0.18:
+                raise ValueError("Live canary requires MAX_MARKED_LOSS_PCT <= 0.18.")
+            if self.trailing_stop_pct > 0.12:
+                raise ValueError("Live canary requires TRAILING_STOP_PCT <= 0.12.")
+            if self.max_quote_shortfall_pct > 0.04:
+                raise ValueError("Live canary requires MAX_QUOTE_SHORTFALL_PCT <= 0.04.")
             if _bool("TOKEN_DISCOVERY_LIVE_ENABLED", False):
                 raise ValueError("Initial live canary is leader-copy only; TOKEN_DISCOVERY_LIVE_ENABLED must be false.")
             if _bool("TRENDING_DISCOVERY_LIVE_ENABLED", False):
