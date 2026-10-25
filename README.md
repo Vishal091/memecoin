@@ -195,3 +195,16 @@ python shadow_evaluation.py --db memecoin-phase5-paper.db --json-out reports/pha
 ```
 
 The evaluator uses first qualifying entries chronologically, measures 1/5/15-minute returns, reports adverse excursion and cost-sensitivity scenarios, keeps screened missing-price candidates visible but excludes them from returns, and separates paper-ledger P&L from shadow marks. It reports insufficient data honestly; review readiness is not live-trading authorization. Initial review targets are at least 30 elapsed days and 100 evaluable 15-minute samples per strategy. No live orders are submitted by the evaluator.
+
+
+## Phase 1: per-mode research evidence and risk isolation
+
+This branch adds secret-safe SQLite research journaling for public feed events, entry decisions/rejection reasons, market marks after signals, and cost-estimate components. It also adds independent virtual paper cash ledgers, per-mode entry kill switches, and a deterministic per-mode after-cost evaluator. See [the research runbook](docs/research_runbook.md) and [initial evidence verdict](docs/initial_mode_verdict.md).
+
+The report command reads the selected local database read-only and does not sign or submit anything:
+
+```powershell
+python mode_evaluation.py --db memecoin-phase1-research.db --mode paper --json-out reports/phase1-mode-evaluation.json
+```
+
+The default 5% round-trip cost is a sensitivity assumption, not a verified route quote. Unknown protocol fees, slippage/impact, tips, latency and failed-transaction costs are shown as missing rather than silently replaced by zero. A mature strategy whose lower 95% expectancy confidence bound fails to exceed zero is latched off for new entries; a positive confidence bound is only a human-review candidate. No strategy is auto-enabled, and all live approval settings remain separate.
