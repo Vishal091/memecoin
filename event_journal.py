@@ -21,10 +21,10 @@ _SECRET_NAME = re.compile(
     re.IGNORECASE,
 )
 _SECRET_QUERY_VALUE = re.compile(
-    r"(?i)([?&](?:api[-_]?key|access[-_]?token|auth(?:orization)?|token|key|secret|password|cookie)=)[^&#\s\"'<>]+"
+    r"(?i)([?&](?:api[-_]?key|access[-_]?token|auth(?:orization)?(?:[-_]?token)?|refresh[-_]?token|client[-_]?secret|token|key|secret|password|cookie|x-amz-signature|x-goog-signature|signature|sig)=)[^&#\s\"'<>]+"
 )
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b(api[-_]?key|access[-_]?token|auth(?:orization)?|private[-_]?key|"
+    r"(?i)\b(api[-_]?key|access[-_]?token|auth(?:orization)?(?:[-_]?token)?|refresh[-_]?token|client[-_]?secret|private[-_]?key|"
     r"secret|seed[-_]?phrase|mnemonic|password|cookie)\b(\s*[:=]\s*)[^,;\s\"']+"
 )
 _SECRET_HEADER = re.compile(r"(?im)\b(Cookie|Set-Cookie|Authorization)\s*:\s*[^\r\n]+")
