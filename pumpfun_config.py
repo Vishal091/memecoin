@@ -1,5 +1,6 @@
 """Configuration for the Pump.fun-specific bot entrypoint."""
 from __future__ import annotations
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +50,7 @@ class PumpFunSettings:
     keypair_path: Path
     max_entry_usd: float
     max_total_exposure_usd: float
+    max_strategy_exposure_usd: float
     max_open_positions: int
     max_entries_per_day: int
     max_consecutive_losses: int
@@ -131,6 +133,7 @@ class PumpFunSettings:
             # Enforced trial ceilings: local settings can only make this profile stricter.
             max_entry_usd=min(0.50, _float("MAX_ENTRY_USD", 0.50)),
             max_total_exposure_usd=min(1.00, _float("MAX_TOTAL_EXPOSURE_USD", 1.00)),
+            max_strategy_exposure_usd=min(0.75, _float("MAX_STRATEGY_EXPOSURE_USD", 0.75)),
             max_open_positions=1,
             max_entries_per_day=max(1, min(4, _int("MAX_ENTRIES_PER_DAY", 4))),
             # Pause new entries after three losing exits in a row; allow only a narrow safe override range.
@@ -208,10 +211,12 @@ class PumpFunSettings:
             raise ValueError("SOLANA_RPC_URL must use HTTPS")
         if self.default_leaderboard_window not in {"overall", "day", "week", "month"}:
             raise ValueError("DEFAULT_LEADERBOARD_WINDOW must be overall, day, week or month")
-        if self.max_entry_usd <= 0 or self.max_total_exposure_usd <= 0:
+        if self.max_entry_usd <= 0 or self.max_total_exposure_usd <= 0 or self.max_strategy_exposure_usd <= 0:
             raise ValueError("Entry and exposure limits must be positive")
         if self.max_entry_usd > 0.50 or self.max_total_exposure_usd > 1.00:
             raise ValueError("This trial profile caps entries at $0.50 and total exposure at $1.00")
+        if self.max_strategy_exposure_usd > 0.75:
+            raise ValueError("This trial profile caps per-strategy exposure at $0.75")
         if self.max_open_positions != 1:
             raise ValueError("This trial profile permits one open position at a time")
         if not (0 < self.max_portfolio_drawdown_pct <= 0.15):
