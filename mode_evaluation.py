@@ -322,6 +322,17 @@ def auto_disable_unprofitable_modes(
                 "INSERT INTO state(key,value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (reason_key, "Evidence maturity passed and 95% bootstrap expectancy lower bound was not positive after configured cost assumption."),
             )
+            # Preserve an independent per-strategy stop state as well as the
+            # evidence verdict. This remains an entry-only halt; exits still run.
+            store.db.execute(
+                "INSERT INTO state(key,value) VALUES(?, '1') ON CONFLICT(key) DO UPDATE SET value='1'",
+                (f"mode_kill_switch:{mode}:{strategy}",),
+            )
+            store.db.execute(
+                "INSERT INTO state(key,value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (f"mode_kill_switch_reason:{mode}:{strategy}",
+                 "Evidence policy auto-disabled this mode after the 95% expectancy CI lower bound failed to exceed zero."),
+            )
         changes.append(strategy)
     return {"disabled": changes, "report": report}
 
