@@ -31,7 +31,7 @@ class _FakeRiskEngine:
     def __init__(self):
         self.last_reason = ""
 
-    def gate_reason(self):
+    def gate_reason(self, *, strategy=None, ignore_reservation_id=None):
         return ""
 
     def activate_kill_switch(self, reason):
@@ -934,6 +934,9 @@ class EntryDrawdownCircuitBreakerTests(unittest.TestCase):
             return 0
         def list_positions(self):
             return []
+
+        def get_strategy_account(self, mode, strategy):
+            return {"cash_usd": 10.0 / 3.0}
 
     def _bot(self, *, equity=10.0, initial=10.0, day_start=10.0):
         bot = object.__new__(PumpFunBot)

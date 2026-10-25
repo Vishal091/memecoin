@@ -32,6 +32,7 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px 8px
 <header><div><h1>Memecoin <span class="muted">/ Pump.fun</span></h1><div class="muted">Top traders · automatic copy · manual exits</div></div><div><span class="pill" id="mode">MODE</span> <button id="refresh">Refresh</button></div></header>
 <div id="message" class="status">Connecting to local bot...</div>
 <section class="panel"><div class="toolbar"><div><h2>Global entry safety gate <span class="pill" id="entryGateStatus">HALTED</span></h2><div class="muted">Blocks new buys across all strategies. Existing positions continue to be managed; the switch does not auto-liquidate holdings. Every process startup requires an explicit resume.</div></div><button id="entryGateToggle" class="primary">Resume new entries</button></div><div id="entryGateDetail" class="status">Risk-control state is loading…</div><div id="unresolvedTransactions" class="status">Checking unresolved transactions and reservations…</div><div class="footer">Only acknowledge after independently checking transaction history and actual wallet balances. Acknowledgement does not enable entries; use the separate resume control afterwards.</div></section>
+<section class="panel"><h2>Independent strategy budgets and kill switches</h2><div class="muted">Each mode has its own virtual paper cash account and persistent entry kill switch. Pausing a mode blocks new entries only; existing positions remain managed. Evidence-policy auto-disable cannot be manually overridden here.</div><div id="modeControls" class="grid"></div><div id="strategyAccounts" class="status">Loading per-strategy paper accounts…</div></section>
 <div class="grid"><div class="metric"><small>Estimated equity</small><strong id="equity">—</strong></div>
 <div class="metric"><small>Open positions</small><strong id="posCount">0</strong></div><div class="metric"><small>Auto-copy</small><strong id="copyStatus">OFF</strong></div>
 <div class="metric"><small>Active traders</small><strong id="walletCount">0</strong></div></div>
@@ -131,6 +132,41 @@ function render(d){
       action({action:"set_entry_kill_switch",enabled:true});
     }
   };
+  var policy=rc.mode_policy||{}, accounts=d.strategy_accounts||{};
+  var strategyDefs=[
+    {key:"leader_copy",label:"Auto-copy leaders"},
+    {key:"trending_discovery",label:"Trending tokens"},
+    {key:"token_discovery",label:"New-token discovery"}
+  ];
+  el("modeControls").innerHTML=strategyDefs.map(function(s){
+    var p=policy[s.key]||{}, a=accounts[s.key]||{};
+    var autoDisabled=Boolean(p.disabled), halted=Boolean(p.kill_switch_active);
+    var status=autoDisabled?"AUTO-DISABLED BY EVIDENCE":(halted?"MODE KILL SWITCH ON":"MODE KILL SWITCH OFF");
+    var buttonLabel=autoDisabled?"Disabled by evidence":(halted?"Clear mode kill switch":"Pause this mode");
+    var disabledAttr=autoDisabled?" disabled":"";
+    return "<div class='metric'><strong>"+s.label+"</strong><div class='pill'>"+status+"</div>"+
+      "<div class='muted' style='margin-top:8px'>Paper budget $"+num(a.starting_cash_usd||0)+
+      " · cash $"+num(a.cash_usd||0)+" · realized P&amp;L $"+num(a.realized_pnl_usd||0)+"</div>"+
+      "<div class='muted' style='margin-top:6px'>"+esc(autoDisabled?(p.reason||"Non-positive lower confidence bound after evidence maturity"):(p.kill_switch_reason||"Independent strategy switch controls new entries only."))+"</div>"+
+      "<button class='"+(halted||autoDisabled?"primary":"danger")+"' data-strategy='"+s.key+"'"+disabledAttr+">"+buttonLabel+"</button></div>";
+  }).join("");
+  document.querySelectorAll("#modeControls button[data-strategy]").forEach(function(b){
+    b.onclick=function(){
+      var key=b.dataset.strategy, p=policy[key]||{};
+      if(p.disabled){el("message").textContent="Evidence policy has auto-disabled this strategy and cannot be bypassed in the dashboard.";return;}
+      var enable=!p.kill_switch_active;
+      var question=enable
+        ?"Pause new entries for "+key+"? Existing positions will continue to be managed."
+        :"Clear the independent kill switch for "+key+"? The global kill switch, evidence policy and risk checks still apply.";
+      if(!confirm(question))return;
+      action({action:"set_mode_kill_switch",strategy:key,enabled:enable});
+    };
+  });
+  var journal=d.research_journal||{};
+  el("strategyAccounts").textContent="Research journal · events "+(journal.events||0)+
+    " · signals "+(journal.signals||0)+" · rejected "+(journal.rejected_signals||0)+
+    " · price marks "+(journal.observed_marks||0)+" · cost estimates missing components "+(journal.cost_estimates_missing_components||0)+
+    " · auto-disable policy "+(Boolean(d.mode_policy_auto_disable_enabled)?"ON":"OFF");
   var unresolved=rc.unresolved_trades||[], reservations=rc.active_reservations||[];
   var reconHtml="";
   unresolved.forEach(function(x){
@@ -284,12 +320,16 @@ class DashboardServer:
                         "copy_top10", "stop_copy", "manual_exit", "exit_all",
                         "set_token_discovery_enabled", "set_token_discovery_live_enabled",
                         "set_trending_discovery_enabled", "set_trending_discovery_live_enabled",
-                        "set_entry_kill_switch", "acknowledge_reconciled_trade",
-                        "acknowledge_risk_reservation",
+                        "set_entry_kill_switch", "set_mode_kill_switch",
+                        "acknowledge_reconciled_trade", "acknowledge_risk_reservation",
                     }:
                         raise ValueError("Unknown action")
                     if str(command.get("action", "")).startswith("set_") and not isinstance(command.get("enabled"), bool):
                         raise ValueError("Toggle enabled value must be true or false")
+                    if command.get("action") == "set_mode_kill_switch" and command.get("strategy") not in {
+                            "leader_copy", "trending_discovery", "token_discovery"
+                    }:
+                        raise ValueError("Unknown strategy for mode kill switch")
                     if command.get("action") == "acknowledge_reconciled_trade":
                         if not all(isinstance(command.get(key), str) and command.get(key) for key in ("mint", "signature", "confirmation")):
                             raise ValueError("Mint, signature, and reconciliation confirmation are required")

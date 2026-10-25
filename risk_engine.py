@@ -43,8 +43,8 @@ class RiskEngine:
             "Entry kill switch is active; explicit operator resume is required.",
         )
 
-    def gate_reason(self, *, ignore_reservation_id: str | None = None) -> str:
-        """Return a rejection reason; optionally allow a reservation through its own submit boundary."""
+    def gate_reason(self, *, strategy: str | None = None, ignore_reservation_id: str | None = None) -> str:
+        """Return a rejection reason; enforce global and strategy-specific gates."""
         try:
             if (
                 str(getattr(self.settings, "mode", "paper")).lower() == "live"
@@ -54,6 +54,23 @@ class RiskEngine:
                     "Live entries are disabled in this Phase 4 build: LIVE_ENTRIES_APPROVED=false. "
                     "Use paper mode until a separate rollout is approved."
                 )
+            mode = str(getattr(self.settings, "mode", "paper")).lower()
+            if strategy:
+                if strategy not in {"leader_copy", "trending_discovery", "token_discovery"}:
+                    return "Unknown strategy; refusing entry."
+                disabled_key = f"mode_policy_disabled:{mode}:{strategy}"
+                if self.store.get_state(disabled_key, "0") == "1":
+                    detail = self.store.get_state(
+                        f"mode_policy_reason:{mode}:{strategy}",
+                        "Mature after-cost expectancy evidence did not clear the positive lower-confidence-bound gate.",
+                    )
+                    return f"Strategy {strategy} is auto-disabled by mode evidence policy: {detail}"
+                if self.store.get_state(f"mode_kill_switch:{mode}:{strategy}", "0") == "1":
+                    detail = self.store.get_state(
+                        f"mode_kill_switch_reason:{mode}:{strategy}",
+                        "Independent strategy kill switch is active.",
+                    )
+                    return f"Strategy {strategy} kill switch is active: {detail}"
             if self.kill_switch_active():
                 return "Global entry kill switch is active: " + self.kill_switch_reason()
             unresolved = self.store.list_state_prefix("unresolved_trade:", limit=1)
@@ -72,6 +89,24 @@ class RiskEngine:
         except Exception:
             return "Risk-control state could not be read; refusing new entries."
         return ""
+
+    def set_mode_kill_switch(self, strategy: str, enabled: bool, reason: str = "") -> tuple[bool, str]:
+        """Set a persistent, independent entry kill switch for exactly one strategy."""
+        if strategy not in {"leader_copy", "trending_discovery", "token_discovery"}:
+            return False, "Unknown strategy."
+        mode = str(getattr(self.settings, "mode", "paper")).lower()
+        disabled_key = f"mode_policy_disabled:{mode}:{strategy}"
+        if not enabled and self.store.get_state(disabled_key, "0") == "1":
+            return False, "Evidence policy auto-disabled this strategy; manual toggles cannot override it."
+        state_key = f"mode_kill_switch:{mode}:{strategy}"
+        reason_key = f"mode_kill_switch_reason:{mode}:{strategy}"
+        self.store.set_state(state_key, "1" if enabled else "0")
+        if enabled:
+            clean = " ".join(str(reason or "Operator paused this strategy").split())[:500]
+            self.store.set_state(reason_key, clean)
+            return True, f"{strategy} entry kill switch engaged; existing positions remain managed."
+        self.store.set_state(reason_key, "")
+        return True, f"{strategy} entry kill switch cleared. Global and evidence gates still apply."
 
     def activate_kill_switch(self, reason: str) -> None:
         clean = " ".join(str(reason or "Operator or safety gate activated").split())[:1000]
@@ -113,7 +148,7 @@ class RiskEngine:
         exposure_usd: float | None = None,
     ) -> tuple[str | None, str]:
         """Atomically reserve position/exposure capacity before building or submitting."""
-        reason = self.gate_reason()
+        reason = self.gate_reason(strategy=strategy)
         if reason:
             return None, reason
         try:
@@ -139,6 +174,7 @@ class RiskEngine:
                 max_total_exposure_usd=float(getattr(self.settings, "max_total_exposure_usd", 1.00)),
                 max_open_positions=int(getattr(self.settings, "max_open_positions", 1)),
                 max_entries_per_day=int(getattr(self.settings, "max_entries_per_day", 4)),
+                max_strategy_exposure_usd=float(getattr(self.settings, "max_strategy_exposure_usd", 0.75)),
             )
             if denied:
                 return None, denied
@@ -150,7 +186,9 @@ class RiskEngine:
     def mark_submitting(self, reservation_id: str) -> tuple[bool, str]:
         """Last local admission check; fails closed on live-policy or kill-switch changes."""
         try:
-            policy_reason = self.gate_reason(ignore_reservation_id=reservation_id)
+            row = self.store.get_entry_reservation(reservation_id) or {}
+            strategy = str(row.get("strategy") or "") or None
+            policy_reason = self.gate_reason(strategy=strategy, ignore_reservation_id=reservation_id)
             if policy_reason:
                 return False, policy_reason
             return self.store.mark_entry_reservation_submitting(reservation_id)
@@ -264,8 +302,19 @@ class RiskEngine:
             active = self.store.active_entry_reservations()
         except Exception:
             active = []
+        mode = str(getattr(self.settings, "mode", "paper")).lower()
+        mode_policy = {}
+        for strategy in ("leader_copy", "trending_discovery", "token_discovery"):
+            disabled = self.store.get_state(f"mode_policy_disabled:{mode}:{strategy}", "0") == "1"
+            mode_policy[strategy] = {
+                "disabled": disabled,
+                "reason": self.store.get_state(f"mode_policy_reason:{mode}:{strategy}", ""),
+                "kill_switch_active": self.store.get_state(f"mode_kill_switch:{mode}:{strategy}", "0") == "1",
+                "kill_switch_reason": self.store.get_state(f"mode_kill_switch_reason:{mode}:{strategy}", ""),
+            }
         return {
-            "mode": str(getattr(self.settings, "mode", "paper")),
+            "mode": mode,
+            "mode_policy": mode_policy,
             "live_entries_approved": bool(getattr(self.settings, "live_entries_approved", False)),
             "kill_switch_active": self.kill_switch_active(),
             "kill_switch_reason": self.kill_switch_reason(),
@@ -275,6 +324,7 @@ class RiskEngine:
             "unresolved_trades": unresolved_rows,
             "max_entry_usd": float(getattr(self.settings, "max_entry_usd", 0.50)),
             "max_total_exposure_usd": float(getattr(self.settings, "max_total_exposure_usd", 1.00)),
+            "max_strategy_exposure_usd": float(getattr(self.settings, "max_strategy_exposure_usd", 0.75)),
             "max_open_positions": int(getattr(self.settings, "max_open_positions", 1)),
             "max_entries_per_day": int(getattr(self.settings, "max_entries_per_day", 4)),
             "max_portfolio_drawdown_pct": float(getattr(self.settings, "max_portfolio_drawdown_pct", 0.15)),

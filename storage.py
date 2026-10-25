@@ -16,22 +16,48 @@ def utc_now() -> str:
 class Store:
     def __init__(self, path: Path, starting_cash: float, mode: str = "paper"):
         self.path = path
+        self.mode = str(mode).lower()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.db = sqlite3.connect(str(path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA foreign_keys=ON")
-        self._init(starting_cash)
-        existing_mode = self.get_state("database_mode", "")
-        has_history = (
-            self.db.execute("SELECT COUNT(*) FROM trades").fetchone()[0] > 0 or
-            self.db.execute("SELECT COUNT(*) FROM positions").fetchone()[0] > 0
-        )
-        if existing_mode and existing_mode != mode:
+
+        # Check database mode before changing pragmas or running schema migrations.
+        # A wrong-mode invocation must be a non-mutating failure.
+        tables = {
+            str(row["name"])
+            for row in self.db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        existing_mode = ""
+        if "state" in tables:
+            try:
+                mode_row = self.db.execute(
+                    "SELECT value FROM state WHERE key='database_mode' LIMIT 1"
+                ).fetchone()
+                existing_mode = str(mode_row["value"] or "").strip().lower() if mode_row else ""
+            except sqlite3.Error:
+                self.db.close()
+                raise RuntimeError(
+                    "Could not validate this database's mode marker. Use a new, separate DATABASE_PATH."
+                )
+        has_history = False
+        for table in ("trades", "positions"):
+            if table in tables:
+                try:
+                    if int(self.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) > 0:
+                        has_history = True
+                        break
+                except sqlite3.Error:
+                    self.db.close()
+                    raise RuntimeError(
+                        "Could not validate existing trading history. Use a new, separate DATABASE_PATH."
+                    )
+        if existing_mode and existing_mode != self.mode:
             self.db.close()
             raise RuntimeError(
-                f"This database is locked to {existing_mode!r} mode, not {mode!r}. "
+                f"This database is locked to {existing_mode!r} mode, not {self.mode!r}. "
                 "Use a different DATABASE_PATH for paper and live trading."
             )
         if not existing_mode and has_history:
@@ -40,8 +66,12 @@ class Store:
                 "This database contains old trading history but has no mode marker. "
                 "Use a new, separate DATABASE_PATH for this mode."
             )
+
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA foreign_keys=ON")
+        self._init(starting_cash)
         with self.db:
-            self.db.execute("INSERT OR IGNORE INTO state(key,value) VALUES('database_mode',?)", (mode,))
+            self.db.execute("INSERT OR IGNORE INTO state(key,value) VALUES('database_mode',?)", (self.mode,))
 
     def _init(self, starting_cash: float) -> None:
         with self.db:
@@ -93,6 +123,17 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS idx_risk_reservations_status
                 ON risk_reservations(status, created_at);
+            CREATE TABLE IF NOT EXISTS strategy_accounts (
+                mode TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                starting_cash_usd REAL NOT NULL,
+                cash_usd REAL NOT NULL,
+                realized_pnl_usd REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(mode,strategy)
+            );
+            CREATE INDEX IF NOT EXISTS idx_strategy_accounts_mode ON strategy_accounts(mode,strategy);
             CREATE TABLE IF NOT EXISTS shadow_observations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 observed_at REAL NOT NULL,
@@ -149,6 +190,49 @@ class Store:
             trade_columns = {row[1] for row in self.db.execute("PRAGMA table_info(trades)").fetchall()}
             if "strategy" not in trade_columns:
                 self.db.execute("ALTER TABLE trades ADD COLUMN strategy TEXT NOT NULL DEFAULT 'leader_copy'")
+            # Equal starting paper allocations are tracked independently by strategy.
+            # On a legacy DB, current cash is reconstructed from its tagged buy/sell rows.
+            saved_mode_for_accounts = str(self.get_state("database_mode", "") or "").lower()
+            # Never create paper-account rows before mode validation. Existing
+            # unmarked ledgers are rejected by the constructor and must remain untouched.
+            unmarked_history = (
+                not saved_mode_for_accounts
+                and (
+                    int(self.db.execute("SELECT COUNT(*) FROM trades").fetchone()[0]) > 0
+                    or int(self.db.execute("SELECT COUNT(*) FROM positions").fetchone()[0]) > 0
+                )
+            )
+            if self.mode == "paper" and saved_mode_for_accounts in {"", "paper"} and not unmarked_history:
+                account_count = int(self.db.execute(
+                    "SELECT COUNT(*) FROM strategy_accounts WHERE lower(mode)='paper'"
+                ).fetchone()[0])
+                if account_count == 0:
+                    try:
+                        total_start = float(self.get_state("initial_equity", str(starting_cash)))
+                    except (TypeError, ValueError):
+                        total_start = float(starting_cash)
+                    allocation = max(0.0, total_start / 3.0)
+                    for strategy in ("leader_copy", "trending_discovery", "token_discovery"):
+                        trades = self.db.execute(
+                            "SELECT action,value_usd,pnl_usd FROM trades WHERE lower(mode)='paper' AND strategy=? ORDER BY id ASC",
+                            (strategy,),
+                        ).fetchall()
+                        cash = allocation
+                        realized = 0.0
+                        for trade in trades:
+                            action = str(trade["action"] or "").upper()
+                            value = float(trade["value_usd"] or 0.0)
+                            if action.startswith("BUY"):
+                                cash -= value
+                            elif action.startswith("SELL"):
+                                cash += value
+                                realized += float(trade["pnl_usd"] or 0.0)
+                        self.db.execute(
+                            "INSERT OR IGNORE INTO strategy_accounts "
+                            "(mode,strategy,starting_cash_usd,cash_usd,realized_pnl_usd,created_at,updated_at) "
+                            "VALUES('paper',?,?,?,?,?,?)",
+                            (strategy, allocation, cash, realized, utc_now(), utc_now()),
+                        )
 
     def close(self) -> None:
         self.db.close()
@@ -315,6 +399,57 @@ class Store:
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (utc_now(), mode, action, mint, str(amount_raw), float(price_usd), float(value_usd),
                  float(pnl_usd), reason, source_wallet, source_signature, tx_signature, str(strategy or "leader_copy")))
+            if str(mode).lower() == "paper":
+                strategy_value = str(strategy or "leader_copy")
+                account = self.db.execute(
+                    "SELECT cash_usd,realized_pnl_usd FROM strategy_accounts WHERE lower(mode)='paper' AND strategy=?",
+                    (strategy_value,),
+                ).fetchone()
+                if account is None:
+                    raise RuntimeError("Strategy-specific paper account is missing; refusing unbudgeted ledger update.")
+                action_value = str(action or "").upper()
+                if action_value.startswith("BUY"):
+                    cash_delta = -float(value_usd)
+                    pnl_delta = 0.0
+                elif action_value.startswith("SELL"):
+                    cash_delta = float(value_usd)
+                    pnl_delta = float(pnl_usd)
+                else:
+                    cash_delta = 0.0
+                    pnl_delta = 0.0
+                next_cash = float(account["cash_usd"] or 0.0) + cash_delta
+                if next_cash < -1e-6:
+                    raise ValueError("Strategy-specific paper cash budget would be exceeded.")
+                self.db.execute(
+                    "UPDATE strategy_accounts SET cash_usd=?,realized_pnl_usd=?,updated_at=? "
+                    "WHERE lower(mode)='paper' AND strategy=?",
+                    (max(0.0, next_cash), float(account["realized_pnl_usd"] or 0.0) + pnl_delta,
+                     utc_now(), strategy_value),
+                )
+        # The trading ledger remains authoritative. Research telemetry is secondary:
+        # never let an observability failure erase a persisted fill/exit record.
+        try:
+            from research_journal import get_research_journal
+            get_research_journal(self).record_event(
+                mode=str(mode), strategy=str(strategy or "leader_copy"),
+                event_type="ledger_trade",
+                event={
+                    "source": "local_trade_ledger", "signature": str(tx_signature or ""),
+                    "source_signature": str(source_signature or ""), "mint": str(mint),
+                    "side": str(action).lower(), "action": str(action),
+                    "price_usd": float(price_usd), "value_usd": float(value_usd),
+                    "pnl_usd": float(pnl_usd), "wallet": str(source_wallet or ""),
+                    "reason": str(reason or "")[:300],
+                },
+                observed_at=__import__("time").time(),
+                amount_usd=float(value_usd),
+                rejection_reason="",
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Research telemetry failed after ledger trade persisted (%s)", type(exc).__name__
+            )
 
     def equity_snapshot(self) -> dict:
         return {
@@ -408,6 +543,7 @@ class Store:
         max_total_exposure_usd: float,
         max_open_positions: int,
         max_entries_per_day: int,
+        max_strategy_exposure_usd: float | None = None,
     ) -> str:
         """Atomically account for tracked positions, pending intents, duplicate mints and daily capacity."""
         from math import isfinite
@@ -476,6 +612,20 @@ class Store:
                 if exposure + amount > float(max_total_exposure_usd) + 1e-9:
                     self.db.rollback()
                     return "Total exposure reservation would exceed configured maximum."
+                if max_strategy_exposure_usd is not None:
+                    strategy_position_exposure = self.db.execute(
+                        "SELECT COALESCE(SUM(invested_usd),0) FROM positions WHERE strategy=?",
+                        (str(strategy),),
+                    ).fetchone()[0]
+                    strategy_reserved_exposure = self.db.execute(
+                        "SELECT COALESCE(SUM(amount_usd),0) FROM risk_reservations "
+                        "WHERE strategy=? AND status IN (" + placeholders + ")",
+                        (str(strategy), *active_statuses),
+                    ).fetchone()[0]
+                    strategy_exposure = float(strategy_position_exposure or 0) + float(strategy_reserved_exposure or 0)
+                    if strategy_exposure + amount > float(max_strategy_exposure_usd) + 1e-9:
+                        self.db.rollback()
+                        return "Strategy-specific exposure budget would be exceeded."
 
                 timestamp = utc_now()
                 self.db.execute(
@@ -736,6 +886,32 @@ class Store:
             item["shadow_eligible"] = bool(item.get("shadow_eligible"))
             results.append(item)
         return results
+
+    def get_strategy_account(self, mode: str, strategy: str) -> dict | None:
+        """Return a virtual capital account for one strategy and runtime mode."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM strategy_accounts WHERE lower(mode)=lower(?) AND strategy=?",
+                (str(mode), str(strategy)),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def strategy_accounts_snapshot(self, *, mode: str = "paper") -> dict:
+        """Compact per-strategy starting cash, remaining paper cash and realized PnL."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT * FROM strategy_accounts WHERE lower(mode)=lower(?) ORDER BY strategy",
+                (str(mode),),
+            ).fetchall()
+        return {
+            str(row["strategy"]): {
+                "starting_cash_usd": round(float(row["starting_cash_usd"] or 0), 6),
+                "cash_usd": round(float(row["cash_usd"] or 0), 6),
+                "realized_pnl_usd": round(float(row["realized_pnl_usd"] or 0), 6),
+                "updated_at": str(row["updated_at"] or ""),
+            }
+            for row in rows
+        }
 
     def claim_once(self, key: str) -> bool:
         """Atomically add a one-time action key; returns False if it was already claimed."""
