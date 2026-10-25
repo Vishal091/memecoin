@@ -1870,7 +1870,7 @@ class PumpFunBot:
             mint = str(signal.get("mint") or "")
             signature = str(signal.get("signature") or signal.get("source_signature") or "")
             wallet = str(signal.get("wallet") or signal.get("source_wallet") or "")
-            self.research.record_signal(
+            journal.record_signal(
                 mode=self.s.mode, strategy=strategy, mint=mint,
                 signal_type="entry_decision", decision=decision,
                 rejection_reason=reason, price_usd=price_usd,
