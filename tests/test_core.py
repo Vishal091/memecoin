@@ -935,6 +935,9 @@ class EntryDrawdownCircuitBreakerTests(unittest.TestCase):
         def list_positions(self):
             return []
 
+        def get_strategy_account(self, mode, strategy):
+            return {"cash_usd": 10.0 / 3.0}
+
     def _bot(self, *, equity=10.0, initial=10.0, day_start=10.0):
         bot = object.__new__(PumpFunBot)
         bot.store = self.FakeStore({
