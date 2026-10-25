@@ -3581,7 +3581,9 @@ class PumpFunBot:
                     now = time.time()
 
                     if self.s.research_auto_disable_enabled and now >= self._next_mode_policy_check_at:
-                        self._next_mode_policy_check_at = now + 60.0
+                        # Reports are bounded but evaluate multiple strategy samples;
+                        # don't rerun bootstrap analysis on every fast trading tick.
+                        self._next_mode_policy_check_at = now + 300.0
                         try:
                             policy_result = auto_disable_unprofitable_modes(
                                 self.store, mode=self.s.mode,
