@@ -56,7 +56,7 @@ The journal does not need any API key values to be printed. Existing provider cr
 python pumpfun_bot.py
 ```
 
-Open the loopback dashboard (normally `http://127.0.0.1:8765`). Leave the global entry kill switch engaged for shadow-only collection. To collect leader observations, choose the leaderboard and activate the leader subscription; this is now separate from order authorization. The bot will refuse new entries while the global gate is engaged. Do not turn on any live discovery toggle.
+Open the loopback dashboard (normally `http://127.0.0.1:8765`). Leave the global entry kill switch engaged for shadow-only collection. To collect leader observations, choose the leaderboard and activate the leader subscription; this is now separate from order authorization. The bot will refuse new entries while the global gate is engaged. Leader signals that pass the market/strategy filters are still recorded as counterfactual would-copy signals, while the separate entry-decision record shows that the actual order was blocked by the gate. This lets the trial score strategy selection without submitting a paper/live order. Do not turn on any live discovery toggle.
 
 The API state now includes:
 
