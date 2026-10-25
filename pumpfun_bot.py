@@ -995,6 +995,19 @@ class PumpFunBot:
             self.signal_stats["rpc_log_notifications"] += 1
             wallet = str(event.get("wallet") or "")
             signature = str(event.get("signature") or "")
+            initial_reason = (
+                "Solana log event is missing wallet or signature."
+                if not wallet or not signature
+                else ("Wallet is not in the active observation set." if wallet not in self.active_wallets else "")
+            )
+            try:
+                self.research.record_event(
+                    mode=self.s.mode, strategy="leader_copy",
+                    event_type="solana_log_notification", event=event,
+                    observed_at=time.time(), rejection_reason=initial_reason,
+                )
+            except Exception as exc:
+                logger.warning("Research Solana-log event write failed (%s)", type(exc).__name__)
             if not wallet or not signature:
                 continue
             if wallet not in self.active_wallets:
@@ -1033,6 +1046,16 @@ class PumpFunBot:
             except Exception as exc:
                 logger.warning("Could not inspect Solana log notification (%s)", type(exc).__name__)
                 continue
+            if not signals:
+                try:
+                    self.research.record_event(
+                        mode=self.s.mode, strategy="leader_copy",
+                        event_type="rejected_chain_signal", event=event,
+                        observed_at=time.time(),
+                        rejection_reason="Transaction did not yield a canonical, signer-verified Pump/PumpSwap trade signal.",
+                    )
+                except Exception as exc:
+                    logger.warning("Research rejected-chain-event write failed (%s)", type(exc).__name__)
             for signal in signals:
                 signal["source"] = "solana_logs"
                 signal["signer_verified"] = True
