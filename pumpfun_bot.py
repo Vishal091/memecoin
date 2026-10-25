@@ -1835,6 +1835,26 @@ class PumpFunBot:
         )
         logger.warning("Live transaction confirmed: https://solscan.io/tx/%s", tx_sig)
 
+    def _journal_entry_decision(
+        self, signal: dict, *, strategy: str, decision: str, reason: str = "",
+        price_usd: float | None = None, liquidity_usd: float | None = None,
+    ) -> None:
+        """Persist a strategy entry decision and its reason without raw secrets."""
+        try:
+            mint = str(signal.get("mint") or "")
+            signature = str(signal.get("signature") or signal.get("source_signature") or "")
+            wallet = str(signal.get("wallet") or signal.get("source_wallet") or "")
+            self.research.record_signal(
+                mode=self.s.mode, strategy=strategy, mint=mint,
+                signal_type="entry_decision", decision=decision,
+                rejection_reason=reason, price_usd=price_usd,
+                liquidity_usd=liquidity_usd, source_wallet=wallet,
+                source_signature=signature,
+                payload={**signal, "decision": decision, "reason": reason},
+            )
+        except Exception as exc:
+            logger.warning("Research entry-decision journal write failed (%s)", type(exc).__name__)
+
     def buy(
         self, signal: dict, *, strategy: str = "leader_copy",
         entry_cap_usd: float | None = None,
@@ -1872,14 +1892,17 @@ class PumpFunBot:
         source_wallet = str(signal.get("wallet") or "") or None
         source_signature = str(signal.get("signature") or "") or None
         if self.store.get_state(f"unresolved_trade:{mint}", ""):
+            self._journal_entry_decision(signal, strategy=strategy, decision="rejected", reason="An earlier transaction outcome remains unresolved.")
             logger.warning(
                 "Skipping buy for %s because an earlier transaction outcome remains unresolved",
                 mint[:8],
             )
             return
         if self.store.get_position(mint):
+            self._journal_entry_decision(signal, strategy=strategy, decision="rejected", reason="A position for this mint is already tracked.")
             return
         if self._native_build_retry_deferred(mint):
+            self._journal_entry_decision(signal, strategy=strategy, decision="rejected", reason="Pre-submission build retry is deferred.")
             logger.debug("Skipping repeated build for mint=%s during pre-submission cooldown", mint[:8])
             return
         sol_price = self.market.sol_price_usd()
@@ -1888,6 +1911,7 @@ class PumpFunBot:
         if observed_price <= 0 and market:
             observed_price = float(market.get("price_usd") or 0)
         if observed_price <= 0:
+            self._journal_entry_decision(signal, strategy=strategy, decision="rejected", reason="No reliable trade or market USD price yet.", liquidity_usd=signal.get("curve_liquidity_usd"))
             logger.info("Reject Pump.fun buy %s: no reliable trade or market price yet", mint)
             return
 
@@ -1901,6 +1925,9 @@ class PumpFunBot:
             5000.0, float(getattr(self.s, "min_liquidity_usd", 5000.0))
         )
         if strategy == "token_discovery" and curve_liquidity < discovery_liquidity_floor:
+            self._journal_entry_decision(signal, strategy=strategy, decision="rejected",
+                reason=f"Fresh real curve liquidity {curve_liquidity:.2f} USD below {discovery_liquidity_floor:.2f} USD.",
+                price_usd=observed_price, liquidity_usd=curve_liquidity)
             logger.info(
                 "Reject discovery buy %s: fresh real curve liquidity %.0f USD below %.0f USD",
                 mint[:8], curve_liquidity, discovery_liquidity_floor,
@@ -1927,16 +1954,25 @@ class PumpFunBot:
             and (market is None or int(market.get("pair_age_seconds") or 0) < self.s.min_pair_age_seconds)
         )
         if market is None and not allow_verified_curve_age_bypass:
+            self._journal_entry_decision(signal, strategy=strategy, decision="rejected",
+                reason="Indexed market pair unavailable and verified on-chain curve fallback criteria were not met.",
+                price_usd=observed_price, liquidity_usd=actual_liquidity)
             logger.info(
                 "Reject buy %s: indexed market pair unavailable and fresh verified on-chain curve fallback criteria were not met",
                 mint[:8],
             )
             return
         if actual_liquidity < portfolio_liquidity_floor:
+            self._journal_entry_decision(signal, strategy=strategy, decision="rejected",
+                reason=f"Observed liquidity {actual_liquidity:.2f} USD below {portfolio_liquidity_floor:.2f} USD.",
+                price_usd=observed_price, liquidity_usd=actual_liquidity)
             logger.info("Reject Pump.fun buy %s: verified/observed liquidity %.0f USD below %.0f USD",
                         mint, actual_liquidity, portfolio_liquidity_floor)
             return
         if market and int(market.get("pair_age_seconds") or 0) < self.s.min_pair_age_seconds and not unindexed_pump_entry:
+            self._journal_entry_decision(signal, strategy=strategy, decision="rejected",
+                reason="Market pair age is below the configured minimum.",
+                price_usd=observed_price, liquidity_usd=actual_liquidity)
             logger.info("Reject Pump.fun buy %s: pair age below filter", mint)
             return
         if unindexed_pump_entry:
@@ -1952,6 +1988,8 @@ class PumpFunBot:
             equity, strategy=strategy, entry_cap_usd=entry_cap_usd
         )
         if not allowed:
+            self._journal_entry_decision(signal, strategy=strategy, decision="rejected",
+                reason=reason, price_usd=observed_price, liquidity_usd=actual_liquidity)
             logger.info("Reject buy %s: %s", mint, reason)
             return
         effective_entry_cap = self.s.max_entry_usd
@@ -1963,6 +2001,9 @@ class PumpFunBot:
         spend = min(effective_entry_cap, self.s.max_total_exposure_usd - self._current_positions_value())
         minimum_practical_spend = 0.10 if strategy == "token_discovery" else 0.50
         if spend < minimum_practical_spend:
+            self._journal_entry_decision(signal, strategy=strategy, decision="rejected",
+                reason="Insufficient exposure headroom for a practical trade.",
+                price_usd=observed_price, liquidity_usd=actual_liquidity)
             return
 
         reservation_id, reserve_reason = self.risk_engine.reserve_entry(
@@ -1970,8 +2011,26 @@ class PumpFunBot:
             exposure_usd=spend + (self.s.paper_swap_cost_usd if self.s.mode == "paper" else 0.05),
         )
         if not reservation_id:
+            self._journal_entry_decision(signal, strategy=strategy, decision="rejected",
+                reason=f"Risk reservation denied: {reserve_reason}",
+                price_usd=observed_price, liquidity_usd=actual_liquidity)
             logger.warning("Reject buy %s: risk reservation denied: %s", str(mint)[:8], reserve_reason)
             return
+
+        # Entry is now strategy-qualified: after all local filters and atomic risk
+        # reservation. Separate actual fills and transaction failures in the ledger.
+        self._journal_entry_decision(signal, strategy=strategy, decision="would_copy",
+            price_usd=observed_price, liquidity_usd=actual_liquidity)
+        try:
+            self.research.record_event(
+                mode=self.s.mode, strategy=strategy, event_type="qualified_entry",
+                event={**signal, "price_usd": observed_price, "liquidity_usd": actual_liquidity,
+                       "decision": "would_copy",
+                       "latency_ms": max(0.0, (time.time() - float(signal.get("first_seen_at") or time.time())) * 1000.0)},
+                observed_at=time.time(),
+            )
+        except Exception as exc:
+            logger.warning("Research qualified-entry event write failed (%s)", type(exc).__name__)
 
         decimals = int(signal.get("decimals") or 6)
         total_supply_tokens = float(signal.get("total_supply_tokens") or 0)
@@ -3224,12 +3283,12 @@ class PumpFunBot:
         mint = str(signal.get("mint") or "")
         position_exists = bool(mint and self.store.get_position(mint))
         decision = (
-            "would_copy" if side == "buy" and verified
+            "verified_buy_signal" if side == "buy" and verified
             else "would_mirror_sell" if side == "sell" and verified and position_exists
             else "observed_unverified" if not verified
             else "rejected"
         )
-        reason = "" if decision in {"would_copy", "would_mirror_sell"} else (
+        reason = "" if decision in {"verified_buy_signal", "would_mirror_sell"} else (
             "Leader transaction lacks independent signer/program verification."
             if not verified else "Leader sell observed without a matching tracked position."
         )
