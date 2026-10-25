@@ -226,7 +226,15 @@ class ResearchJournal:
         safe = safe_payload(item)
         # Prefer real public transaction signatures for deduplication; otherwise retain
         # events within distinct timestamps, not a single mutable "latest event" record.
-        event_key = dedupe_key or self._key(mode, strategy, event_type, signature or source, mint, wallet, side, round(stamp, 2), safe)
+        if dedupe_key:
+            event_key = dedupe_key
+        elif signature:
+            # A repeated delivery of the same signed transaction is one observed
+            # event, even when websocket/RPC ingestion timestamps differ.
+            event_key = self._key(mode, strategy, event_type, signature, mint, wallet, side)
+        else:
+            # Events lacking a chain signature must retain a timestamped fingerprint.
+            event_key = self._key(mode, strategy, event_type, source, mint, wallet, side, round(stamp, 2), safe)
         with self.lock, self.db:
             self.db.execute(
                 """INSERT OR IGNORE INTO research_events
