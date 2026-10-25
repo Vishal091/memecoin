@@ -230,12 +230,12 @@ class TokenDiscoveryShadow:
             try:
                 try:
                     candidate_costs = estimate_round_trip_cost(
-                        notional_usd=min(0.50, max(0.10, float(getattr(self.s, "token_discovery_max_entry_usd", 0.50)))),
+                        notional_usd=min(0.50, max(0.10, float(getattr(self.settings, "token_discovery_max_entry_usd", 0.50)))),
                         route="native_pump_sdk",
                         venue="pump",
                         liquidity_usd=candidate.get("real_curve_liquidity_usd"),
                         sol_usd=None,
-                        assumptions=assumptions_from_settings(self.s),
+                        assumptions=assumptions_from_settings(self.settings),
                     )
                     candidate_costs["measurement_basis"] = "estimate_only"
                 except Exception as cost_exc:

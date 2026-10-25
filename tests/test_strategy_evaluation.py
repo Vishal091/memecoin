@@ -42,8 +42,9 @@ class StrategyEvaluationTests(unittest.TestCase):
             ("mint-good", 1.0, (1.10, 1.20, 0.95)),
             ("mint-rejected", 2.0, (0.50, 0.40, 0.25)),
         ):
+            signal_at = start if mint == "mint-good" else start + 1
             for horizon, multiple in zip((60, 300, 900), multipliers):
-                self._mark(mint=mint, timestamp=start + horizon, price=initial * multiple)
+                self._mark(mint=mint, timestamp=signal_at + horizon, price=initial * multiple)
         events, _ = load_events_read_only(self.db_path)
         result = evaluate_mode_events(events, "trending_discovery")
         self.assertEqual(result["horizons"]["1m"]["evaluable_samples"], 2)
