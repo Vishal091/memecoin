@@ -12,6 +12,7 @@ import requests
 
 from native_pump import TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID
 from token_discovery import BLOCKED_EXTENSION_NAMES, TOKEN_METADATA_SAFE_EXTENSIONS
+from research_journal import get_research_journal
 
 logger = logging.getLogger("trending_discovery")
 GECKO = "https://api.geckoterminal.com/api/v2"
@@ -796,6 +797,22 @@ class TrendingTokenScanner:
                     item["live_entry_reason"] = live_reason
                     item["live_entry_status_updated_at"] = live_updated_at
                 self._candidates[item["mint"]] = item
+                # Record screened and rejected candidate decisions, not just the
+                # shortlisted rows, so filters can be scored against future outcomes.
+                if self.store is not None:
+                    try:
+                        get_research_journal(self.store).record_candidate(
+                            mode=str(getattr(self.settings, "mode", "paper")),
+                            strategy="trending_discovery",
+                            candidate=item,
+                            observed_at=_num(item.get("updated_at")) or time.time(),
+                        )
+                    except Exception as exc:
+                        log_now = time.time()
+                        last_log = float(getattr(self, "_last_research_journal_error_at", 0.0) or 0.0)
+                        if log_now - last_log >= 60:
+                            logger.warning("Could not persist trending research event (%s)", type(exc).__name__)
+                            self._last_research_journal_error_at = log_now
                 is_trade_candidate = (
                     item.get("status") == "SCREENED"
                     and int(item.get("momentum_score") or 0) >= int(getattr(self.settings, "trending_min_score", 75))
