@@ -17,6 +17,7 @@ When `BOT_MODE=live`, configuration validation fails closed unless all of these 
 - `MAX_ENTRIES_PER_DAY=1`.
 - `DAILY_LOSS_LIMIT_USD` and `TOTAL_LOSS_LIMIT_USD` are each greater than zero and no greater than $0.50.
 - `MIN_SOL_RESERVE >= 0.025` SOL.
+- `MAX_MARKED_LOSS_PCT <= 0.18`, `TRAILING_STOP_PCT <= 0.12`, and `MAX_QUOTE_SHORTFALL_PCT <= 0.04`.
 - `TOKEN_DISCOVERY_LIVE_ENABLED=false` and `TRENDING_DISCOVERY_LIVE_ENABLED=false`. The initial canary is leader-copy only.
 
 The risk engine separately clamps live input to $0.50, total reserved exposure to $0.55, open positions to one and entries per day to one, even when a settings object is looser. These are ceilings, not guarantees about total wallet debit: network and route fees, token-account rent, slippage, and failed/unsellable tokens can cause additional costs or losses. The loss thresholds stop new entries; they are not a guarantee that an existing position will be liquidated at that loss.
