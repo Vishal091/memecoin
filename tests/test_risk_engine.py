@@ -242,7 +242,7 @@ class RiskEngineTests(unittest.TestCase):
                 "strategy": "leader_copy",
             })
             self.store.increment_daily_entries()
-            self.risk.release_entry(reservation, status="filled", detail="Test-only simulated fill")
+            self.risk.release_entry(reservation, status="completed", detail="Test-only simulated fill")
 
         self.assertEqual(len(self.store.list_positions()), 10)
         self.assertEqual(len(self.store.active_entry_reservations()), 0)
