@@ -41,6 +41,8 @@ from token_discovery import TokenDiscoveryShadow
 from trending_scanner import TrendingTokenScanner
 from jupiter_ultra import JupiterUltraExecutor
 from risk_engine import RiskEngine
+from research_journal import get_research_journal
+from mode_evaluation import auto_disable_unprofitable_modes
 
 logger = logging.getLogger("pumpfun")
 
@@ -141,7 +143,11 @@ class PumpFunBot:
         if not db_path.is_absolute():
             db_path = Path(__file__).resolve().parent / db_path
         self.store = Store(db_path, self.s.starting_paper_cash_usd, mode=self.s.mode)
+        self.research = get_research_journal(
+            self.store, path_window_seconds=int(getattr(self.s, "research_path_window_seconds", 900))
+        )
         self.risk_engine = RiskEngine(self.store, self.s)
+        self._next_mode_policy_check_at = 0.0
         self.risk_engine.engage_on_startup()
         self.rpc = SolanaRPC(self.s.rpc_url, self.s.request_timeout_seconds)
         # Aggressive launchpad filters; still require a tracked market pair for price marks.
@@ -319,7 +325,7 @@ class PumpFunBot:
 
     def _copy_block_reason(self) -> str:
         """Report the global entry gate and persisted circuit breakers."""
-        gate_reason = self.risk_engine.gate_reason()
+        gate_reason = self.risk_engine.gate_reason(strategy=strategy)
         if gate_reason:
             return gate_reason
         if self.store.get_state("daily_paused", "0") == "1":
@@ -495,6 +501,7 @@ class PumpFunBot:
             "token_discovery": token_discovery_state,
             "trending_discovery": self.trending_scanner.dashboard_snapshot(),
             "risk_control": self.risk_engine.snapshot(),
+            "research_journal": self.research.snapshot(),
             "feed_connected": bool(self.feed and self.feed.connected.is_set()),
             "feed_error": self.feed.last_error if self.feed else "",
             "feed_stats": ({
@@ -870,6 +877,27 @@ class PumpFunBot:
                 break
             self.signal_stats["queued_events"] += 1
             source = str(event.get("source") or "")
+            journal_strategy = {
+                "account_trade": "leader_copy", "token_trade": "token_discovery",
+                "token_discovery_new": "token_discovery",
+                "trending_discovery_candidate": "trending_discovery",
+            }.get(source, "market_data")
+            journal_type = {
+                "account_trade": "leader_trade_observation", "token_trade": "trade_tick",
+                "token_discovery_new": "token_launch",
+                "trending_discovery_candidate": "trending_candidate_queued",
+            }.get(source, "provider_event")
+            journal_event = dict(event)
+            try:
+                event_price = self._event_price_usd(event)
+                if event_price is not None and event_price > 0:
+                    journal_event["price_usd"] = event_price
+                self.research.record_event(
+                    mode=self.s.mode, strategy=journal_strategy, event_type=journal_type,
+                    event=journal_event, observed_at=time.time(),
+                )
+            except Exception as exc:
+                logger.warning("Research event journal write failed (%s)", type(exc).__name__)
             if source == "trending_discovery_candidate":
                 signal = event.get("signal")
                 if isinstance(signal, dict):
@@ -893,11 +921,33 @@ class PumpFunBot:
                 self.price_cache_at[mint] = time.time()
             signal = self._signal_from_feed(event)
             if not signal:
+                try:
+                    self.research.record_signal(
+                        mode=self.s.mode, strategy="leader_copy",
+                        mint=mint or str(event.get("mint") or ""),
+                        signal_type="leader_trade", decision="rejected",
+                        rejection_reason="Required mint/wallet/side/amount fields could not be parsed.",
+                        source_wallet=str(event.get("wallet") or event.get("traderPublicKey") or ""),
+                        source_signature=str(event.get("signature") or ""),
+                        payload=event,
+                    )
+                except Exception as exc:
+                    logger.warning("Research rejected-signal journal write failed (%s)", type(exc).__name__)
                 self.signal_stats["unparsed_events"] += 1
                 logger.warning("Ignoring PumpPortal trade event because required mint/wallet/side/amount fields could not be parsed; fields=%s",
                                ",".join(sorted(str(k) for k in event.keys())))
                 continue
             if signal["wallet"] not in self.active_wallets:
+                try:
+                    self.research.record_signal(
+                        mode=self.s.mode, strategy="leader_copy", mint=signal.get("mint", ""),
+                        signal_type="leader_trade", decision="rejected",
+                        rejection_reason="Wallet is not in the current active subscription set.",
+                        source_wallet=signal.get("wallet", ""), source_signature=signal.get("signature", ""),
+                        payload=signal,
+                    )
+                except Exception as exc:
+                    logger.warning("Research rejected-signal journal write failed (%s)", type(exc).__name__)
                 self.signal_stats["unwatched_events"] += 1
                 logger.warning("Ignoring PumpPortal %s event for a wallet not in active subscriptions (%s)",
                                signal["side"], signal["wallet"][:8])
@@ -910,6 +960,11 @@ class PumpFunBot:
             logger.info("Copy signal parsed: side=%s wallet=%s mint=%s source=%s",
                         signal["side"], signal["wallet"][:8], signal["mint"][:8], signal.get("source"))
             self.process_signal(signal)
+            # An account-feed event is only an observation until the separate Solana
+            # RPC path confirms that the watched wallet signed a Pump/PumpSwap trade.
+            # Do not suppress that later verified notification in live mode.
+            if self.s.mode == "live" and signal.get("signer_verified") is not True:
+                continue
             self.store.mark_signature_seen(dedupe_key, signal["wallet"])
 
     def _consume_solana_log_events(self) -> None:
@@ -962,6 +1017,8 @@ class PumpFunBot:
                 continue
             for signal in signals:
                 signal["source"] = "solana_logs"
+                signal["signer_verified"] = True
+                signal["program_verified"] = True
                 self.signal_stats["parsed_signals"] += 1
                 self.signal_stats["rpc_log_signals"] += 1
                 logger.info(
@@ -3134,6 +3191,46 @@ class PumpFunBot:
                         self.store.upsert_position(pos)
 
     def process_signal(self, signal: dict):
+        # PumpPortal trade events are observations, not proof that the named wallet
+        # signed a canonical Pump/PumpSwap transaction. Only the Solana RPC detector
+        # sets these flags after checking the signer and invoked program IDs.
+        verified = (
+            signal.get("source") == "solana_logs"
+            and signal.get("signer_verified") is True
+            and signal.get("program_verified") is True
+        )
+        side = str(signal.get("side") or "").lower()
+        mint = str(signal.get("mint") or "")
+        position_exists = bool(mint and self.store.get_position(mint))
+        decision = (
+            "would_copy" if side == "buy" and verified
+            else "would_mirror_sell" if side == "sell" and verified and position_exists
+            else "observed_unverified" if not verified
+            else "rejected"
+        )
+        reason = "" if decision in {"would_copy", "would_mirror_sell"} else (
+            "Leader transaction lacks independent signer/program verification."
+            if not verified else "Leader sell observed without a matching tracked position."
+        )
+        try:
+            price = float(signal.get("observed_price_usd") or self.price_cache.get(mint, 0) or 0)
+            self.research.record_signal(
+                mode=self.s.mode, strategy="leader_copy", mint=mint,
+                signal_type="leader_trade", decision=decision, rejection_reason=reason,
+                price_usd=price if price > 0 else None,
+                liquidity_usd=signal.get("curve_liquidity_usd"),
+                source_wallet=str(signal.get("wallet") or ""),
+                source_signature=str(signal.get("signature") or ""),
+                payload={**signal, "signer_verified": verified, "program_verified": verified},
+            )
+        except Exception as exc:
+            logger.warning("Research leader-signal journal write failed (%s)", type(exc).__name__)
+        if self.s.mode == "live" and not verified:
+            logger.warning(
+                "Reject unverified live leader signal side=%s wallet=%s mint=%s; waiting for signer-verified Solana RPC signal",
+                side, str(signal.get("wallet") or "")[:8], mint[:8],
+            )
+            return
         if signal.get("wallet") not in self.active_wallets:
             return
         self.store.add_signal(signal["wallet"], signal["signature"], signal["mint"], signal["side"],
@@ -3375,6 +3472,21 @@ class PumpFunBot:
                     self._process_discovery_live_entries()
                     self._process_trending_live_entries()
                     now = time.time()
+
+                    if now >= self._next_mode_policy_check_at:
+                        self._next_mode_policy_check_at = now + 60.0
+                        try:
+                            policy_result = auto_disable_unprofitable_modes(
+                                self.store, mode=self.s.mode,
+                                round_trip_cost_pct=float(getattr(self.s, "research_round_trip_cost_pct", 5.0)),
+                            )
+                            for disabled_strategy in policy_result.get("disabled", []):
+                                logger.warning(
+                                    "AUTO-DISABLED strategy=%s mode=%s after mature counterfactual sample failed positive lower-CI gate",
+                                    disabled_strategy, self.s.mode,
+                                )
+                        except Exception as exc:
+                            logger.warning("Per-mode evidence evaluation unavailable (%s)", type(exc).__name__)
 
                     if self.leaderboard_client.ready and now - self.last_leaderboard_refresh >= self.s.leaderboard_refresh_seconds:
                         self.refresh_leaderboards(force=True)
