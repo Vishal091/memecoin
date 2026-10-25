@@ -49,8 +49,11 @@ class LiveCanaryConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "LIVE_ENTRIES_APPROVED=true"):
                 Settings.load()
 
-    def test_valid_live_canary_profile_passes_configuration_validation(self):
-        with patch.dict(os.environ, self.live_env(), clear=True):
+    def test_valid_live_canary_profile_passes_without_jupiter_key(self):
+        # The first canary is leader-copy only; Jupiter is only needed for trending live execution.
+        env = self.live_env()
+        env.pop("JUPITER_API_KEY")
+        with patch.dict(os.environ, env, clear=True):
             settings = Settings.load()
         self.assertEqual(settings.mode, "live")
         self.assertTrue(settings.live_entries_approved)
