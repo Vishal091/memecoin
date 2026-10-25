@@ -182,8 +182,8 @@ class RiskEngineTests(unittest.TestCase):
         self.settings.mode = "live"
         self.settings.live_entries_approved = True
         self.settings.max_entry_usd = 5.00
-        self.settings.max_total_exposure_usd = 5.00
-        self.settings.max_open_positions = 3
+        self.settings.max_total_exposure_usd = 20.00
+        self.settings.max_open_positions = 20
         self.settings.max_entries_per_day = 20
 
         # The approval flag alone is not enough: the engine applies its own hard ceilings, including ten entries/day.
@@ -193,7 +193,7 @@ class RiskEngineTests(unittest.TestCase):
         self.assertIn("0.50", reason)
 
         reservation, reason = self.risk.reserve_entry(
-            "MintExcessExposure", "leader_copy", 0.50, exposure_usd=0.56
+            "MintExcessExposure", "leader_copy", 0.50, exposure_usd=5.51
         )
         self.assertIsNone(reservation)
         self.assertIn("exposure", reason.lower())
@@ -204,8 +204,40 @@ class RiskEngineTests(unittest.TestCase):
         self.assertIsNotNone(reservation, reason)
         snapshot = self.risk.snapshot()
         self.assertEqual(snapshot["max_entry_usd"], 0.50)
-        self.assertEqual(snapshot["max_total_exposure_usd"], 0.55)
-        self.assertEqual(snapshot["max_open_positions"], 1)
+        self.assertEqual(snapshot["max_total_exposure_usd"], 5.50)
+        self.assertEqual(snapshot["max_open_positions"], 10)
+        self.assertEqual(snapshot["max_entries_per_day"], 10)
+
+    def test_live_canary_allows_ten_half_dollar_positions_and_blocks_eleventh(self):
+        self.settings.mode = "live"
+        self.settings.live_entries_approved = True
+        self.settings.max_entry_usd = 5.00
+        self.settings.max_total_exposure_usd = 20.00
+        self.settings.max_open_positions = 20
+        self.settings.max_entries_per_day = 20
+        self.assertTrue(self.risk.resume_entries()[0])
+
+        reservations = []
+        for index in range(10):
+            reservation, reason = self.risk.reserve_entry(
+                f"MintLive{index}", "leader_copy", 0.50, exposure_usd=0.55
+            )
+            self.assertIsNotNone(reservation, reason)
+            reservations.append(reservation)
+
+        self.assertEqual(len(self.store.active_entry_reservations()), 10)
+        eleventh, reason = self.risk.reserve_entry(
+            "MintLive10", "leader_copy", 0.50, exposure_usd=0.55
+        )
+        self.assertIsNone(eleventh)
+        self.assertTrue(
+            "position" in reason.lower() or "daily entry" in reason.lower(),
+            reason,
+        )
+        snapshot = self.risk.snapshot()
+        self.assertEqual(snapshot["max_entry_usd"], 0.50)
+        self.assertEqual(snapshot["max_total_exposure_usd"], 5.50)
+        self.assertEqual(snapshot["max_open_positions"], 10)
         self.assertEqual(snapshot["max_entries_per_day"], 10)
 
     def test_live_canary_keeps_entry_approval_fail_closed_when_missing(self):
