@@ -10,7 +10,7 @@ class StrategyAccountTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.store = Store(Path(self.tmp.name) / "strategy-accounts.db", 12.0, mode="paper")
-        self.addCleanup(self.store.close)
+        self.addCleanup(self.store.db.close)
 
     def test_paper_budget_is_split_evenly_across_three_strategy_ledgers(self):
         accounts = self.store.strategy_accounts_snapshot(mode="paper")
