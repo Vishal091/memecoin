@@ -28,7 +28,7 @@ class LiveCanaryConfigTests(unittest.TestCase):
             "MAX_ENTRY_USD": "0.50",
             "MAX_TOTAL_EXPOSURE_USD": "0.55",
             "MAX_OPEN_POSITIONS": "1",
-            "MAX_ENTRIES_PER_DAY": "1",
+            "MAX_ENTRIES_PER_DAY": "10",
             "DAILY_LOSS_LIMIT_USD": "0.50",
             "TOTAL_LOSS_LIMIT_USD": "0.50",
             "MIN_SOL_RESERVE": "0.025",
@@ -63,7 +63,7 @@ class LiveCanaryConfigTests(unittest.TestCase):
         self.assertEqual(settings.max_entry_usd, 0.50)
         self.assertEqual(settings.max_total_exposure_usd, 0.55)
         self.assertEqual(settings.max_open_positions, 1)
-        self.assertEqual(settings.max_entries_per_day, 1)
+        self.assertEqual(settings.max_entries_per_day, 10)
         self.assertGreaterEqual(settings.min_sol_reserve, 0.025)
 
     def test_live_canary_rejects_limits_above_the_hard_caps(self):
@@ -71,7 +71,8 @@ class LiveCanaryConfigTests(unittest.TestCase):
             ("MAX_ENTRY_USD", "0.51", "MAX_ENTRY_USD"),
             ("MAX_TOTAL_EXPOSURE_USD", "0.56", "MAX_TOTAL_EXPOSURE_USD"),
             ("MAX_OPEN_POSITIONS", "2", "MAX_OPEN_POSITIONS"),
-            ("MAX_ENTRIES_PER_DAY", "2", "MAX_ENTRIES_PER_DAY"),
+            ("MAX_ENTRIES_PER_DAY", "11", "MAX_ENTRIES_PER_DAY"),
+            ("MAX_ENTRIES_PER_DAY", "0", "MAX_ENTRIES_PER_DAY"),
             ("DAILY_LOSS_LIMIT_USD", "0.51", "DAILY_LOSS_LIMIT_USD"),
             ("TOTAL_LOSS_LIMIT_USD", "0.51", "TOTAL_LOSS_LIMIT_USD"),
             ("MIN_SOL_RESERVE", "0.024", "MIN_SOL_RESERVE"),
