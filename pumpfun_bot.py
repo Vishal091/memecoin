@@ -2025,12 +2025,16 @@ class PumpFunBot:
             self.research.record_event(
                 mode=self.s.mode, strategy=strategy, event_type="qualified_entry",
                 event={**signal, "price_usd": observed_price, "liquidity_usd": actual_liquidity,
-                       "decision": "would_copy",
-                       "latency_ms": max(0.0, (time.time() - float(signal.get("first_seen_at") or time.time())) * 1000.0)},
+                       "decision": "would_copy"},
                 observed_at=time.time(),
             )
+            if strategy in {"leader_copy", "token_discovery"}:
+                self.research.record_cost_estimate(
+                    strategy=strategy, mint=mint, notional_usd=spend,
+                    source="PumpPortal 0.5% provider-fee assumption; other cost components left unknown",
+                )
         except Exception as exc:
-            logger.warning("Research qualified-entry event write failed (%s)", type(exc).__name__)
+            logger.warning("Research qualified-entry/cost journal write failed (%s)", type(exc).__name__)
 
         decimals = int(signal.get("decimals") or 6)
         total_supply_tokens = float(signal.get("total_supply_tokens") or 0)
