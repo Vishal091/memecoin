@@ -24,6 +24,37 @@ class PumpFunDailyEntryCapTests(unittest.TestCase):
         self.assertEqual(settings.max_entries_per_day, 10)
         self.assertEqual(settings.max_entry_usd, 0.50)
 
+    def test_ten_positions_and_exposure_budget_are_configurable(self):
+        with patch.dict(
+            os.environ,
+            {
+                "BOT_MODE": "paper",
+                "MAX_ENTRIES_PER_DAY": "10",
+                "MAX_OPEN_POSITIONS": "10",
+                "MAX_TOTAL_EXPOSURE_USD": "5.50",
+            },
+            clear=True,
+        ):
+            settings = PumpFunSettings.load()
+        self.assertEqual(settings.max_open_positions, 10)
+        self.assertEqual(settings.max_entries_per_day, 10)
+        self.assertEqual(settings.max_total_exposure_usd, 5.50)
+        self.assertEqual(settings.max_entry_usd, 0.50)
+
+    def test_position_count_and_exposure_are_clamped(self):
+        with patch.dict(
+            os.environ,
+            {
+                "BOT_MODE": "paper",
+                "MAX_OPEN_POSITIONS": "99",
+                "MAX_TOTAL_EXPOSURE_USD": "99",
+            },
+            clear=True,
+        ):
+            settings = PumpFunSettings.load()
+        self.assertEqual(settings.max_open_positions, 10)
+        self.assertEqual(settings.max_total_exposure_usd, 5.50)
+
     def test_daily_entry_cap_has_minimum_one(self):
         settings = self.load_paper_settings(0)
         self.assertEqual(settings.max_entries_per_day, 1)
