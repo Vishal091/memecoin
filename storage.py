@@ -315,6 +315,30 @@ class Store:
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (utc_now(), mode, action, mint, str(amount_raw), float(price_usd), float(value_usd),
                  float(pnl_usd), reason, source_wallet, source_signature, tx_signature, str(strategy or "leader_copy")))
+        # The trading ledger remains authoritative. Research telemetry is secondary:
+        # never let an observability failure erase a persisted fill/exit record.
+        try:
+            from research_journal import get_research_journal
+            get_research_journal(self).record_event(
+                mode=str(mode), strategy=str(strategy or "leader_copy"),
+                event_type="ledger_trade",
+                event={
+                    "source": "local_trade_ledger", "signature": str(tx_signature or ""),
+                    "source_signature": str(source_signature or ""), "mint": str(mint),
+                    "side": str(action).lower(), "action": str(action),
+                    "price_usd": float(price_usd), "value_usd": float(value_usd),
+                    "pnl_usd": float(pnl_usd), "wallet": str(source_wallet or ""),
+                    "reason": str(reason or "")[:300],
+                },
+                observed_at=__import__("time").time(),
+                amount_usd=float(value_usd),
+                rejection_reason="",
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Research telemetry failed after ledger trade persisted (%s)", type(exc).__name__
+            )
 
     def equity_snapshot(self) -> dict:
         return {
