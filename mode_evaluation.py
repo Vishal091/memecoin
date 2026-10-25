@@ -288,8 +288,13 @@ def build_mode_report(db_path: str | Path, *, mode: str = "paper",
         ],
     }
 
-def auto_disable_unprofitable_modes(store, *, mode: str = "paper",
-                                    round_trip_cost_pct: float = DEFAULT_ROUND_TRIP_COST_PCT) -> dict:
+def auto_disable_unprofitable_modes(
+    store, *, mode: str = "paper",
+    round_trip_cost_pct: float = DEFAULT_ROUND_TRIP_COST_PCT,
+    min_counterfactual_trades: int = DEFAULT_MIN_COUNTERFACTUAL_TRADES,
+    min_active_days: float = DEFAULT_MIN_ACTIVE_DAYS,
+    min_samples_for_day_gate: int = MIN_SAMPLES_FOR_DAY_GATE,
+) -> dict:
     """Persist a per-mode disable only when mature counterfactual evidence has CI lower <= 0.
 
     This function never re-enables a disabled strategy and never changes the global live
@@ -297,6 +302,9 @@ def auto_disable_unprofitable_modes(store, *, mode: str = "paper",
     """
     report = build_mode_report(
         store.path, mode=mode, round_trip_cost_pct=round_trip_cost_pct,
+        min_counterfactual_trades=min_counterfactual_trades,
+        min_active_days=min_active_days,
+        min_samples_for_day_gate=min_samples_for_day_gate,
         bootstrap_iterations=1000,
     )
     changes = []
