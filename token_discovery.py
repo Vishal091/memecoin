@@ -178,6 +178,8 @@ class TokenDiscoveryShadow:
         # Journal every candidate state (including safety/liquidity rejections) for
         # later counterfactual price-path evaluation; the writer allowlists public fields.
         try:
+            if not hasattr(self.store, "db"):
+                return
             get_research_journal(self.store).record_candidate(
                 mode=str(getattr(self.settings, "mode", "paper")),
                 strategy="token_discovery",
