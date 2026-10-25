@@ -313,7 +313,11 @@ def auto_disable_unprofitable_modes(
             continue
         key = f"mode_policy_disabled:{mode}:{strategy}"
         reason_key = f"mode_policy_reason:{mode}:{strategy}"
-        with store.db:
+        # Only persist/log the transition once; the policy latch is irreversible
+        # through the dashboard and must not rewrite state on every evaluation pass.
+        if store.get_state(key, "0") == "1":
+            continue
+        with store.lock, store.db:
             store.db.execute(
                 "INSERT INTO state(key,value) VALUES(?, '1') ON CONFLICT(key) DO UPDATE SET value='1'",
                 (key,),
