@@ -101,6 +101,19 @@ class EventJournal:
                 CREATE INDEX IF NOT EXISTS idx_event_journal_mode_type
                     ON event_journal(strategy, event_type, status);
             """)
+            # Cache row count for this single-writer connection. Repair a database
+            # that exceeded the cap under an older hourly-only pruning policy.
+            self._row_count = int(
+                self.db.execute("SELECT COUNT(*) FROM event_journal").fetchone()[0]
+            )
+            excess = max(0, self._row_count - self.RETENTION_ROWS)
+            if excess:
+                cursor = self.db.execute(
+                    "DELETE FROM event_journal WHERE id IN ("
+                    "SELECT id FROM event_journal ORDER BY observed_at ASC,id ASC LIMIT ?)",
+                    (excess,),
+                )
+                self._row_count -= max(0, int(cursor.rowcount))
 
     def record_event(
         self,
@@ -214,24 +227,19 @@ class EventJournal:
                 ),
             )
             _ = cur.rowcount  # rowcount also returns 1 for an UPSERT update.
-            # Prune at most once per UTC hour; keep the most recent bounded timeline.
-            hour = int(time.time() // 3600)
-            marker = self.db.execute(
-                "SELECT value FROM state WHERE key='event_journal_prune_hour'"
-            ).fetchone()
-            if not marker or str(marker["value"]) != str(hour):
-                count = int(self.db.execute("SELECT COUNT(*) FROM event_journal").fetchone()[0])
-                excess = max(0, count - self.RETENTION_ROWS)
+            # Enforce the hard cap on every new row, not once per hour. With one
+            # writer connection, the in-memory count avoids an O(n) COUNT(*) on
+            # every event and deletion only runs when the table is over capacity.
+            if inserted:
+                self._row_count += 1
+                excess = max(0, self._row_count - self.RETENTION_ROWS)
                 if excess:
-                    self.db.execute(
+                    cursor = self.db.execute(
                         "DELETE FROM event_journal WHERE id IN ("
                         "SELECT id FROM event_journal ORDER BY observed_at ASC,id ASC LIMIT ?)",
                         (excess,),
                     )
-                self.db.execute(
-                    "INSERT INTO state(key,value) VALUES('event_journal_prune_hour',?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(hour),)
-                )
+                    self._row_count -= max(0, int(cursor.rowcount))
         return inserted
 
     def list_events(

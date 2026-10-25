@@ -99,6 +99,29 @@ class EventJournalTests(unittest.TestCase):
         self.assertNotIn("DO_NOT_STORE_THIS_EITHER", serialized)
         self.assertEqual(row["payload"]["nested"]["safe_metric"], 12)
 
+    def test_retention_limit_is_enforced_on_every_insert_not_only_hourly(self):
+        self.store.journal.RETENTION_ROWS = 3
+        for index in range(5):
+            self.store.record_event(
+                event_type="price_mark",
+                strategy="market_data",
+                observed_at=1_800_000_000 + index,
+                mint=f"mint-{index}",
+                source="retention-fixture",
+                status="observed",
+                decision="price_mark",
+                price_usd=1.0 + index,
+            )
+
+        rows = self.store.list_events(limit=10)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([row["mint"] for row in rows], ["mint-2", "mint-3", "mint-4"])
+        actual_count = self.store.db.execute(
+            "SELECT COUNT(*) FROM event_journal"
+        ).fetchone()[0]
+        self.assertEqual(actual_count, 3)
+        self.assertEqual(self.store.journal._row_count, 3)
+
     def test_dashboard_ledger_summary_only_counts_paper_pnl(self):
         self.store.add_trade(
             mode="paper", action="SELL", mint="paper-mint", amount_raw="10",
