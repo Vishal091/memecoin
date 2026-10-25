@@ -16,7 +16,7 @@ class ModeEvaluationTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.db_path = Path(self.temp.name) / "mode-paper.db"
         self.store = Store(self.db_path, 12.0, mode="paper")
-        self.addCleanup(self.store.close)
+        self.addCleanup(self.store.db.close)
 
     def _add_token_shadow_outcome(self, mint, start, entry, exit_price):
         base_payload = {
