@@ -16,20 +16,22 @@ class StrategyEvaluationTests(unittest.TestCase):
         self.store.db.close()
         self.temp.cleanup()
 
-    def _candidate(self, *, mint, timestamp, price, status, decision, reason=""):
+    def _candidate(self, *, mint, timestamp, price, status, decision, reason="", pool_address="pool-main"):
         self.store.record_event(
             event_type="candidate_decision", strategy="trending_discovery",
             observed_at=timestamp, mint=mint, side="screen",
             source="fixture", status=status, decision=decision,
             reason=reason, price_usd=price, liquidity_usd=25000.0,
+            payload={"pool_address": pool_address},
             cost_inputs={"measurement_basis": "estimate_only", "complete_for_after_cost_verdict": False},
         )
 
-    def _mark(self, *, mint, timestamp, price):
+    def _mark(self, *, mint, timestamp, price, pool_address="pool-main"):
         self.store.record_event(
             event_type="price_mark", strategy="market_data", observed_at=timestamp,
             mint=mint, source="fixture", status="observed", decision="price_mark",
             price_usd=price, liquidity_usd=25000.0,
+            payload={"pool_address": pool_address},
         )
 
     def test_rejected_candidate_counterfactual_and_future_horizons_are_reported(self):
@@ -84,6 +86,61 @@ class StrategyEvaluationTests(unittest.TestCase):
         self.assertIn(report["mode_results"]["trending_discovery"]["verdict"],
                       {"KEEP IN PAPER — INSUFFICIENT EVIDENCE", "KEEP IN PAPER — COST DATA INCOMPLETE"})
         self.assertEqual(report["mode_results"]["leader_copy"]["verdict"], "KEEP IN PAPER — NO OUTCOME DATA")
+
+    def test_trending_evaluation_ignores_future_price_marks_from_a_different_pool(self):
+        start = 1_800_000_000.0
+        self._candidate(
+            mint="mint-shared", timestamp=start, price=1.0,
+            status="SCREENED", decision="shadow_eligible", pool_address="pool-A",
+        )
+        # Another venue/pool for the same mint spikes dramatically. That must not
+        # be used as the candidate's mark for pool-A.
+        self._mark(
+            mint="mint-shared", timestamp=start + 60, price=5.0,
+            pool_address="pool-B",
+        )
+        events, _ = load_events_read_only(self.db_path)
+        result = evaluate_mode_events(events, "trending_discovery")
+        one_minute = result["horizons"]["1m"]
+        self.assertEqual(one_minute["evaluable_samples"], 0)
+        self.assertEqual(one_minute["missing_valid_market_match"], 1)
+        self.assertEqual(one_minute["missing_or_stale_future_mark"], 1)
+
+    def test_trending_evaluation_uses_a_later_exact_pool_mark_after_ignoring_other_pool(self):
+        start = 1_800_000_000.0
+        self._candidate(
+            mint="mint-shared", timestamp=start, price=1.0,
+            status="SCREENED", decision="shadow_eligible", pool_address="pool-A",
+        )
+        self._mark(
+            mint="mint-shared", timestamp=start + 60, price=5.0,
+            pool_address="pool-B",
+        )
+        self._mark(
+            mint="mint-shared", timestamp=start + 75, price=1.2,
+            pool_address="pool-A",
+        )
+        events, _ = load_events_read_only(self.db_path)
+        result = evaluate_mode_events(events, "trending_discovery")
+        one_minute = result["horizons"]["1m"]
+        self.assertEqual(one_minute["evaluable_samples"], 1)
+        self.assertAlmostEqual(one_minute["outcomes"][0]["gross_return_pct"], 20.0)
+        self.assertEqual(one_minute["outcomes"][0]["signal_pool_address"], "pool-A")
+        self.assertEqual(one_minute["outcomes"][0]["mark_pool_address"], "pool-A")
+        self.assertEqual(one_minute["outcomes"][0]["mark_latency_after_horizon_seconds"], 15.0)
+
+    def test_trending_evaluation_fails_closed_when_pool_identity_is_missing(self):
+        start = 1_800_000_000.0
+        self._candidate(
+            mint="mint-no-pool", timestamp=start, price=1.0,
+            status="SCREENED", decision="shadow_eligible", pool_address="",
+        )
+        self._mark(mint="mint-no-pool", timestamp=start + 60, price=1.1, pool_address="")
+        events, _ = load_events_read_only(self.db_path)
+        result = evaluate_mode_events(events, "trending_discovery")
+        self.assertEqual(result["signals_missing_market_identity"], 1)
+        self.assertEqual(result["horizons"]["1m"]["evaluable_samples"], 0)
+        self.assertEqual(result["horizons"]["1m"]["missing_valid_market_match"], 1)
 
     def test_signal_decision_latency_is_distinct_from_provider_event_age(self):
         start = 1_800_000_000.0

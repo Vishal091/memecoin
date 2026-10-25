@@ -29,7 +29,9 @@ Event rows deduplicate on transaction identity where available. Different lifecy
 
 The event timeline preserves observed marks as they arrive. The read-only strategy_evaluation.py report evaluates the first recorded decision for a new/trending mint and uses a future mark at or after 1, 5 and 15 minutes, bounded by the configured allowed delay. Missing or stale future marks are counted as missing; no interpolated or guessed prices are inserted.
 
-Important limitation: scanner marks and trade-derived prices are reference prices, not guaranteed executable prices. The journal does not pretend to have a mark when none was received. Raw provider trade events are marked as observed; only the Solana-transaction parser path is labeled signer-verified after its existing checks.
+**Pool identity is part of the evaluation key for trending-token outcomes.** The evaluator only accepts a future mark when its explicit pool/pair address matches the screened candidate's pool. A missing pool identity or a mark from another pool is excluded and counted under `missing_valid_market_match`, rather than being joined by token mint alone. This is necessary because the same mint can trade in more than one pool with different prices, depth and executable liquidity. The scanner must record the exact `pool_address` on candidate and mark payloads for that sample to be evaluable.
+
+Important limitation: scanner marks and trade-derived prices are reference prices, not guaranteed executable prices. Pool-matched marks are still not guaranteed fills at the desired order size. The journal does not pretend to have a mark when none was received. Raw provider trade events are marked as observed; only the Solana-transaction parser path is labeled signer-verified after its existing checks.
 
 ## Cost model status
 
