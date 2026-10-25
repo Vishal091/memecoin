@@ -54,15 +54,17 @@ Use a separate working copy/database for observation, never the live database.
 
         cd C:\Users\visha\memecoin
         git fetch origin
-        git switch --track origin/phase6/data-first-evidence
+        git switch --track origin/phase6d/redact-secret-values
         python -m pip install -r requirements.txt
 
 2. In your local .env (do not paste it into chat or commit it), set these non-secret values for the observation run:
 
         BOT_MODE=paper
         LIVE_ENTRIES_APPROVED=false
-        DATABASE_PATH=memecoin-phase6-observe.db
+        DATABASE_PATH=memecoin-phase6d-observe.db
+        TOKEN_DISCOVERY_ENABLED=true
         TOKEN_DISCOVERY_LIVE_ENABLED=false
+        TRENDING_DISCOVERY_ENABLED=true
         TRENDING_DISCOVERY_LIVE_ENABLED=false
 
    Preserve all existing credentials locally. Do not set the live approval true or enable a discovery live switch. If the selected DB path is already used by a different mode, pick another fresh paper DB name. Avoid starting two copies of the bot against one database.
