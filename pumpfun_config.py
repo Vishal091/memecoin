@@ -100,6 +100,9 @@ class PumpFunSettings:
     jupiter_api_key: str
     database_path: Path
     log_level: str
+    research_round_trip_cost_pct: float
+    research_path_window_seconds: int
+    research_auto_disable_enabled: bool
 
     @classmethod
     def load(cls) -> "PumpFunSettings":
@@ -189,11 +192,18 @@ class PumpFunSettings:
             jupiter_api_key=os.getenv("JUPITER_API_KEY", "").strip(),
             database_path=Path(os.getenv("DATABASE_PATH", "memecoin-pumpfun.db")),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            research_round_trip_cost_pct=_float("RESEARCH_ROUND_TRIP_COST_PCT", 5.0),
+            research_path_window_seconds=max(60, min(3600, _int("RESEARCH_PATH_WINDOW_SECONDS", 900))),
+            research_auto_disable_enabled=os.getenv("RESEARCH_AUTO_DISABLE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
         )
         obj.validate()
         return obj
 
     def validate(self) -> None:
+        if not math.isfinite(self.research_round_trip_cost_pct) or not 0 <= self.research_round_trip_cost_pct <= 50:
+            raise ValueError("RESEARCH_ROUND_TRIP_COST_PCT must be between 0 and 50")
+        if not 60 <= self.research_path_window_seconds <= 3600:
+            raise ValueError("RESEARCH_PATH_WINDOW_SECONDS must be between 60 and 3600")
         if not self.rpc_url.startswith("https://"):
             raise ValueError("SOLANA_RPC_URL must use HTTPS")
         if self.default_leaderboard_window not in {"overall", "day", "week", "month"}:
