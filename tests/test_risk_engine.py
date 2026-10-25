@@ -217,15 +217,35 @@ class RiskEngineTests(unittest.TestCase):
         self.settings.max_entries_per_day = 20
         self.assertTrue(self.risk.resume_entries()[0])
 
-        reservations = []
         for index in range(10):
+            mint = f"MintLive{index}"
             reservation, reason = self.risk.reserve_entry(
-                f"MintLive{index}", "leader_copy", 0.50, exposure_usd=0.55
+                mint, "leader_copy", 0.50, exposure_usd=0.55
             )
             self.assertIsNotNone(reservation, reason)
-            reservations.append(reservation)
 
-        self.assertEqual(len(self.store.active_entry_reservations()), 10)
+            # Simulate the swap filling and its submission reservation being resolved.
+            self.store.upsert_position({
+                "mint": mint,
+                "decimals": 6,
+                "amount_raw": "1000000",
+                "entry_price_usd": 1.0,
+                "initial_amount_raw": "1000000",
+                "peak_price_usd": 1.0,
+                "tp1_done": 0,
+                "tp2_done": 0,
+                "opened_at": datetime.now(timezone.utc).isoformat(),
+                "last_price_usd": 1.0,
+                "invested_usd": 0.50,
+                "source_wallet": f"Leader{index}",
+                "source_signature": f"Signature{index}",
+                "strategy": "leader_copy",
+            })
+            self.store.increment_daily_entries()
+            self.risk.release_entry(reservation, status="filled", detail="Test-only simulated fill")
+
+        self.assertEqual(len(self.store.list_positions()), 10)
+        self.assertEqual(len(self.store.active_entry_reservations()), 0)
         eleventh, reason = self.risk.reserve_entry(
             "MintLive10", "leader_copy", 0.50, exposure_usd=0.55
         )
