@@ -87,8 +87,10 @@ class PumpFunSettings:
     paper_swap_cost_usd: float
     pumpportal_priority_fee_sol: float
     pumpportal_fee_pct_per_side: float
-    pump_bonding_curve_fee_pct_per_side: float
-    pumpswap_conservative_fee_pct_per_side: float
+    pump_protocol_fee_pct_per_side: float | None
+    pump_creator_fee_pct_per_side: float | None
+    pumpswap_protocol_fee_pct_per_side: float | None
+    pumpswap_creator_fee_pct_per_side: float | None
     base_network_fee_sol_per_side: float
     jito_tip_sol_per_side: float
     failed_tx_probability: float | None
@@ -179,8 +181,12 @@ class PumpFunSettings:
             pumpportal_priority_fee_sol=_float("PUMPPORTAL_PRIORITY_FEE_SOL", 0.00001),
             # Cost-model values are assumptions unless measured against actual fills.
             pumpportal_fee_pct_per_side=_float("PUMPPORTAL_FEE_PCT_PER_SIDE", 0.5),
-            pump_bonding_curve_fee_pct_per_side=_float("PUMP_BONDING_CURVE_FEE_PCT_PER_SIDE", 1.25),
-            pumpswap_conservative_fee_pct_per_side=_float("PUMPSWAP_CONSERVATIVE_FEE_PCT_PER_SIDE", 1.25),
+            # Intentionally unset by default: use verified/configured venue fee schedules,
+            # never a fabricated creator/protocol fee to make expectancy look complete.
+            pump_protocol_fee_pct_per_side=_optional_float("PUMP_PROTOCOL_FEE_PCT_PER_SIDE"),
+            pump_creator_fee_pct_per_side=_optional_float("PUMP_CREATOR_FEE_PCT_PER_SIDE"),
+            pumpswap_protocol_fee_pct_per_side=_optional_float("PUMPSWAP_PROTOCOL_FEE_PCT_PER_SIDE"),
+            pumpswap_creator_fee_pct_per_side=_optional_float("PUMPSWAP_CREATOR_FEE_PCT_PER_SIDE"),
             base_network_fee_sol_per_side=_float("BASE_NETWORK_FEE_SOL_PER_SIDE", 0.000005),
             jito_tip_sol_per_side=_float("JITO_TIP_SOL_PER_SIDE", 0.0),
             failed_tx_probability=_optional_float("FAILED_TX_PROBABILITY"),
@@ -240,10 +246,12 @@ class PumpFunSettings:
             raise ValueError("MAX_PORTFOLIO_DRAWDOWN_PCT must be greater than 0 and no more than 0.15")
         fee_values = (
             self.pumpportal_fee_pct_per_side,
-            self.pump_bonding_curve_fee_pct_per_side,
-            self.pumpswap_conservative_fee_pct_per_side,
+            self.pump_protocol_fee_pct_per_side,
+            self.pump_creator_fee_pct_per_side,
+            self.pumpswap_protocol_fee_pct_per_side,
+            self.pumpswap_creator_fee_pct_per_side,
         )
-        if any(value < 0 or value > 100 for value in fee_values):
+        if any(value is not None and (value < 0 or value > 100) for value in fee_values):
             raise ValueError("Fee percentages must be in [0,100]")
         if self.failed_tx_probability is not None and not 0 <= self.failed_tx_probability <= 1:
             raise ValueError("FAILED_TX_PROBABILITY must be in [0,1] when supplied")

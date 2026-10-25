@@ -35,12 +35,12 @@ Important limitation: scanner marks and trade-derived prices are reference price
 
 execution_costs.py provides versioned, configurable cost assumptions for:
 - PumpPortal Local Transaction route fee when that execution route is actually used.
-- Pump.fun bonding-curve or PumpSwap venue fee assumptions.
+- Pump.fun protocol fees and creator fees, independently configurable for bonding-curve and PumpSwap routes. These are unknown-by-default; the cost model is deliberately incomplete until the fee schedule is configured/verified.
 - Base network fees, configured priority fees and optional Jito tip.
 - A conservative first-order slippage proxy based on observed real pool/curve liquidity (never virtual reserves).
-- Measured latency slippage, failed-transaction probability/cost and allocated PumpPortal stream-message cost.
+- Provider event age, measured signal-to-decision delay, measured latency slippage, failed-transaction probability/cost and allocated PumpPortal stream-message cost.
 
-The estimate is intentionally incomplete if required observations are missing. Default failed-transaction probability, latency slippage, SOL/USD, stream-event allocation and exit-size executable quotes are not inferred. Configured fee percentages are assumptions, not verified on-chain fee schedules. The liquidity-based slippage proxy is not a quote or curve simulation. A record with measurement_basis=estimate_only must not satisfy the report's after-cost evidence gate.
+The estimate is intentionally incomplete if required observations are missing. Default failed-transaction probability, latency slippage, SOL/USD, stream-event allocation and exit-size executable quotes are not inferred. Configured fee percentages are assumptions, not verified on-chain fee schedules. Protocol and creator fees default to unknown rather than a fabricated aggregate percentage. The liquidity-based slippage proxy is not a quote or curve simulation. Signal-to-decision delay is not the same as execution/fill latency. A record with measurement_basis=estimate_only must not satisfy the report's after-cost evidence gate.
 
 No after-cost expectancy conclusion is available until measured fees, latency, failures and size-aware buy/sell results are recorded for all included samples.
 

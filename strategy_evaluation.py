@@ -305,7 +305,11 @@ def evaluate_mode_events(
                 "horizon_seconds": horizon, "mark_at": future["observed_at"],
                 "mark_price_usd": future["price_usd"], "gross_return_pct": value,
                 "mark_latency_after_horizon_seconds": future["observed_at"] - target,
-                "signal_latency_ms": signal["latency_ms"],
+                "signal_to_decision_latency_ms": signal["latency_ms"],
+                "provider_event_age_ms": (
+                    _finite(signal["payload"].get("provider_event_age_ms"))
+                    if isinstance(signal.get("payload"), dict) else None
+                ),
                 "liquidity_usd_at_signal": signal["liquidity_usd"],
                 "cost_inputs": signal["cost_inputs"],
             })
@@ -372,8 +376,8 @@ def build_report(
             and _finite(row["cost_inputs"].get("round_trip_cost_pct_of_notional")) is not None
             for row in outcomes
         )
-        latencies_complete = bool(outcomes) and all(
-            row.get("signal_latency_ms") is not None for row in outcomes
+        decision_latencies_complete = bool(outcomes) and all(
+            row.get("signal_to_decision_latency_ms") is not None for row in outcomes
         )
         real_liquidity_complete = bool(outcomes) and all(
             row.get("liquidity_usd_at_signal") is not None
@@ -405,10 +409,11 @@ def build_report(
         }
         item["cost_model_readiness"] = {
             "complete_measured_cost_inputs_for_all_15m_outcomes": costs_complete,
-            "observed_latency_for_all_outcomes": latencies_complete,
+            "signal_to_decision_latency_for_all_outcomes": decision_latencies_complete,
+            "execution_fill_latency_measured": False,
             "verified_real_liquidity_for_all_outcomes": real_liquidity_complete,
             "measured_after_cost_expectancy_ci_verified": costs_complete and len(net_test) >= 2,
-            "note": "TVL/price-mark sensitivity is not an executable quote. Measured fee, failure, latency and size-aware exit inputs are required for an after-cost verdict.",
+            "note": "Signal-to-decision delay is recorded separately from provider event age. Execution/fill latency and its slippage impact remain unmeasured unless actual fill timestamps and size-aware quotes are recorded. TVL-based slippage is not an executable quote.",
         }
         item["conclusion_threshold"] = {
             "minimum_samples": int(min_samples_for_conclusion),

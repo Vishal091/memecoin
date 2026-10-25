@@ -992,6 +992,9 @@ class PumpFunBot:
                 self.price_cache[mint] = price
                 self.price_cache_at[mint] = now
             signal = self._signal_from_feed(event)
+            if signal:
+                signal["signal_observed_at"] = now
+                signal["signal_provider_latency_ms"] = self._event_latency_ms(event, now)
             if not signal:
                 self.signal_stats["unparsed_events"] += 1
                 reason = "required mint/wallet/side/amount fields could not be parsed"
@@ -2016,11 +2019,22 @@ class PumpFunBot:
         self, strategy: str, signal: dict, decision: str, reason: str,
         *, status: str | None = None,
     ) -> None:
-        """Journal entry gate outcomes without changing the entry gate or retry policy."""
+        """Journal entry gate outcomes and signal-to-decision delay without changing safety gates."""
+        now = time.time()
+        observed_at = None
+        for key in ("signal_observed_at", "shadow_entry_at", "updated_at", "last_updated_at"):
+            try:
+                candidate_at = float(signal.get(key) or 0)
+            except (TypeError, ValueError, OverflowError):
+                candidate_at = 0.0
+            if math.isfinite(candidate_at) and 0 < candidate_at <= now:
+                observed_at = candidate_at
+                break
+        signal_to_decision_ms = max(0.0, (now - observed_at) * 1000.0) if observed_at else None
         self._record_event_safe(
             event_type="entry_decision",
             strategy=strategy,
-            observed_at=time.time(),
+            observed_at=now,
             mint=str(signal.get("mint") or ""),
             wallet=str(signal.get("wallet") or ""),
             side="buy",
@@ -2032,12 +2046,15 @@ class PumpFunBot:
             price_usd=signal.get("observed_price_usd") or signal.get("price_usd"),
             liquidity_usd=(signal.get("verified_real_liquidity_usd")
                            or signal.get("curve_liquidity_usd") or signal.get("liquidity_usd")),
-            latency_ms=signal.get("signal_latency_ms"),
+            latency_ms=signal_to_decision_ms,
             cost_inputs=self._entry_cost_inputs(strategy, signal),
             payload={
                 "venue": signal.get("venue"),
                 "amount_ui": signal.get("amount_ui"),
                 "planned_entry_usd": signal.get("planned_entry_usd"),
+                "signal_observed_at": observed_at,
+                "signal_to_decision_latency_ms": signal_to_decision_ms,
+                "provider_event_age_ms": signal.get("signal_provider_latency_ms"),
             },
         )
 

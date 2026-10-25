@@ -21,8 +21,10 @@ def _num(value: Any) -> float | None:
 @dataclass(frozen=True)
 class CostAssumptions:
     pumpportal_fee_pct_per_side: float = 0.5
-    pump_bonding_curve_fee_pct_per_side: float = 1.25
-    pumpswap_conservative_fee_pct_per_side: float = 1.25
+    pump_protocol_fee_pct_per_side: float | None = None
+    pump_creator_fee_pct_per_side: float | None = None
+    pumpswap_protocol_fee_pct_per_side: float | None = None
+    pumpswap_creator_fee_pct_per_side: float | None = None
     base_network_fee_sol_per_side: float = 0.000005
     priority_fee_sol_per_side: float = 0.00001
     jito_tip_sol_per_side: float = 0.0
@@ -42,8 +44,10 @@ def assumptions_from_settings(settings: Any, *, stream_events_attributed_per_rou
 
     return CostAssumptions(
         pumpportal_fee_pct_per_side=float(get("pumpportal_fee_pct_per_side", 0.5)),
-        pump_bonding_curve_fee_pct_per_side=float(get("pump_bonding_curve_fee_pct_per_side", 1.25)),
-        pumpswap_conservative_fee_pct_per_side=float(get("pumpswap_conservative_fee_pct_per_side", 1.25)),
+        pump_protocol_fee_pct_per_side=get("pump_protocol_fee_pct_per_side", None),
+        pump_creator_fee_pct_per_side=get("pump_creator_fee_pct_per_side", None),
+        pumpswap_protocol_fee_pct_per_side=get("pumpswap_protocol_fee_pct_per_side", None),
+        pumpswap_creator_fee_pct_per_side=get("pumpswap_creator_fee_pct_per_side", None),
         base_network_fee_sol_per_side=float(get("base_network_fee_sol_per_side", 0.000005)),
         priority_fee_sol_per_side=float(get("pumpportal_priority_fee_sol", 0.00001)),
         jito_tip_sol_per_side=float(get("jito_tip_sol_per_side", 0.0)),
@@ -89,12 +93,23 @@ def estimate_round_trip_cost(
     if route_key in {"", "unknown"}:
         missing.append("execution_route")
     if venue_key in {"pump", "pump_bonding_curve", "bonding_curve"}:
-        venue_fee = assumptions.pump_bonding_curve_fee_pct_per_side
+        protocol_fee = _num(assumptions.pump_protocol_fee_pct_per_side)
+        creator_fee = _num(assumptions.pump_creator_fee_pct_per_side)
+        if protocol_fee is None:
+            missing.append("pump_protocol_fee_schedule")
+        if creator_fee is None:
+            missing.append("pump_creator_fee_schedule")
     elif venue_key in {"pumpswap", "pump_amm", "pump-amm"}:
-        venue_fee = assumptions.pumpswap_conservative_fee_pct_per_side
+        protocol_fee = _num(assumptions.pumpswap_protocol_fee_pct_per_side)
+        creator_fee = _num(assumptions.pumpswap_creator_fee_pct_per_side)
+        if protocol_fee is None:
+            missing.append("pumpswap_protocol_fee_schedule")
+        if creator_fee is None:
+            missing.append("pumpswap_creator_fee_schedule")
     else:
-        venue_fee = None
+        protocol_fee = creator_fee = None
         missing.append("venue_fee_schedule")
+    venue_fee = (protocol_fee + creator_fee) if protocol_fee is not None and creator_fee is not None else None
 
     liquidity = _num(liquidity_usd)
     if liquidity is None or liquidity <= 0:
@@ -163,6 +178,12 @@ def estimate_round_trip_cost(
     breakdown.update({
         "pumpportal_fee_pct_per_side": portal_fee,
         "venue_fee_pct_per_side": venue_fee,
+        "protocol_fee_pct_per_side": protocol_fee,
+        "creator_fee_pct_per_side": creator_fee,
+        "pump_protocol_fee_pct_per_side": _num(assumptions.pump_protocol_fee_pct_per_side),
+        "pump_creator_fee_pct_per_side": _num(assumptions.pump_creator_fee_pct_per_side),
+        "pumpswap_protocol_fee_pct_per_side": _num(assumptions.pumpswap_protocol_fee_pct_per_side),
+        "pumpswap_creator_fee_pct_per_side": _num(assumptions.pumpswap_creator_fee_pct_per_side),
         "estimated_slippage_pct_per_side": slippage_per_side,
         "latency_slippage_pct_per_side": latency_slippage,
         "variable_cost_usd": variable_cost_usd,

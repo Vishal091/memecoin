@@ -85,6 +85,35 @@ class StrategyEvaluationTests(unittest.TestCase):
                       {"KEEP IN PAPER — INSUFFICIENT EVIDENCE", "KEEP IN PAPER — COST DATA INCOMPLETE"})
         self.assertEqual(report["mode_results"]["leader_copy"]["verdict"], "KEEP IN PAPER — NO OUTCOME DATA")
 
+    def test_signal_decision_latency_is_distinct_from_provider_event_age(self):
+        start = 1_800_000_000.0
+        self.store.record_event(
+            event_type="signal_decision", strategy="leader_copy",
+            observed_at=start, mint="leader-mint", wallet="leader",
+            side="buy", signature="leader-signature", source="fixture",
+            status="observed", decision="accepted_for_processing",
+            price_usd=1.0, payload={"provider_event_age_ms": 300.0},
+        )
+        self.store.record_event(
+            event_type="entry_decision", strategy="leader_copy",
+            observed_at=start + 2, mint="leader-mint", wallet="leader",
+            side="buy", signature="leader-signature", source="fixture",
+            status="rejected", decision="rejected", reason="fixture risk gate",
+            price_usd=1.0, latency_ms=250.0,
+            payload={
+                "signal_to_decision_latency_ms": 250.0,
+                "provider_event_age_ms": 300.0,
+            },
+        )
+        self._mark(mint="leader-mint", timestamp=start + 902, price=1.05)
+        events, _ = load_events_read_only(self.db_path)
+        result = evaluate_mode_events(events, "leader_copy")
+        outcome = result["horizons"]["15m"]["outcomes"][0]
+        self.assertEqual(outcome["signal_to_decision_latency_ms"], 250.0)
+        self.assertEqual(outcome["provider_event_age_ms"], 300.0)
+        self.assertNotIn("signal_latency_ms", outcome)
+
+
     def test_round_trip_cost_sensitivity_is_explicit(self):
         self.assertAlmostEqual(net_return_pct(10.0, 3.5), 6.5)
 
