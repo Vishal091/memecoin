@@ -72,6 +72,9 @@ class LiveCanaryConfigTests(unittest.TestCase):
             ("DAILY_LOSS_LIMIT_USD", "0.51", "DAILY_LOSS_LIMIT_USD"),
             ("TOTAL_LOSS_LIMIT_USD", "0.51", "TOTAL_LOSS_LIMIT_USD"),
             ("MIN_SOL_RESERVE", "0.024", "MIN_SOL_RESERVE"),
+            ("MAX_MARKED_LOSS_PCT", "0.19", "MAX_MARKED_LOSS_PCT"),
+            ("TRAILING_STOP_PCT", "0.13", "TRAILING_STOP_PCT"),
+            ("MAX_QUOTE_SHORTFALL_PCT", "0.05", "MAX_QUOTE_SHORTFALL_PCT"),
         )
         for key, value, expected_message in invalid_values:
             with self.subTest(key=key):
