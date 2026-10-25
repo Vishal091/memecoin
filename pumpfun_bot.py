@@ -1140,6 +1140,8 @@ class PumpFunBot:
                 )
             for signal in signals:
                 signal["source"] = "solana_logs"
+                signal["signal_observed_at"] = float(event.get("_first_seen_at") or time.time())
+                signal["signal_provider_latency_ms"] = None
                 leader_trade_at = time.time()
                 leader_price = _finite(signal.get("observed_price_usd"))
                 self._record_event_safe(
@@ -2112,8 +2114,14 @@ class PumpFunBot:
             logger.debug("Skipping repeated build for mint=%s during pre-submission cooldown", mint[:8])
             self._record_entry_decision(strategy, signal, "rejected", "native transaction builder retry cooldown active")
             return
-        sol_price = self.market.sol_price_usd()
-        market = self.market.token_market(mint)
+        try:
+            sol_price = self.market.sol_price_usd()
+            market = self.market.token_market(mint)
+        except Exception as exc:
+            reason = f"market preflight failed ({type(exc).__name__}); no order decision from missing data"
+            self._record_entry_decision(strategy, signal, "unknown", reason, status="unknown")
+            logger.warning("Buy preflight market data unavailable for mint=%s (%s)", mint[:8], type(exc).__name__)
+            raise
         observed_price = float(signal.get("observed_price_usd") or 0)
         if observed_price <= 0 and market:
             observed_price = float(market.get("price_usd") or 0)
@@ -3505,6 +3513,14 @@ class PumpFunBot:
         self.store.add_signal(signal["wallet"], signal["signature"], signal["mint"], signal["side"],
                               signal["amount_ui"], signal["decimals"])
         if self.wallet_address and signal["wallet"] == self.wallet_address:
+            self._record_event_safe(
+                event_type="signal_decision", strategy="leader_copy", observed_at=time.time(),
+                mint=str(signal.get("mint") or ""), wallet=str(signal.get("wallet") or ""),
+                side=str(signal.get("side") or ""), signature=str(signal.get("signature") or ""),
+                source="bot_wallet", status="skipped", decision="ignored_own_wallet",
+                reason="signal originated from the configured bot wallet; do not copy own trades",
+                price_usd=signal.get("observed_price_usd"),
+            )
             return
         if signal["side"] == "buy":
             self.signal_stats["buy_signals"] += 1
@@ -3526,6 +3542,16 @@ class PumpFunBot:
                       signal["wallet"], signal["signature"])
         elif signal["side"] == "sell":
             self.signal_stats["sell_without_position"] += 1
+            self._record_event_safe(
+                event_type="signal_decision", strategy="leader_copy", observed_at=time.time(),
+                mint=str(signal.get("mint") or ""), wallet=str(signal.get("wallet") or ""),
+                side="sell", signature=str(signal.get("signature") or ""),
+                source=str(signal.get("source") or "signal_pipeline"),
+                status="skipped", decision="rejected",
+                reason="leader sell observed but no matching follower position is open",
+                price_usd=signal.get("observed_price_usd"),
+                payload={"venue": signal.get("venue")},
+            )
             logger.info("Leader sell observed but no matching paper position is open for mint=%s; no sell copied",
                         signal["mint"][:8])
 
