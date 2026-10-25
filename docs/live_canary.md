@@ -12,14 +12,14 @@ When `BOT_MODE=live`, configuration validation fails closed unless all of these 
 
 - `LIVE_ENTRIES_APPROVED=true` and the existing exact `LIVE_CONFIRMATION` phrase is set locally.
 - `MAX_ENTRY_USD <= 0.50`.
-- `MAX_TOTAL_EXPOSURE_USD <= 0.50`.
+- `MAX_TOTAL_EXPOSURE_USD <= 0.55`. The reservation includes the code's built-in $0.05 allowance for fees; actual fees/rent may be higher.
 - `MAX_OPEN_POSITIONS=1`.
 - `MAX_ENTRIES_PER_DAY=1`.
 - `DAILY_LOSS_LIMIT_USD` and `TOTAL_LOSS_LIMIT_USD` are each greater than zero and no greater than $0.50.
 - `MIN_SOL_RESERVE >= 0.025` SOL.
 - `TOKEN_DISCOVERY_LIVE_ENABLED=false` and `TRENDING_DISCOVERY_LIVE_ENABLED=false`. The initial canary is leader-copy only.
 
-The risk engine separately clamps live input to $0.50, total reserved exposure to $0.50, open positions to one and entries per day to one, even when a settings object is looser. These are ceilings, not guarantees about total wallet debit: network and route fees, token-account rent, slippage, and failed/unsellable tokens can cause additional costs or losses. The loss thresholds stop new entries; they are not a guarantee that an existing position will be liquidated at that loss.
+The risk engine separately clamps live input to $0.50, total reserved exposure to $0.55, open positions to one and entries per day to one, even when a settings object is looser. These are ceilings, not guarantees about total wallet debit: network and route fees, token-account rent, slippage, and failed/unsellable tokens can cause additional costs or losses. The loss thresholds stop new entries; they are not a guarantee that an existing position will be liquidated at that loss.
 
 ## Preflight — do not skip
 
@@ -32,7 +32,7 @@ The risk engine separately clamps live input to $0.50, total reserved exposure t
         LIVE_ENTRIES_APPROVED=true
         LIVE_CONFIRMATION=I_ACCEPT_THE_RISK_AND_UNDERSTAND_LIVE_TRADING
         MAX_ENTRY_USD=0.50
-        MAX_TOTAL_EXPOSURE_USD=0.50
+        MAX_TOTAL_EXPOSURE_USD=0.55
         MAX_OPEN_POSITIONS=1
         MAX_ENTRIES_PER_DAY=1
         DAILY_LOSS_LIMIT_USD=0.50
